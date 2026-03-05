@@ -150,6 +150,7 @@ function archivePitches() {
   if (insertAt1 === -1) insertAt1 = refreshedArchivedStart0 + 2;
 
   const numCols = sheet.getLastColumn();
+  const arrayFormulaCols0 = getArrayFormulaColumns_(sheet, 2, numCols);
   const templateRange = getSafeFormatRow_(sheet, refreshedArchivedStart0 + 2, numCols);
 
   if (rowsToArchive.length > 1) {
@@ -161,6 +162,9 @@ function archivePitches() {
   const writeRange = sheet.getRange(insertAt1, 1, rowsToArchive.length, numCols);
   templateRange.copyTo(writeRange, { formatOnly: true });
   writeRange.setValues(rowsToArchive.map(r => r.values));
+  for (const col0 of arrayFormulaCols0) {
+    sheet.getRange(insertAt1, col0 + 1, rowsToArchive.length, 1).clearContent();
+  }
   if (activationCol !== -1) {
     sheet.getRange(insertAt1, activationCol + 1, rowsToArchive.length, 1).setShowHyperlink(false);
   }
@@ -335,6 +339,19 @@ function getCommonColumnsByHeader_(sourceHeader, targetHeader) {
     if (sourceMap.has(name)) common.push({ name, pIdx: sourceMap.get(name), cIdx: j });
   }
   return common;
+}
+
+function getArrayFormulaColumns_(sheet, probeRow1, numCols) {
+  if (!sheet || probeRow1 < 1 || numCols < 1) return [];
+  if (sheet.getMaxRows() < probeRow1) return [];
+
+  const formulas = sheet.getRange(probeRow1, 1, 1, numCols).getFormulas()[0] || [];
+  const cols = [];
+
+  for (let c = 0; c < formulas.length; c++) {
+    if (/ARRAYFORMULA\s*\(/i.test(String(formulas[c] || ""))) cols.push(c);
+  }
+  return cols;
 }
 
 function getExistingSignaturesBySection_(campaignData, commonCols) {
