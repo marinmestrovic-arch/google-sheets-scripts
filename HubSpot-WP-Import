@@ -77,11 +77,16 @@ function fillCrmImport() {
       .trim();
   }
 
-  function isYouTubeErField_(crmHeader, exportHeader) {
-    const haystack = `${normalizeKey_(crmHeader)} ${normalizeKey_(exportHeader)}`;
-    const hasYouTube = haystack.includes("youtube");
-    const hasEr = /\ber\b/.test(haystack) || haystack.includes("engagement rate");
-    return hasYouTube && hasEr;
+  const SOCIAL_ER_HEADER_PAIRS_ = new Set([
+    "youtube engagement rate|youtube er",
+    "instagram engagement rate|instagram er",
+    "tiktok engagement rate|tiktok er",
+    "twitter engagement rate|twitter er"
+  ]);
+
+  function isSocialErField_(crmHeader, exportHeader) {
+    const pairKey = `${normalizeKey_(crmHeader)}|${normalizeKey_(exportHeader)}`;
+    return SOCIAL_ER_HEADER_PAIRS_.has(pairKey);
   }
 
   function parseMaybePercentNumber_(raw) {
@@ -161,9 +166,9 @@ function fillCrmImport() {
 
         value = row[idx];
 
-        // HypeAuditor exports ER as percent points (e.g. 3.47), while
-        // HubSpot percentage fields expect fractions (0.0347 for 3.47%).
-        if (isYouTubeErField_(header, mappedHeader)) {
+        // HypeAuditor exports social ER as percent points (e.g. 3.47),
+        // while HubSpot percentage fields expect fractions (0.0347 for 3.47%).
+        if (isSocialErField_(header, mappedHeader)) {
           const er = parseMaybePercentNumber_(value);
           value = er === null ? "" : er / 100;
         }
