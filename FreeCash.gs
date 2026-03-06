@@ -8,21 +8,41 @@ function fillMissingAverageViews_PitchList_Safe() {
   if (lastRow < 2 || lastCol < 1) return Logger.log("ℹ️ Pitch List has no data.");
 
   const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
-  const header = (values[0] || []).map(v => String(v || "").trim());
 
-  const urlCol = header.indexOf("Channel URL");
-  const avgCol = header.indexOf("Average Views");
-  const nameCol = header.indexOf("Channel Name");
-  if (urlCol === -1 || avgCol === -1) {
-    return Logger.log("❌ Missing required headers: Channel URL and/or Average Views.");
+  const headerSearchRows = Math.min(lastRow, 5);
+  let headerRow1 = -1;
+  let header = [];
+  let urlCol = -1;
+  let avgCol = -1;
+  let nameCol = -1;
+
+  for (let r = 1; r <= headerSearchRows; r++) {
+    const candidate = (values[r - 1] || []).map(v => String(v || "").trim());
+    const candidateUrlCol = candidate.indexOf("Channel URL");
+    const candidateAvgCol = candidate.indexOf("Average Views");
+    if (candidateUrlCol !== -1 && candidateAvgCol !== -1) {
+      headerRow1 = r;
+      header = candidate;
+      urlCol = candidateUrlCol;
+      avgCol = candidateAvgCol;
+      nameCol = header.indexOf("Channel Name");
+      break;
+    }
   }
+
+  if (headerRow1 === -1) {
+    return Logger.log("❌ Missing required headers: Channel URL and/or Average Views (searched rows 1-5).");
+  }
+
+  const startDataRow1 = headerRow1 + 1;
+  if (startDataRow1 > lastRow) return Logger.log("ℹ️ No data rows below header.");
 
   const updates = [];
   let checked = 0;
   let missing = 0;
   let failed = 0;
 
-  for (let r = 2; r <= lastRow; r++) {
+  for (let r = startDataRow1; r <= lastRow; r++) {
     const row = values[r - 1];
     if (!row || row.join("").trim() === "") continue;
 
