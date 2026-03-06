@@ -1,0 +1,430 @@
+function fillCrmImport() {
+  const SKIP_HEADER = "Deal name";
+  const EXPORT_SHEET = "HypeAuditor Export";
+  const CRM_SHEET = "HubSpot Import";
+  const MAPPING_SHEET = "Mapping";
+
+  // --- Language value mapping ---
+  // Create a sheet tab with 2 columns:
+  // A: code (e.g., fr)
+  // B: language (e.g., French)
+  const LANGUAGE_MAPPING_SHEET = "Language Mapping";
+  const LANGUAGE_CRM_HEADER = "Language"; // HubSpot Import column header that should receive full name
+
+  const CONTACT_TYPE_HEADER = "Contact Type";
+  const CONTACT_TYPE_VALUE = "Influencer";
+
+  const ss = SpreadsheetApp.getActive();
+  const exportSh = ss.getSheetByName(EXPORT_SHEET);
+  const crmSh = ss.getSheetByName(CRM_SHEET);
+  const mapSh = ss.getSheetByName(MAPPING_SHEET);
+  const langSh = ss.getSheetByName(LANGUAGE_MAPPING_SHEET);
+
+  if (!exportSh) throw new Error(`Sheet not found: "${EXPORT_SHEET}"`);
+  if (!crmSh) throw new Error(`Sheet not found: "${CRM_SHEET}"`);
+  if (!mapSh) throw new Error(`Sheet not found: "${MAPPING_SHEET}"`);
+  if (!langSh) throw new Error(`Sheet not found: "${LANGUAGE_MAPPING_SHEET}"`);
+
+  const exportData = exportSh.getDataRange().getValues();
+  if (exportData.length < 2) return;
+
+  const exportHeaders = exportData[0];
+  const exportRows = exportData.slice(1);
+
+  const crmHeaders = crmSh.getRange(1, 1, 1, crmSh.getLastColumn()).getValues()[0];
+
+  // Pull validations sized to exportRows (so row-indexed validation checks work)
+  const crmValidations = crmSh
+    .getRange(2, 1, Math.max(exportRows.length, 1), crmHeaders.length)
+    .getDataValidations();
+
+  // Mapping (guard for empty mapping sheet)
+  const mapLastRow = mapSh.getLastRow();
+  const mappingData = mapLastRow > 1 ? mapSh.getRange(2, 1, mapLastRow - 1, 2).getValues() : [];
+
+  // Export header → index
+  const exportIndex = {};
+  exportHeaders.forEach((h, i) => (exportIndex[h] = i));
+
+  // CRM → Export mapping
+  const mapping = {};
+  mappingData.forEach(([crm, exp]) => {
+    if (crm && exp) mapping[crm] = exp;
+  });
+
+  // ---- Load language map (code -> full name) ----
+  const langLastRow = langSh.getLastRow();
+  const langData = langLastRow > 1 ? langSh.getRange(2, 1, langLastRow - 1, 2).getValues() : [];
+
+  const langMap = {};
+  langData.forEach(([code, name]) => {
+    if (!code || !name) return;
+    langMap[String(code).trim().toLowerCase()] = String(name).trim();
+  });
+
+  // Normalize incoming language values (supports: "fr", "fr-FR", "fr_FR", " fr ")
+  function normalizeLangCode_(v) {
+    if (v === null || v === undefined) return "";
+    const s = String(v).trim().toLowerCase();
+    if (!s) return "";
+    return s.split(/[-_]/)[0]; // "fr-FR" -> "fr"
+  }
+
+  function normalizeKey_(v) {
+    return String(v || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function isYouTubeErField_(crmHeader, exportHeader) {
+    const haystack = `${normalizeKey_(crmHeader)} ${normalizeKey_(exportHeader)}`;
+    const hasYouTube = haystack.includes("youtube");
+    const hasEr = /\ber\b/.test(haystack) || haystack.includes("engagement rate");
+    return hasYouTube && hasEr;
+  }
+
+  function parseMaybePercentNumber_(raw) {
+    if (raw === null || raw === undefined || raw === "") return null;
+    if (typeof raw === "number") return isFinite(raw) ? raw : null;
+
+    const cleaned = String(raw)
+      .trim()
+      .replace("%", "")
+      .replace(",", ".");
+
+    if (!cleaned) return null;
+    const parsed = Number(cleaned);
+    return isFinite(parsed) ? parsed : null;
+  }
+
+  // ---- Validation helpers (prevents setValues() from throwing) ----
+
+  // Build a Set of allowed dropdown values (list OR range). Returns null if not a dropdown.
+  function getAllowedSet(validation) {
+    if (!validation) return null;
+
+    const criteria = validation.getCriteriaType();
+    const critVals = validation.getCriteriaValues();
+
+    if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+      const list = critVals?.[0] || [];
+      return new Set(list.map(v => String(v)));
+    }
+
+    if (criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
+      const range = critVals?.[0];
+      if (!range) return null;
+      const vals = range.getValues().flat().filter(v => v !== "" && v !== null);
+      return new Set(vals.map(v => String(v)));
+    }
+
+    return null;
+  }
+
+  // Returns true if it's safe to write `value` into a cell with `validation`.
+  // For dropdowns: enforce membership.
+  // For other validation types we can't easily validate: skip writing to avoid runtime errors.
+  function canWriteValue(validation, value) {
+    if (value === "" || value === null) return true; // blanks are safe
+    if (!validation) return true;
+
+    const criteria = validation.getCriteriaType();
+
+    if (
+      criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST ||
+      criteria === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE
+    ) {
+      const allowedSet = getAllowedSet(validation);
+      if (!allowedSet) return false;
+      return allowedSet.has(String(value));
+    }
+
+    // Unknown/other validation types (NUMBER_*, DATE_*, CUSTOM_FORMULA, etc.)
+    // To guarantee the script never fails, don't write into these cells.
+    return false;
+  }
+
+  // ---- Build desired output (invalid dropdown values become "") ----
+  const output = exportRows.map((row, rIdx) =>
+    crmHeaders.map((header, cIdx) => {
+      let value = "";
+
+      if (header === CONTACT_TYPE_HEADER) {
+        value = row.some(v => v !== "" && v !== null) ? CONTACT_TYPE_VALUE : "";
+      } else {
+        const mappedHeader = mapping[header];
+        if (!mappedHeader) return "";
+
+        const idx = exportIndex[mappedHeader];
+        if (idx === undefined) return "";
+
+        value = row[idx];
+
+        // HypeAuditor exports ER as percent points (e.g. 3.47), while
+        // HubSpot percentage fields expect fractions (0.0347 for 3.47%).
+        if (isYouTubeErField_(header, mappedHeader)) {
+          const er = parseMaybePercentNumber_(value);
+          value = er === null ? "" : er / 100;
+        }
+      }
+
+      // Hide locked values
+      if (value === "🔒") value = "";
+
+      // --- Special case: map Language codes -> full language name ---
+      if (header === LANGUAGE_CRM_HEADER) {
+        const code = normalizeLangCode_(value);
+        value = langMap[code] || ""; // unknown -> blank (safe for validation)
+      }
+
+      // Validation safety (dropdown list/range, and conservative skip for other validation types)
+      const validation = crmValidations[rIdx]?.[cIdx];
+      if (!canWriteValue(validation, value)) return "";
+
+      return value;
+    })
+  );
+
+  if (!output.length) return;
+
+  // ---- Read existing values + formulas so we can preserve them ----
+  const targetRange = crmSh.getRange(2, 1, output.length, crmHeaders.length);
+  const existingValues = targetRange.getValues();
+  const existingFormulas = targetRange.getFormulas(); // "" if no formula in that cell
+
+  // Identify columns that have ANY formulas in the target rows (we won't write these columns at all)
+  const colHasFormula = crmHeaders.map((_, c) => existingFormulas.some(r => r[c] !== ""));
+
+  // Merge:
+  // - don't overwrite existing cells with ""
+  // - don't write values that would violate validation (keeps existing instead)
+  const nextValues = output.map((row, r) =>
+    row.map((val, c) => {
+      const validation = crmValidations[r]?.[c];
+
+      if (val === "") return existingValues[r][c];
+      if (!canWriteValue(validation, val)) return existingValues[r][c];
+
+      return val;
+    })
+  );
+
+  const skipCol = crmHeaders.indexOf(SKIP_HEADER); // 0-based
+  if (skipCol === -1) throw new Error(`Header not found: "${SKIP_HEADER}"`);
+
+  // Write contiguous blocks, skipping:
+  // - the SKIP_HEADER column
+  // - any column that contains formulas (so formulas never get overwritten)
+  function writeNonFormulaBlocks(colStartInclusive, colEndInclusive) {
+    let c = colStartInclusive;
+
+    while (c <= colEndInclusive) {
+      // advance to next writable column
+      while (c <= colEndInclusive && (c === skipCol || colHasFormula[c])) c++;
+      if (c > colEndInclusive) break;
+
+      const blockStart = c;
+
+      // extend block while columns are writable
+      while (c <= colEndInclusive && c !== skipCol && !colHasFormula[c]) c++;
+
+      const blockEnd = c - 1;
+      const width = blockEnd - blockStart + 1;
+
+      const blockValues = nextValues.map(r => r.slice(blockStart, blockEnd + 1));
+      crmSh.getRange(2, blockStart + 1, output.length, width).setValues(blockValues);
+    }
+  }
+
+  // Write left side (before "Deal name")
+  if (skipCol > 0) writeNonFormulaBlocks(0, skipCol - 1);
+
+  // Write right side (after "Deal name")
+  if (skipCol < crmHeaders.length - 1) writeNonFormulaBlocks(skipCol + 1, crmHeaders.length - 1);
+}
+
+function exportToCsv() {
+  const CRM_SHEET = "HubSpot Import";
+  const APPROVED_HEADER = "Approved by CM";
+  const EMAIL_HEADER = "Email";
+
+  // Columns to EXCLUDE from the REJECTED export only
+  const REJECTED_EXCLUDE_HEADERS = [
+    "Campaign Name",
+    "Month",
+    "Year",
+    "Client name",
+    "Deal owner",
+    "Deal name",
+    "Pipeline",
+    "Deal stage",
+    "Amount",
+    "Currency",
+    "Deal Type",
+    "Activation Type"
+  ];
+
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CRM_SHEET);
+  if (!sh) throw new Error(`Sheet not found: "${CRM_SHEET}"`);
+
+  const lastRow = sh.getLastRow();
+  const lastCol = sh.getLastColumn();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("No data to export.");
+    return;
+  }
+
+  // Use DISPLAY values to mimic File > Download > CSV behavior
+  const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  const headers = values[0];
+  const rows = values.slice(1);
+
+  const approvedIdx = headers.indexOf(APPROVED_HEADER);
+  const emailIdx = headers.indexOf(EMAIL_HEADER);
+
+  if (approvedIdx === -1) throw new Error(`Header not found: "${APPROVED_HEADER}"`);
+  if (emailIdx === -1) throw new Error(`Header not found: "${EMAIL_HEADER}"`);
+
+  // Only rows with Email filled
+  const filtered = rows.filter(r => {
+    const email = r[emailIdx];
+    return email !== "" && email !== null && String(email).trim() !== "";
+  });
+
+  const approvedTrue = [];
+  const approvedFalse = [];
+
+  filtered.forEach(r => {
+    const approvedCell = String(r[approvedIdx]).trim().toLowerCase();
+    const approved = approvedCell === "true" || approvedCell === "yes" || approvedCell === "1";
+    (approved ? approvedTrue : approvedFalse).push(r);
+  });
+
+  if (approvedTrue.length === 0 && approvedFalse.length === 0) {
+    SpreadsheetApp.getUi().alert("No rows with a filled Email column to export.");
+    return;
+  }
+
+  // ---- Build rejected export view (drop specified columns) ----
+  const excludeSet = new Set(REJECTED_EXCLUDE_HEADERS.map(h => String(h).trim().toLowerCase()));
+  const rejectedKeepIdx = headers
+    .map((h, i) => ({ h, i }))
+    .filter(x => !excludeSet.has(String(x.h).trim().toLowerCase()))
+    .map(x => x.i);
+
+  const rejectedHeaders = rejectedKeepIdx.map(i => headers[i]);
+  const rejectedRows = approvedFalse.map(r => rejectedKeepIdx.map(i => r[i]));
+
+  const tz = Session.getScriptTimeZone();
+  const stamp = Utilities.formatDate(new Date(), tz, "yyyyMMdd-HHmmss");
+  const baseName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
+
+  const files = [];
+
+  // Outreach: keep full headers/rows (unchanged)
+  if (approvedTrue.length > 0) {
+    files.push({
+      name: `Outreach - ${baseName} - ${stamp}.csv`,
+      bytes: toCsvBytes_([headers, ...approvedTrue])
+    });
+  }
+
+  // Rejected: export WITHOUT excluded columns
+  if (rejectedRows.length > 0) {
+    files.push({
+      name: `Rejected - ${baseName} - ${stamp}.csv`,
+      bytes: toCsvBytes_([rejectedHeaders, ...rejectedRows])
+    });
+  }
+
+  showDownloadDialog_(files);
+}
+
+/**
+ * Returns UTF-8 CSV BYTES with BOM (matches Google Sheets download behavior more closely).
+ */
+function toCsvBytes_(grid) {
+  const csv = grid
+    .map(row =>
+      row
+        .map(cell => {
+          if (cell === null || cell === undefined) return "";
+          let s = String(cell);
+
+          // Normalize line breaks like Sheets CSV export
+          s = s.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+          const needsQuotes = /[",\n]/.test(s);
+          s = s.replace(/"/g, '""');
+          return needsQuotes ? `"${s}"` : s;
+        })
+        .join(",")
+    )
+    .join("\r\n");
+
+  // UTF-8 BOM so Excel + others keep special chars correctly
+  const withBom = "\uFEFF" + csv;
+
+  // Convert to bytes explicitly (UTF-8)
+  return Utilities.newBlob(withBom, "text/csv;charset=utf-8").getBytes();
+}
+
+function showDownloadDialog_(files) {
+  const fileData = files.map(f => ({
+    name: f.name,
+    // base64 of BYTES (safe for unicode)
+    base64: Utilities.base64Encode(f.bytes)
+  }));
+
+  const html = HtmlService.createHtmlOutput(`
+    <html>
+      <body>
+        <script>
+          const files = ${JSON.stringify(fileData)};
+
+          function downloadFile(name, base64) {
+            const link = document.createElement("a");
+            link.href = "data:text/csv;charset=utf-8;base64," + base64;
+            link.download = name;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+          }
+
+          files.forEach(f => downloadFile(f.name, f.base64));
+          google.script.host.close();
+        </script>
+        <p>Preparing download...</p>
+      </body>
+    </html>
+  `).setWidth(300).setHeight(80);
+
+  SpreadsheetApp.getUi().showModalDialog(html, "Exporting CSV...");
+}
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu("HypeAuditor → HubSpot")
+    .addItem("Fill CRM Import (SCOUTERS)", "fillCrmImport")
+    .addSeparator()
+    .addItem("Export to CSV (CMs)", "exportToCsv")
+    .addSeparator()
+    .addItem("🔵 CM input", "showLegend")
+    .addItem("🟡 Scouter input", "showLegend")
+    .addItem("🔴 Filled automatically", "showLegend")
+    .addItem("⚪ Optional", "showLegend")
+    .addToUi();
+}
+
+function showLegend() {
+  SpreadsheetApp.getUi().alert(
+    "Legend:\n\n" +
+    "🔵 CM input\n" +
+    "🟡 Scouter input\n" +
+    "🔴 Filled automatically\n" +
+    "⚪ Optional"
+  );
+}
