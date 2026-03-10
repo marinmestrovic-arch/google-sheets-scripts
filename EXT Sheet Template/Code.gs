@@ -268,6 +268,8 @@ function fillMissingAverageViews_Pitching() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
+    .addItem("Import HubSpot segment to Pitching", "importHubSpotDealsListToPitching")
+    .addSeparator()
     .addItem("Push confirmed creators to Campaigns", "pushConfirmedCreatorsToCampaigns")
     .addItem("Archive pitches", "archivePitches")
     .addSeparator()
@@ -768,4 +770,384 @@ function iso8601DurationToSeconds_(duration) {
   const minutes = Number(match[2] || 0);
   const seconds = Number(match[3] || 0);
   return (hours * 3600) + (minutes * 60) + seconds;
+}
+
+/***************************************
+ * HUBSPOT -> PITCHING IMPORT
+ ***************************************/
+
+const HUBSPOT_TOKEN_PROP_ = "HUBSPOT_PRIVATE_APP_TOKEN";
+const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
+
+// Keep all guessed internal names here so they are easy to fix later.
+const HUBSPOT_PROP_MAP_ = {
+  deal: {
+    dealType: "dealtype",
+    activationType: "activation_type",
+    extAmount: "ext_amount"
+  },
+  contact: {
+    firstName: "firstname",                 // often standard HubSpot field
+    lastName: "lastname",                   // often standard HubSpot field
+    youtubeUrl: "youtube_url",
+    countryRegion: "country",
+    influencerVertical: "influencer_vertical",
+    youtubeVideoAverageViews: "youtube_video_average_views"
+  }
+};
+
+function importHubSpotDealsListToPitching() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Pitching");
+  if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
+
+  const segmentId = promptForHubSpotSegmentId_();
+  if (!segmentId) {
+    return Logger.log("ℹ️ Import cancelled: no HubSpot segment ID provided.");
+  }
+
+  const token = getHubSpotToken_();
+  if (!token) {
+    Logger.log("❌ Missing HubSpot token. Set Script Property: HUBSPOT_PRIVATE_APP_TOKEN");
+    return;
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (!data.length) return Logger.log("❌ Pitching sheet is empty.");
+
+  const header = (data[0] || []).map(v => String(v || "").trim());
+
+  const requiredSheetCols = [
+    "Channel Name",
+    "Deal Type",
+    "Activation Type",
+    "Channel URL",
+    "Country/Region",
+    "Influencer Vertical",
+    "Rate",
+    "Average Views",
+    "HubSpot Record ID"
+  ];
+
+  const missingSheetCols = requiredSheetCols.filter(name => header.indexOf(name) === -1);
+  if (missingSheetCols.length) {
+    return Logger.log("❌ Pitching missing required columns: " + missingSheetCols.join(", "));
+  }
+
+  const activeSection0 = findSectionRowByLabel_(data, "Active Pitches");
+  if (activeSection0 === -1) {
+    return Logger.log("❌ Could not find 'Active Pitches' section in Pitching.");
+  }
+
+  const templateRow1 = activeSection0 + 2; // row below the section label
+  if (templateRow1 > sheet.getLastRow()) {
+    return Logger.log("❌ Template row below 'Active Pitches' not found.");
+  }
+
+  Logger.log(`▶️ Fetching deal IDs from HubSpot segment ${segmentId}...`);
+  const dealIds = fetchHubSpotListDealIds_(segmentId, token);
+  if (!dealIds.length) {
+    return Logger.log(`ℹ️ No deal IDs found in HubSpot segment ${segmentId}.`);
+  }
+  Logger.log(`✅ Got ${dealIds.length} deal ID(s) from HubSpot segment ${segmentId}.`);
+
+  const deals = fetchHubSpotDealsByIds_(dealIds, token);
+  if (!deals.length) {
+    return Logger.log("ℹ️ No deals returned from HubSpot batch read.");
+  }
+
+  const dealToContactId = fetchDealToPrimaryContactMap_(dealIds, token);
+  const contactIds = Object.values(dealToContactId).filter(Boolean);
+
+  let contactsById = {};
+  if (contactIds.length) {
+    contactsById = fetchHubSpotContactsByIds_(contactIds, token);
+  }
+
+  const rowsToInsert = [];
+  for (const deal of deals) {
+    const dealId = String(deal.id || "").trim();
+    if (!dealId) continue;
+
+    const contactId = dealToContactId[dealId];
+    const contact = contactId ? contactsById[String(contactId)] : null;
+
+    const row = mapHubSpotDealAndContactToPitchingRow_(deal, contact, header);
+    rowsToInsert.push(row);
+  }
+
+  if (!rowsToInsert.length) {
+    return Logger.log("ℹ️ No rows to insert.");
+  }
+
+  insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1);
+
+  Logger.log(`✅ Imported ${rowsToInsert.length} row(s) into Pitching.`);
+}
+
+
+/***************************************
+ * HUBSPOT FETCHERS
+ ***************************************/
+
+function getHubSpotToken_() {
+  return String(
+    PropertiesService.getScriptProperties().getProperty(HUBSPOT_TOKEN_PROP_) || ""
+  ).trim();
+}
+
+function promptForHubSpotSegmentId_() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(
+    "Import HubSpot segment to Pitching",
+    "Paste the HubSpot segment ID to import.",
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return "";
+
+  const segmentId = String(response.getResponseText() || "").trim();
+  if (!segmentId) {
+    ui.alert("HubSpot segment ID is required.");
+    return "";
+  }
+
+  return segmentId;
+}
+
+function hubspotHeaders_(token) {
+  return {
+    Authorization: "Bearer " + token,
+    "Content-Type": "application/json"
+  };
+}
+
+function hubspotFetchJson_(url, token, options) {
+  const opts = Object.assign(
+    {
+      method: "get",
+      muteHttpExceptions: true,
+      headers: hubspotHeaders_(token)
+    },
+    options || {}
+  );
+
+  const resp = UrlFetchApp.fetch(url, opts);
+  const code = resp.getResponseCode();
+  const text = String(resp.getContentText() || "");
+
+  if (code >= 400) {
+    Logger.log(`❌ HubSpot API error ${code}: ${text.slice(0, 1000)}`);
+    return null;
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    Logger.log("❌ HubSpot API parse error: " + e);
+    return null;
+  }
+}
+
+function fetchHubSpotListDealIds_(listId, token) {
+  const ids = [];
+  let after = null;
+
+  do {
+    let url = `${HUBSPOT_API_BASE_}/crm/v3/lists/${encodeURIComponent(listId)}/memberships`;
+    if (after != null) {
+      url += `?after=${encodeURIComponent(after)}`;
+    }
+
+    const data = hubspotFetchJson_(url, token);
+    if (!data) break;
+
+    const results = Array.isArray(data.results) ? data.results : [];
+    for (const item of results) {
+      const recordId = item && item.recordId != null ? String(item.recordId).trim() : "";
+      if (recordId) ids.push(recordId);
+    }
+
+    after = data.paging && data.paging.next && data.paging.next.after
+      ? data.paging.next.after
+      : null;
+  } while (after);
+
+  return ids;
+}
+
+function fetchHubSpotDealsByIds_(dealIds, token) {
+  const chunks = chunkArray_(dealIds, 100);
+  const out = [];
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) })),
+      properties: [
+        HUBSPOT_PROP_MAP_.deal.dealType,
+        HUBSPOT_PROP_MAP_.deal.activationType,
+        HUBSPOT_PROP_MAP_.deal.extAmount
+      ]
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/deals/batch/read`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+    out.push.apply(out, data.results);
+  }
+
+  return out;
+}
+
+function fetchDealToPrimaryContactMap_(dealIds, token) {
+  const chunks = chunkArray_(dealIds, 1000);
+  const out = {};
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) }))
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v4/associations/deals/contacts/batch/read`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+
+    for (const item of data.results) {
+      const fromId = item && item.from && item.from.id != null ? String(item.from.id) : "";
+      const to = Array.isArray(item.to) ? item.to : [];
+      const firstContactId = to.length && to[0] && to[0].toObjectId != null
+        ? String(to[0].toObjectId)
+        : "";
+      if (fromId && firstContactId) out[fromId] = firstContactId;
+    }
+  }
+
+  return out;
+}
+
+function fetchHubSpotContactsByIds_(contactIds, token) {
+  const chunks = chunkArray_(uniqueStrings_(contactIds), 100);
+  const out = {};
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) })),
+      properties: [
+        HUBSPOT_PROP_MAP_.contact.firstName,
+        HUBSPOT_PROP_MAP_.contact.lastName,
+        HUBSPOT_PROP_MAP_.contact.youtubeUrl,
+        HUBSPOT_PROP_MAP_.contact.countryRegion,
+        HUBSPOT_PROP_MAP_.contact.influencerVertical,
+        HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews
+      ]
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/contacts/batch/read`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+
+    for (const item of data.results) {
+      if (item && item.id != null) {
+        out[String(item.id)] = item;
+      }
+    }
+  }
+
+  return out;
+}
+
+
+/***************************************
+ * MAPPING + INSERT
+ ***************************************/
+
+function mapHubSpotDealAndContactToPitchingRow_(deal, contact, header) {
+  const row = new Array(header.length).fill("");
+
+  const dealProps = (deal && deal.properties) ? deal.properties : {};
+  const contactProps = (contact && contact.properties) ? contact.properties : {};
+
+  const firstName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.firstName]);
+  const lastName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.lastName]);
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+
+  setIfColumnExists_(row, header, "Channel Name", fullName);
+  setIfColumnExists_(row, header, "Deal Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.dealType]));
+  setIfColumnExists_(row, header, "Activation Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.activationType]));
+  setIfColumnExists_(row, header, "Channel URL", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeUrl]));
+  setIfColumnExists_(row, header, "Country/Region", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.countryRegion]));
+  setIfColumnExists_(row, header, "Influencer Vertical", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.influencerVertical]));
+  setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.extAmount]));
+  setIfColumnExists_(row, header, "Average Views", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews]));
+  setIfColumnExists_(row, header, "HubSpot Record ID", String(deal.id || "").trim());
+
+  // Leave these blank on purpose:
+  // Availability, CPM, ARCH. Comment, Approved, Rejected, Still Checking, Counteroffer
+
+  return row;
+}
+
+function insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1) {
+  if (!rowsToInsert.length) return;
+
+  const numCols = header.length;
+  const insertAt1 = templateRow1; // insert before the template row
+  const formatSourceRow1 = templateRow1 + rowsToInsert.length; // original template row shifts down
+
+  sheet.insertRowsBefore(insertAt1, rowsToInsert.length);
+
+  const writeRange = sheet.getRange(insertAt1, 1, rowsToInsert.length, numCols);
+  const templateRange = getSafeFormatRow_(sheet, formatSourceRow1, numCols);
+
+  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+  sheet.setRowHeights(insertAt1, rowsToInsert.length, sheet.getRowHeight(formatSourceRow1));
+  writeRange.setValues(rowsToInsert);
+}
+
+
+/***************************************
+ * SMALL HELPERS
+ ***************************************/
+
+function safeHubSpotValue_(value) {
+  return value == null ? "" : value;
+}
+
+function setIfColumnExists_(row, header, columnName, value) {
+  const idx = header.indexOf(columnName);
+  if (idx !== -1) row[idx] = value;
+}
+
+function chunkArray_(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
+function uniqueStrings_(arr) {
+  return Array.from(new Set((arr || []).map(v => String(v || "").trim()).filter(Boolean)));
 }
