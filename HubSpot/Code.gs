@@ -259,6 +259,11 @@ const HUBSPOT_IMPORT_TOKEN_PROPS_ = [
   "HUBSPOT_PRIVATE_APP_TOKEN",
   "HUBSPOT_API_KEY"
 ];
+const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
+// Set this once in the template file after deploying the shared importer web app.
+// All future copies created from the template will inherit the URL automatically.
+const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ = "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
+const HUBSPOT_SHARED_IMPORT_ACTION_ = "startImport";
 
 const HUBSPOT_IMPORT_OBJECT_SPECS_ = [
   {
@@ -376,36 +381,66 @@ function importToHubSpot() {
 
   try {
     const ss = SpreadsheetApp.getActive();
-    const token = getHubSpotImportToken_();
-    if (!token) {
+    const sheetPayload = prepareHubSpotImportSheetPayload_(ss);
+    if (sheetPayload.emptyReason) {
+      ui.alert(sheetPayload.emptyReason);
+      return;
+    }
+
+    if (hasHubSpotSharedImporterLibrary_()) {
+      const startedImport = startHubSpotImportViaLibrary_(sheetPayload);
       ui.alert(
-        "Missing HubSpot token.\n\n" +
-        "Set one of these Script Properties: " +
-        HUBSPOT_IMPORT_TOKEN_PROPS_.join(", ") +
-        ".\n\n" +
-        "If you use HUBSPOT_API_KEY as the property name, the value still needs to be a private app or service key token."
+        buildHubSpotImportSubmittedMessage_({
+          rowCount: startedImport.rowCount || sheetPayload.rowCount,
+          columnCount: startedImport.columnCount || sheetPayload.columnCount,
+          objectLabels: startedImport.objectLabels || [],
+          importId: startedImport.importId,
+          importState: startedImport.state
+        })
       );
       return;
     }
 
-    const prepared = prepareHubSpotImport_(ss, token);
-    if (prepared.emptyReason) {
-      ui.alert(prepared.emptyReason);
+    const sharedWebAppUrl = getHubSpotSharedImportWebAppUrl_();
+    if (sharedWebAppUrl) {
+      const startedImport = startHubSpotImportViaWebApp_(sharedWebAppUrl, sheetPayload);
+      ui.alert(
+        buildHubSpotImportSubmittedMessage_({
+          rowCount: startedImport.rowCount || sheetPayload.rowCount,
+          columnCount: startedImport.columnCount || sheetPayload.columnCount,
+          objectLabels: startedImport.objectLabels || [],
+          importId: startedImport.importId,
+          importState: startedImport.state
+        })
+      );
       return;
     }
 
+    const token = getHubSpotImportToken_();
+    if (!token) {
+      ui.alert(
+        "Missing HubSpot importer configuration.\n\n" +
+        "Recommended: add the shared Apps Script library with identifier " +
+        HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ +
+        ", or set HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ in this file.\n\n" +
+        "Fallback: set one of these Script Properties in this copy: " +
+        HUBSPOT_IMPORT_TOKEN_PROPS_.join(", ") +
+        "."
+      );
+      return;
+    }
+
+    const prepared = prepareHubSpotImport_(sheetPayload, token);
     const startedImport = startHubSpotImport_(token, prepared.fileBlob, prepared.importRequest);
-    const importId = startedImport && startedImport.id != null ? String(startedImport.id) : "not returned";
-    const importState = startedImport && startedImport.state ? startedImport.state : "STARTED";
 
     ui.alert(
-      "HubSpot import submitted.\n\n" +
-      `Rows: ${prepared.rowCount}\n` +
-      `Columns: ${prepared.columnCount}\n` +
-      `Objects: ${prepared.objectLabels.join(", ")}\n` +
-      `Import ID: ${importId}\n` +
-      `State: ${importState}\n\n` +
-      "HubSpot continues processing the import in the background."
+      buildHubSpotImportSubmittedMessage_({
+        rowCount: prepared.rowCount,
+        columnCount: prepared.columnCount,
+        objectLabels: prepared.objectLabels,
+        importId: startedImport && startedImport.id != null ? String(startedImport.id) : "not returned",
+        importState: startedImport && startedImport.state ? startedImport.state : "STARTED"
+      })
     );
   } catch (error) {
     const message = error && error.message ? error.message : String(error);
@@ -414,7 +449,7 @@ function importToHubSpot() {
   }
 }
 
-function prepareHubSpotImport_(ss, token) {
+function prepareHubSpotImportSheetPayload_(ss) {
   const sh = ss.getSheetByName(HUBSPOT_IMPORT_SHEET_);
   if (!sh) throw new Error(`Sheet not found: "${HUBSPOT_IMPORT_SHEET_}"`);
 
@@ -452,6 +487,21 @@ function prepareHubSpotImport_(ss, token) {
   }
 
   const activeRows = importRows.map(row => activeColIndexes.map(idx => row[idx]));
+  const spreadsheetName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
+
+  return {
+    spreadsheetName,
+    spreadsheetLocale: ss.getSpreadsheetLocale(),
+    headers: activeHeaders,
+    rows: activeRows,
+    rowCount: activeRows.length,
+    columnCount: activeHeaders.length
+  };
+}
+
+function prepareHubSpotImport_(sheetPayload, token) {
+  const activeHeaders = sheetPayload.headers;
+  const activeRows = sheetPayload.rows;
   const objectCatalog = loadHubSpotImportObjectCatalog_(token);
   const resolvedColumns = resolveHubSpotImportColumns_(activeHeaders, objectCatalog);
 
@@ -465,22 +515,33 @@ function prepareHubSpotImport_(ss, token) {
     );
   }
 
-  const baseName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
-  const fileName = `HubSpot Import - ${baseName}.csv`;
+  const fileName = `HubSpot Import - ${sheetPayload.spreadsheetName}.csv`;
   const fileBlob = Utilities.newBlob(toCsvBytes_([activeHeaders].concat(activeRows)), "text/csv", fileName);
   const importRequest = buildHubSpotImportRequest_(
     fileName,
     resolvedColumns.mappings,
-    ss.getSpreadsheetLocale()
+    sheetPayload.spreadsheetLocale
   );
 
   return {
     fileBlob,
     importRequest,
-    rowCount: activeRows.length,
-    columnCount: activeHeaders.length,
+    rowCount: sheetPayload.rowCount,
+    columnCount: sheetPayload.columnCount,
     objectLabels: resolvedColumns.objectLabels
   };
+}
+
+function buildHubSpotImportSubmittedMessage_(details) {
+  return (
+    "HubSpot import submitted.\n\n" +
+    `Rows: ${details.rowCount}\n` +
+    `Columns: ${details.columnCount}\n` +
+    `Objects: ${(details.objectLabels || []).join(", ")}\n` +
+    `Import ID: ${details.importId || "not returned"}\n` +
+    `State: ${details.importState || "STARTED"}\n\n` +
+    "HubSpot continues processing the import in the background."
+  );
 }
 
 /**
@@ -1057,6 +1118,18 @@ function findDuplicateHubSpotHeaders_(headers) {
   return Object.keys(duplicates).map(key => seen[key]);
 }
 
+function getHubSpotSharedImportWebAppUrl_() {
+  return String(HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ || "").trim();
+}
+
+function hasHubSpotSharedImporterLibrary_() {
+  return (
+    typeof HubSpotSharedImporter !== "undefined" &&
+    HubSpotSharedImporter &&
+    typeof HubSpotSharedImporter.startImport === "function"
+  );
+}
+
 function getHubSpotImportToken_() {
   const props = PropertiesService.getScriptProperties();
 
@@ -1066,6 +1139,74 @@ function getHubSpotImportToken_() {
   }
 
   return "";
+}
+
+function startHubSpotImportViaLibrary_(sheetPayload) {
+  const result = HubSpotSharedImporter.startImport({
+    spreadsheetName: sheetPayload.spreadsheetName,
+    spreadsheetLocale: sheetPayload.spreadsheetLocale,
+    headers: sheetPayload.headers,
+    rows: sheetPayload.rows
+  });
+
+  if (!result || result.ok !== true) {
+    throw new Error(
+      result && result.error
+        ? result.error
+        : "Shared HubSpot importer library failed."
+    );
+  }
+
+  return result;
+}
+
+function startHubSpotImportViaWebApp_(webAppUrl, sheetPayload) {
+  const response = UrlFetchApp.fetch(webAppUrl, {
+    method: "post",
+    muteHttpExceptions: true,
+    followRedirects: false,
+    contentType: "application/json",
+    headers: {
+      Authorization: "Bearer " + ScriptApp.getOAuthToken()
+    },
+    payload: JSON.stringify({
+      action: HUBSPOT_SHARED_IMPORT_ACTION_,
+      spreadsheetName: sheetPayload.spreadsheetName,
+      spreadsheetLocale: sheetPayload.spreadsheetLocale,
+      headers: sheetPayload.headers,
+      rows: sheetPayload.rows
+    })
+  });
+
+  const code = response.getResponseCode();
+  const text = String(response.getContentText() || "");
+
+  if (code === 302 || code === 401 || code === 403) {
+    throw new Error(
+      "Shared HubSpot importer web app denied access. " +
+      "Confirm the deployment URL is correct and the web app is deployed to users who should run this template."
+    );
+  }
+
+  if (code >= 400) {
+    throw new Error(`Shared HubSpot importer error ${code}: ${text.slice(0, 1000)}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(
+      "Shared HubSpot importer returned a non-JSON response. " +
+      "This usually means the deployment URL is wrong or the web app access settings are too restrictive."
+    );
+  }
+
+  if (!parsed || parsed.ok !== true) {
+    throw new Error(parsed && parsed.error ? parsed.error : "Shared HubSpot importer failed.");
+  }
+
+  return parsed;
 }
 
 function startHubSpotImport_(token, fileBlob, importRequest) {
