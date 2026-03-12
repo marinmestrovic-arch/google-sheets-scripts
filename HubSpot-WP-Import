@@ -251,24 +251,7 @@ function fillCrmImport() {
 
 function exportToCsv() {
   const CRM_SHEET = "HubSpot Import";
-  const APPROVED_HEADER = "Approved by CM";
   const EMAIL_HEADER = "Email";
-
-  // Columns to EXCLUDE from the REJECTED export only
-  const REJECTED_EXCLUDE_HEADERS = [
-    "Campaign Name",
-    "Month",
-    "Year",
-    "Client name",
-    "Deal owner",
-    "Deal name",
-    "Pipeline",
-    "Deal stage",
-    "Amount",
-    "Currency",
-    "Deal Type",
-    "Activation Type"
-  ];
 
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(CRM_SHEET);
@@ -286,65 +269,28 @@ function exportToCsv() {
   const headers = values[0];
   const rows = values.slice(1);
 
-  const approvedIdx = headers.indexOf(APPROVED_HEADER);
   const emailIdx = headers.indexOf(EMAIL_HEADER);
 
-  if (approvedIdx === -1) throw new Error(`Header not found: "${APPROVED_HEADER}"`);
   if (emailIdx === -1) throw new Error(`Header not found: "${EMAIL_HEADER}"`);
 
   // Only rows with Email filled
-  const filtered = rows.filter(r => {
+  const exportRows = rows.filter(r => {
     const email = r[emailIdx];
     return email !== "" && email !== null && String(email).trim() !== "";
   });
 
-  const approvedTrue = [];
-  const approvedFalse = [];
-
-  filtered.forEach(r => {
-    const approvedCell = String(r[approvedIdx]).trim().toLowerCase();
-    const approved = approvedCell === "true" || approvedCell === "yes" || approvedCell === "1";
-    (approved ? approvedTrue : approvedFalse).push(r);
-  });
-
-  if (approvedTrue.length === 0 && approvedFalse.length === 0) {
+  if (exportRows.length === 0) {
     SpreadsheetApp.getUi().alert("No rows with a filled Email column to export.");
     return;
   }
 
-  // ---- Build rejected export view (drop specified columns) ----
-  const excludeSet = new Set(REJECTED_EXCLUDE_HEADERS.map(h => String(h).trim().toLowerCase()));
-  const rejectedKeepIdx = headers
-    .map((h, i) => ({ h, i }))
-    .filter(x => !excludeSet.has(String(x.h).trim().toLowerCase()))
-    .map(x => x.i);
-
-  const rejectedHeaders = rejectedKeepIdx.map(i => headers[i]);
-  const rejectedRows = approvedFalse.map(r => rejectedKeepIdx.map(i => r[i]));
-
-  const tz = Session.getScriptTimeZone();
-  const stamp = Utilities.formatDate(new Date(), tz, "yyyyMMdd-HHmmss");
   const baseName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
-
-  const files = [];
-
-  // Outreach: keep full headers/rows (unchanged)
-  if (approvedTrue.length > 0) {
-    files.push({
-      name: `Outreach - ${baseName} - ${stamp}.csv`,
-      bytes: toCsvBytes_([headers, ...approvedTrue])
-    });
-  }
-
-  // Rejected: export WITHOUT excluded columns
-  if (rejectedRows.length > 0) {
-    files.push({
-      name: `Rejected - ${baseName} - ${stamp}.csv`,
-      bytes: toCsvBytes_([rejectedHeaders, ...rejectedRows])
-    });
-  }
-
-  showDownloadDialog_(files);
+  showDownloadDialog_([
+    {
+      name: `Export - ${baseName}.csv`,
+      bytes: toCsvBytes_([headers, ...exportRows])
+    }
+  ]);
 }
 
 /**
@@ -415,7 +361,7 @@ function onOpen() {
   ui.createMenu("HypeAuditor → HubSpot")
     .addItem("Fill CRM Import (SCOUTERS)", "fillCrmImport")
     .addSeparator()
-    .addItem("Export to CSV (CMs)", "exportToCsv")
+    .addItem("Export to CSV", "exportToCsv")
     .addSeparator()
     .addItem("🔵 CM input", "showLegend")
     .addItem("🟡 Scouter input", "showLegend")
