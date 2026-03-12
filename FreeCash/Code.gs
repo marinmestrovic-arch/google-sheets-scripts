@@ -7,78 +7,120 @@ function fillMissingAverageViews_PitchList_Safe() {
   const lastCol = sh.getLastColumn();
   if (lastRow < 2 || lastCol < 1) return Logger.log("ℹ️ Pitch List has no data.");
 
-  const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  const displayValues = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  const rawValues = sh.getRange(1, 1, lastRow, lastCol).getValues();
 
-  const headerSearchRows = Math.min(lastRow, 5);
-  let headerRow1 = -1;
-  let header = [];
-  let urlCol = -1;
-  let avgCol = -1;
-  let nameCol = -1;
+  const headerRow1 = 2;
+  const header = (displayValues[headerRow1 - 1] || []).map(v => String(v || "").trim());
+  const urlCol = header.indexOf("Channel URL");
+  const avgCol = header.indexOf("Average Views");
+  const rateCol = header.indexOf("Rate");
+  const cpmCol = header.indexOf("CPM");
+  const nameCol = header.indexOf("Channel Name");
 
-  for (let r = 1; r <= headerSearchRows; r++) {
-    const candidate = (values[r - 1] || []).map(v => String(v || "").trim());
-    const candidateUrlCol = candidate.indexOf("Channel URL");
-    const candidateAvgCol = candidate.indexOf("Average Views");
-    if (candidateUrlCol !== -1 && candidateAvgCol !== -1) {
-      headerRow1 = r;
-      header = candidate;
-      urlCol = candidateUrlCol;
-      avgCol = candidateAvgCol;
-      nameCol = header.indexOf("Channel Name");
-      break;
-    }
+  if (urlCol === -1 || avgCol === -1) {
+    return Logger.log("❌ Missing required headers on row 2: Channel URL and/or Average Views.");
   }
 
-  if (headerRow1 === -1) {
-    return Logger.log("❌ Missing required headers: Channel URL and/or Average Views (searched rows 1-5).");
-  }
+  const canWriteCpm = rateCol !== -1 && cpmCol !== -1;
+  if (!canWriteCpm) Logger.log("⚠️ CPM skipped: missing Rate and/or CPM header on row 2.");
 
   const startDataRow1 = headerRow1 + 1;
-  if (startDataRow1 > lastRow) return Logger.log("ℹ️ No data rows below header.");
+  if (startDataRow1 > lastRow) return Logger.log("ℹ️ No data rows below header row 2.");
 
   const updates = [];
   let checked = 0;
-  let missing = 0;
+  let avgMissing = 0;
+  let avgComputed = 0;
+  let cpmMissing = 0;
+  let cpmComputed = 0;
   let failed = 0;
 
   for (let r = startDataRow1; r <= lastRow; r++) {
-    const row = values[r - 1];
-    if (!row || row.join("").trim() === "") continue;
+    const rowDisplay = displayValues[r - 1];
+    const rowRaw = rawValues[r - 1];
+    if (!rowDisplay || rowDisplay.join("").trim() === "") continue;
 
-    const url = String(row[urlCol] || "").trim();
-    const avgCell = String(row[avgCol] || "").trim();
-    const name = nameCol !== -1 ? String(row[nameCol] || "").trim() : "";
+    const url = String(rowDisplay[urlCol] || "").trim();
+    const avgCell = String(rowDisplay[avgCol] || "").trim();
+    const cpmCell = canWriteCpm ? String(rowDisplay[cpmCol] || "").trim() : "";
+    const name = nameCol !== -1 ? String(rowDisplay[nameCol] || "").trim() : "";
 
     checked++;
-    if (!url || avgCell !== "") continue;
+    if (!url) continue;
 
-    missing++;
-    const avg = plGetAverageViewsCached_(url);
-    if (!plIsValidAverage_(avg)) {
-      failed++;
-      Logger.log(`⚠️ Row ${r} (${name || "no name"}): Average Views not written. URL=${url}`);
-      continue;
+    let avg = plParseNumber_(rowRaw[avgCol]);
+    let avgNeedsWrite = avgCell === "";
+
+    if (avgNeedsWrite) {
+      avgMissing++;
+      avg = plGetAverageViewsCached_(url);
+      if (!plIsValidAverage_(avg)) {
+        failed++;
+        Logger.log(`⚠️ Row ${r} (${name || "no name"}): Average Views not written. URL=${url}`);
+        continue;
+      }
+      avgComputed++;
     }
 
-    updates.push({ row1: r, url, avg: avg });
+    let cpm = null;
+    let cpmNeedsWrite = false;
+    if (canWriteCpm && cpmCell === "") {
+      cpmMissing++;
+      cpm = plCalculateCpm_(rowRaw[rateCol], avg);
+      if (cpm == null) {
+        Logger.log(`⚠️ Row ${r} (${name || "no name"}): CPM not written. Missing or invalid Rate / Average Views.`);
+      } else {
+        cpmNeedsWrite = true;
+        cpmComputed++;
+      }
+    }
+
+    if (!avgNeedsWrite && !cpmNeedsWrite) continue;
+    updates.push({
+      row1: r,
+      url,
+      avg: avgNeedsWrite ? avg : null,
+      cpm: cpmNeedsWrite ? cpm : null
+    });
   }
 
-  Logger.log(`📊 Checked: ${checked} | Missing: ${missing} | Computed: ${updates.length} | Failed: ${failed}`);
+  Logger.log(
+    `📊 Checked: ${checked} | Avg Missing: ${avgMissing} | Avg Computed: ${avgComputed}` +
+    ` | CPM Missing: ${cpmMissing} | CPM Computed: ${cpmComputed} | Failed: ${failed}`
+  );
   if (updates.length === 0) return Logger.log("ℹ️ Nothing to write.");
 
-  // Final guard: write only if URL is unchanged and Average Views is still empty.
-  let written = 0;
+  // Final guard: write only if the row still points at the same channel.
+  let avgWritten = 0;
+  let cpmWritten = 0;
   for (const u of updates) {
     const currentUrl = String(sh.getRange(u.row1, urlCol + 1).getDisplayValue() || "").trim();
-    const currentAvg = String(sh.getRange(u.row1, avgCol + 1).getDisplayValue() || "").trim();
-    if (currentUrl !== u.url || currentAvg !== "") continue;
+    if (currentUrl !== u.url) continue;
 
-    sh.getRange(u.row1, avgCol + 1).setValue(u.avg);
-    written++;
+    const avgRange = sh.getRange(u.row1, avgCol + 1);
+    const currentAvg = String(avgRange.getDisplayValue() || "").trim();
+    if (u.avg != null && currentAvg === "") {
+      avgRange.setValue(u.avg);
+      avgWritten++;
+    }
+
+    if (canWriteCpm && u.cpm != null) {
+      const cpmRange = sh.getRange(u.row1, cpmCol + 1);
+      const currentCpm = String(cpmRange.getDisplayValue() || "").trim();
+      if (currentCpm === "") {
+        const liveRate = sh.getRange(u.row1, rateCol + 1).getValue();
+        const liveAvg = avgRange.getValue();
+        const liveCpm = plCalculateCpm_(liveRate, liveAvg);
+        if (liveCpm != null) {
+          cpmRange.setValue(liveCpm);
+          cpmWritten++;
+        }
+      }
+    }
   }
 
-  Logger.log(`✅ Wrote Average Views for ${written} row(s).`);
+  Logger.log(`✅ Wrote Average Views for ${avgWritten} row(s) and CPM for ${cpmWritten} row(s).`);
 }
 
 const PL_KEY_PROP_ = "YOUTUBE_API_KEY";
@@ -107,6 +149,36 @@ var PL_API_KEY_INVALID_LOGGED_ = false;
 
 function plIsValidAverage_(avg) {
   return typeof avg === "number" && isFinite(avg) && !isNaN(avg) && avg > 0;
+}
+
+function plParseNumber_(value) {
+  if (typeof value === "number") return isFinite(value) && !isNaN(value) ? value : null;
+
+  const str = String(value || "").trim();
+  if (!str) return null;
+
+  let cleaned = str.replace(/\s+/g, "").replace(/[^\d,.-]/g, "");
+  if (!cleaned) return null;
+
+  if (cleaned.indexOf(",") !== -1 && cleaned.indexOf(".") !== -1) {
+    cleaned = cleaned.lastIndexOf(",") > cleaned.lastIndexOf(".")
+      ? cleaned.replace(/\./g, "").replace(",", ".")
+      : cleaned.replace(/,/g, "");
+  } else if (cleaned.indexOf(",") !== -1) {
+    cleaned = /^-?\d{1,3}(,\d{3})+$/.test(cleaned) ? cleaned.replace(/,/g, "") : cleaned.replace(",", ".");
+  } else if (cleaned.indexOf(".") !== -1 && /^-?\d{1,3}(\.\d{3})+$/.test(cleaned)) {
+    cleaned = cleaned.replace(/\./g, "");
+  }
+
+  const parsed = Number(cleaned);
+  return isFinite(parsed) && !isNaN(parsed) ? parsed : null;
+}
+
+function plCalculateCpm_(rateValue, avgValue) {
+  const rate = plParseNumber_(rateValue);
+  const avg = plParseNumber_(avgValue);
+  if (rate == null || avg == null || avg <= 0) return null;
+  return Math.round(((rate / avg) * 1000) * 100) / 100;
 }
 
 function plGetAverageViewsCached_(channelUrl) {
@@ -396,6 +468,6 @@ function plIso8601DurationToSeconds_(duration) {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
-    .addItem("Fill missing Average Views", "fillMissingAverageViews_PitchList_Safe")
+    .addItem("Fill missing Average Views + CPM", "fillMissingAverageViews_PitchList_Safe")
     .addToUi();
 }
