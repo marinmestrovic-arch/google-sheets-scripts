@@ -1153,7 +1153,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
 
   ui.createMenu("HypeAuditor → HubSpot")
-    .addItem("Fill CRM Import (SCOUTERS)", "fillCrmImport")
+    .addItem("Fill CRM Import", "fillCrmImport")
     .addSeparator()
     .addItem("Import to HubSpot", "importToHubSpot")
     .addSeparator()
