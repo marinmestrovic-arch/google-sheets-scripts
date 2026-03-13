@@ -172,6 +172,10 @@ function fillCrmImport() {
           const er = parseMaybePercentNumber_(value);
           value = er === null ? "" : er / 100;
         }
+
+        if (isHubSpotImportTemplateEmailHeader_(header)) {
+          value = getHubSpotPrimaryEmailValue_(value);
+        }
       }
 
       // Hide locked values
@@ -247,6 +251,17 @@ function fillCrmImport() {
 
   // Write right side (after "Deal name")
   if (skipCol < crmHeaders.length - 1) writeNonFormulaBlocks(skipCol + 1, crmHeaders.length - 1);
+}
+
+function getHubSpotPrimaryEmailValue_(value) {
+  if (value === null || value === undefined) return "";
+
+  const segments = String(value)
+    .split(",")
+    .map(part => part.trim())
+    .filter(Boolean);
+
+  return segments.length ? segments[0] : "";
 }
 
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
