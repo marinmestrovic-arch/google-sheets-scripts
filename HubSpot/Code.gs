@@ -387,7 +387,10 @@ function importToHubSpot() {
       return;
     }
 
+    validateHubSpotImportSheetPayload_(sheetPayload);
+
     if (hasHubSpotSharedImporterLibrary_()) {
+      validateHubSpotImportViaLibrary_(sheetPayload);
       const startedImport = startHubSpotImportViaLibrary_(sheetPayload);
       ui.alert(
         buildHubSpotImportSubmittedMessage_({
@@ -462,14 +465,15 @@ function prepareHubSpotImportSheetPayload_(ss) {
   const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
   const headers = values[0].map(v => String(v || "").trim());
   const rows = values.slice(1);
-  const importRows = filterHubSpotImportRows_(rows, headers);
+  const importRowEntries = collectHubSpotImportRowEntries_(rows, headers);
+  const importRows = importRowEntries.map(entry => entry.row);
 
   if (importRows.length === 0) {
-    const emailIdx = headers.indexOf(HUBSPOT_IMPORT_EMAIL_HEADER_);
+    const emailColumns = getHubSpotImportTemplateEmailColumns_(headers);
     return {
-      emptyReason: emailIdx === -1
+      emptyReason: emailColumns.length === 0
         ? "No populated rows to import."
-        : `No rows with a filled ${HUBSPOT_IMPORT_EMAIL_HEADER_} column to import.`
+        : `No rows with a filled ${emailColumns[0].name} column to import.`
     };
   }
 
@@ -487,13 +491,16 @@ function prepareHubSpotImportSheetPayload_(ss) {
   }
 
   const activeRows = importRows.map(row => activeColIndexes.map(idx => row[idx]));
+  const sourceRowNumbers = importRowEntries.map(entry => entry.sourceRowNumber);
   const spreadsheetName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
 
   return {
+    sheetName: sh.getName(),
     spreadsheetName,
     spreadsheetLocale: ss.getSpreadsheetLocale(),
     headers: activeHeaders,
     rows: activeRows,
+    sourceRowNumbers,
     rowCount: activeRows.length,
     columnCount: activeHeaders.length
   };
@@ -515,6 +522,15 @@ function prepareHubSpotImport_(sheetPayload, token) {
     );
   }
 
+  validateHubSpotImportEmails_(
+    activeHeaders,
+    activeRows,
+    resolvedColumns.mappings,
+    objectCatalog.byKey.contacts,
+    sheetPayload.sourceRowNumbers,
+    sheetPayload.sheetName || HUBSPOT_IMPORT_SHEET_
+  );
+
   const fileName = `HubSpot Import - ${sheetPayload.spreadsheetName}.csv`;
   const fileBlob = Utilities.newBlob(toCsvBytes_([activeHeaders].concat(activeRows)), "text/csv", fileName);
   const importRequest = buildHubSpotImportRequest_(
@@ -530,6 +546,45 @@ function prepareHubSpotImport_(sheetPayload, token) {
     columnCount: sheetPayload.columnCount,
     objectLabels: resolvedColumns.objectLabels
   };
+}
+
+function validateHubSpotImportSheetPayload_(sheetPayload) {
+  const issues = collectHubSpotImportTemplateEmailIssues_(
+    sheetPayload.headers,
+    sheetPayload.rows,
+    sheetPayload.sourceRowNumbers
+  );
+
+  if (!issues.length) return;
+
+  throw buildHubSpotImportEmailValidationError_(issues, sheetPayload.sheetName || HUBSPOT_IMPORT_SHEET_);
+}
+
+function validateHubSpotImportViaLibrary_(sheetPayload) {
+  if (
+    typeof HubSpotSharedImporter === "undefined" ||
+    !HubSpotSharedImporter ||
+    typeof HubSpotSharedImporter.validateImport !== "function"
+  ) {
+    return;
+  }
+
+  const result = HubSpotSharedImporter.validateImport({
+    sheetName: sheetPayload.sheetName,
+    spreadsheetName: sheetPayload.spreadsheetName,
+    spreadsheetLocale: sheetPayload.spreadsheetLocale,
+    headers: sheetPayload.headers,
+    rows: sheetPayload.rows,
+    sourceRowNumbers: sheetPayload.sourceRowNumbers
+  });
+
+  if (!result || result.ok !== true) {
+    throw new Error(
+      result && result.error
+        ? result.error
+        : "Shared HubSpot importer library validation failed."
+    );
+  }
 }
 
 function buildHubSpotImportSubmittedMessage_(details) {
@@ -573,18 +628,256 @@ function toCsvBytes_(grid) {
   return Utilities.newBlob(withBom, "text/csv;charset=utf-8").getBytes();
 }
 
-function filterHubSpotImportRows_(rows, headers) {
-  const emailIdx = headers.indexOf(HUBSPOT_IMPORT_EMAIL_HEADER_);
+function collectHubSpotImportRowEntries_(rows, headers) {
+  const emailColumns = getHubSpotImportTemplateEmailColumns_(headers);
 
-  return rows.filter(row => {
+  return rows.reduce((entries, row, rowIdx) => {
     const hasData = row.some(cell => String(cell || "").trim() !== "");
-    if (!hasData) return false;
+    if (!hasData) return entries;
 
-    if (emailIdx === -1) return true;
+    if (!emailColumns.length) {
+      entries.push({
+        row,
+        sourceRowNumber: rowIdx + 2
+      });
+      return entries;
+    }
 
-    const email = row[emailIdx];
-    return email !== null && email !== undefined && String(email).trim() !== "";
+    const hasImportEmail = emailColumns.some(column => {
+      const value = row[column.index];
+      return value !== null && value !== undefined && String(value).trim() !== "";
+    });
+
+    if (hasImportEmail) {
+      entries.push({
+        row,
+        sourceRowNumber: rowIdx + 2
+      });
+    }
+
+    return entries;
+  }, []);
+}
+
+function collectHubSpotImportTemplateEmailIssues_(headers, rows, sourceRowNumbers) {
+  const emailColumns = getHubSpotImportTemplateEmailColumns_(headers);
+  if (!emailColumns.length) return [];
+
+  const issues = [];
+  rows.forEach((row, rowIdx) => {
+    emailColumns.forEach(column => {
+      const value = String((row && row[column.index]) == null ? "" : row[column.index]).trim();
+      if (!value) return;
+
+      const reason = getHubSpotImportEmailValidationIssue_(value);
+      if (!reason) return;
+
+      issues.push({
+        rowNumber: getHubSpotImportSourceRowNumber_(sourceRowNumbers, rowIdx),
+        columnName: column.name,
+        value,
+        reason
+      });
+    });
   });
+
+  return issues;
+}
+
+function getHubSpotImportTemplateEmailColumns_(headers) {
+  return headers.reduce((columns, header, idx) => {
+    if (isHubSpotImportTemplateEmailHeader_(header)) {
+      columns.push({
+        index: idx,
+        name: header || HUBSPOT_IMPORT_EMAIL_HEADER_
+      });
+    }
+
+    return columns;
+  }, []);
+}
+
+function isHubSpotImportTemplateEmailHeader_(header) {
+  const key = normalizeHubSpotLookupKey_(header);
+  if (!key) return false;
+
+  const override = HUBSPOT_IMPORT_HEADER_OVERRIDES_[key];
+  if (
+    override &&
+    override.objectKey === "contacts" &&
+    override.propertyName === "email"
+  ) {
+    return true;
+  }
+
+  if (key === "email") return true;
+
+  const hintObjectInfos = HUBSPOT_IMPORT_OBJECT_SPECS_.map(spec => ({
+    key: spec.key,
+    aliases: spec.aliases.map(alias => normalizeHubSpotLookupKey_(alias))
+  }));
+  const objectHint = extractHubSpotObjectHint_(header, hintObjectInfos);
+  if (!objectHint || !objectHint.objectInfo || objectHint.objectInfo.key !== "contacts") {
+    return false;
+  }
+
+  const remainderKeys = getHubSpotLookupKeys_(objectHint.remainderOriginal || objectHint.remainderKey);
+  return remainderKeys.indexOf("email") !== -1;
+}
+
+function validateHubSpotImportEmails_(
+  headers,
+  rows,
+  columnMappings,
+  contactsObjectInfo,
+  sourceRowNumbers,
+  sheetName
+) {
+  const issues = collectHubSpotImportEmailIssues_(
+    headers,
+    rows,
+    columnMappings,
+    contactsObjectInfo,
+    sourceRowNumbers
+  );
+
+  if (!issues.length) return;
+
+  throw buildHubSpotImportEmailValidationError_(issues, sheetName || HUBSPOT_IMPORT_SHEET_);
+}
+
+function collectHubSpotImportEmailIssues_(
+  headers,
+  rows,
+  columnMappings,
+  contactsObjectInfo,
+  sourceRowNumbers
+) {
+  const emailColumns = getHubSpotImportEmailColumns_(headers, columnMappings, contactsObjectInfo);
+  if (!emailColumns.length) return [];
+
+  const issues = [];
+  rows.forEach((row, rowIdx) => {
+    emailColumns.forEach(column => {
+      const value = String((row && row[column.index]) == null ? "" : row[column.index]).trim();
+      if (!value) return;
+
+      const reason = getHubSpotImportEmailValidationIssue_(value);
+      if (!reason) return;
+
+      issues.push({
+        rowNumber: getHubSpotImportSourceRowNumber_(sourceRowNumbers, rowIdx),
+        columnName: column.name,
+        value,
+        reason
+      });
+    });
+  });
+
+  return issues;
+}
+
+function getHubSpotImportEmailColumns_(headers, columnMappings, contactsObjectInfo) {
+  const contactObjectTypeId = contactsObjectInfo && contactsObjectInfo.objectTypeId
+    ? contactsObjectInfo.objectTypeId
+    : "0-1";
+
+  return columnMappings.reduce((columns, mapping, idx) => {
+    if (
+      mapping &&
+      mapping.columnObjectTypeId === contactObjectTypeId &&
+      mapping.propertyName === "email"
+    ) {
+      columns.push({
+        index: idx,
+        name: headers[idx] || HUBSPOT_IMPORT_EMAIL_HEADER_
+      });
+    }
+
+    return columns;
+  }, []);
+}
+
+function getHubSpotImportEmailValidationIssue_(value) {
+  if (!value) return "is blank.";
+  if (value.length > 254) return "is longer than 254 characters.";
+  if (/[^\x00-\x7F]/.test(value)) return "contains non-ASCII characters. Replace it with a plain email address.";
+  if (/\s/.test(value)) return "contains whitespace.";
+
+  const atCount = (value.match(/@/g) || []).length;
+  if (atCount !== 1) return "must contain exactly one @ symbol.";
+
+  const parts = value.split("@");
+  const local = parts[0];
+  const domain = parts[1];
+
+  if (!local) return "is missing the part before @.";
+  if (!domain) return "is missing the domain after @.";
+  if (local.length > 64) return "has more than 64 characters before @.";
+  if (local.startsWith(".") || local.endsWith(".")) return "has a dot at the start or end before @.";
+  if (local.indexOf("..") !== -1) return "has consecutive dots before @.";
+  if (!/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(local)) {
+    return "contains unsupported characters before @.";
+  }
+
+  if (domain.length > 253) return "has a domain longer than 253 characters.";
+  if (domain.indexOf(".") === -1) return "must include a full domain such as domain.com.";
+  if (domain.startsWith(".") || domain.endsWith(".")) return "has a domain that starts or ends with a dot.";
+  if (domain.indexOf("..") !== -1) return "has consecutive dots in the domain.";
+
+  const labels = domain.split(".");
+  if (labels.some(label => !label)) return "has an empty section in the domain.";
+
+  for (let i = 0; i < labels.length; i++) {
+    const label = labels[i];
+    if (label.length > 63) return "has a domain section longer than 63 characters.";
+    if (!/^[A-Za-z0-9-]+$/.test(label)) return "contains unsupported characters in the domain.";
+    if (label.startsWith("-") || label.endsWith("-")) {
+      return "has a domain section that starts or ends with a hyphen.";
+    }
+  }
+
+  const topLevelDomain = labels[labels.length - 1];
+  if (!/^(xn--[A-Za-z0-9-]{2,59}|[A-Za-z]{2,63})$/.test(topLevelDomain)) {
+    return "has an invalid top-level domain.";
+  }
+
+  return "";
+}
+
+function getHubSpotImportSourceRowNumber_(sourceRowNumbers, rowIdx) {
+  if (Array.isArray(sourceRowNumbers)) {
+    const rowNumber = Number(sourceRowNumbers[rowIdx]);
+    if (Number.isFinite(rowNumber) && rowNumber >= 2) {
+      return Math.floor(rowNumber);
+    }
+  }
+
+  return rowIdx + 2;
+}
+
+function formatHubSpotImportValueForDisplay_(value) {
+  const singleLine = String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+  const shortened = singleLine.length > 120 ? `${singleLine.slice(0, 117)}...` : singleLine;
+  return JSON.stringify(shortened);
+}
+
+function buildHubSpotImportEmailValidationError_(issues, sheetName) {
+  const issueLimit = 15;
+  const lines = issues.slice(0, issueLimit).map(issue =>
+    `- Row ${issue.rowNumber}, column "${issue.columnName}": ${formatHubSpotImportValueForDisplay_(issue.value)} ${issue.reason}`
+  );
+
+  if (issues.length > issueLimit) {
+    lines.push(`- ${issues.length - issueLimit} more invalid email value(s) not shown.`);
+  }
+
+  return new Error(
+    "HubSpot import stopped because some contact email values will be rejected by HubSpot.\n\n" +
+    `Fix these cells in the "${sheetName}" sheet and run the import again:\n` +
+    lines.join("\n") +
+    "\n\nHubSpot only accepts typical email addresses such as name@domain.com."
+  );
 }
 
 function getActiveHubSpotImportColumnIndexes_(headers, rows) {
@@ -1143,10 +1436,12 @@ function getHubSpotImportToken_() {
 
 function startHubSpotImportViaLibrary_(sheetPayload) {
   const result = HubSpotSharedImporter.startImport({
+    sheetName: sheetPayload.sheetName,
     spreadsheetName: sheetPayload.spreadsheetName,
     spreadsheetLocale: sheetPayload.spreadsheetLocale,
     headers: sheetPayload.headers,
-    rows: sheetPayload.rows
+    rows: sheetPayload.rows,
+    sourceRowNumbers: sheetPayload.sourceRowNumbers
   });
 
   if (!result || result.ok !== true) {
@@ -1171,10 +1466,12 @@ function startHubSpotImportViaWebApp_(webAppUrl, sheetPayload) {
     },
     payload: JSON.stringify({
       action: HUBSPOT_SHARED_IMPORT_ACTION_,
+      sheetName: sheetPayload.sheetName,
       spreadsheetName: sheetPayload.spreadsheetName,
       spreadsheetLocale: sheetPayload.spreadsheetLocale,
       headers: sheetPayload.headers,
-      rows: sheetPayload.rows
+      rows: sheetPayload.rows,
+      sourceRowNumbers: sheetPayload.sourceRowNumbers
     })
   });
 
