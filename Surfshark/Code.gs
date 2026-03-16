@@ -173,7 +173,7 @@ function archivePitches() {
 }
 
 
-// 3) Fill missing Average Views (menu action)
+// 3) Fill missing Average Views + Followers (menu action)
 function fillMissingAverageViews_Pitching() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName("Pitching");
@@ -183,16 +183,22 @@ function fillMissingAverageViews_Pitching() {
   const lastCol = sh.getLastColumn();
   if (lastRow < 2 || lastCol < 1) return Logger.log("ℹ️ Pitching has no data.");
 
-  const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
+  const range = sh.getRange(1, 1, lastRow, lastCol);
+  const displayValues = range.getDisplayValues();
 
-  const header = (values[0] || []).map(h => String(h || "").trim());
+  const header = (displayValues[0] || []).map(h => String(h || "").trim());
   const urlCol = header.indexOf("Channel URL");
   const avgCol = header.indexOf("Average Views");
+  const followersCol = header.indexOf("Followers");
   const nameCol = header.indexOf("Channel Name");
 
-  Logger.log(`🔎 Header lookup: Channel URL col=${urlCol} | Average Views col=${avgCol}`);
-  if (urlCol === -1 || avgCol === -1) {
-    Logger.log(`❌ Missing header(s). Found headers: ${header.join(" | ")}`);
+  Logger.log(
+    `🔎 Header lookup: Channel URL col=${urlCol} | Average Views col=${avgCol} | Followers col=${followersCol}`
+  );
+  if (urlCol === -1 || avgCol === -1 || followersCol === -1) {
+    Logger.log(
+      `❌ Missing header(s). Required: Channel URL, Average Views, and Followers. Found headers: ${header.join(" | ")}`
+    );
     return;
   }
 
@@ -213,54 +219,123 @@ function fillMissingAverageViews_Pitching() {
   // stop at Archived
   let stopAt = lastRow + 1;
   for (let r = 2; r <= lastRow; r++) {
-    if (norm(values[r - 1][0]) === "Archived") { stopAt = r; break; }
+    if (norm(displayValues[r - 1][0]) === "Archived") { stopAt = r; break; }
   }
   Logger.log(`🧭 Scanning rows 2..${stopAt - 1} (stop at Archived row ${stopAt <= lastRow ? stopAt : "not found"})`);
 
+  const rowsInScope = Math.max(stopAt - 2, 0);
+  if (rowsInScope > 0) {
+    sh.getRange(2, avgCol + 1, rowsInScope, 1).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+    sh.getRange(2, followersCol + 1, rowsInScope, 1).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+  }
+
   const updates = [];
   let checked = 0;
-  let emptyCount = 0;
-  let nullCount = 0;
+  let avgMissingCount = 0;
+  let followersMissingCount = 0;
+  let avgFilledCount = 0;
+  let followersFilledCount = 0;
+  let avgUnavailableCount = 0;
+  let missingFollowersCount = 0;
+  let invalidFollowersCount = 0;
+  let metricsUnavailableCount = 0;
 
   for (let r = 2; r < stopAt; r++) {
-    const row = values[r - 1];
-    if (isSectionLabelRow(row)) continue;
-    if (isBlankRow(row)) continue;
+    const displayRow = displayValues[r - 1];
+    if (isSectionLabelRow(displayRow)) continue;
+    if (isBlankRow(displayRow)) continue;
 
-    const url = norm(row[urlCol]);
-    const cur = row[avgCol];
-    const chName = (nameCol !== -1) ? norm(row[nameCol]) : "";
+    const url = norm(displayRow[urlCol]);
+    const currentAvg = displayRow[avgCol];
+    const currentFollowers = displayRow[followersCol];
+    const chName = (nameCol !== -1) ? norm(displayRow[nameCol]) : "";
+    const needsAvg = isEmptyCell(currentAvg);
+    const needsFollowers = isEmptyCell(currentFollowers);
 
     checked++;
 
     if (!url) continue;
-    if (!isEmptyCell(cur)) continue;
+    if (!needsAvg && !needsFollowers) continue;
 
-    emptyCount++;
+    if (needsAvg) avgMissingCount++;
+    if (needsFollowers) followersMissingCount++;
 
-    const avg = getAverageViewsCached_(url);
+    const update = { row1: r };
+    let willUpdate = false;
+    let averageViews = null;
+    let followers = null;
 
-    if (avg == null) {
-      nullCount++;
-      Logger.log(`⚠️ Row ${r} (${chName || "no name"}): empty Average Views but could not compute. URL=${url}`);
-      continue;
+    if (needsAvg && needsFollowers) {
+      const metrics = getChannelMetricsCached_(url);
+      if (!metrics) {
+        metricsUnavailableCount++;
+        Logger.log(`⚠️ Row ${r} (${chName || "no name"}): missing Average Views and/or Followers but could not compute YouTube metrics. URL=${url}`);
+        continue;
+      }
+      averageViews = metrics.averageViews;
+      followers = metrics.followers;
+    } else {
+      if (needsAvg) {
+        averageViews = getAverageViewsCached_(url);
+      }
+      if (needsFollowers) {
+        followers = getFollowersCached_(url);
+      }
     }
 
-    updates.push({ row1: r, value: avg });
+    if (needsAvg) {
+      if (averageViews == null) {
+        avgUnavailableCount++;
+        Logger.log(`⚠️ Row ${r} (${chName || "no name"}): Average Views still unavailable. URL=${url}`);
+      } else {
+        update.averageViews = roundToNearestHundred_(averageViews);
+        avgFilledCount++;
+        willUpdate = true;
+      }
+    }
+
+    if (needsFollowers) {
+      if (followers == null) {
+        missingFollowersCount++;
+        Logger.log(`⚠️ Row ${r} (${chName || "no name"}): Followers unavailable or hidden on YouTube. URL=${url}`);
+      } else if (followers <= 0) {
+        invalidFollowersCount++;
+        Logger.log(`⚠️ Row ${r} (${chName || "no name"}): Followers invalid from YouTube (${followers}). URL=${url}`);
+      } else {
+        update.followers = roundToNearestHundred_(followers);
+        followersFilledCount++;
+        willUpdate = true;
+      }
+    }
+
+    Logger.log(
+      `ℹ️ Row ${r} (${chName || "no name"}): avgViews=${averageViews} | subscribers=${followers}`
+    );
+
+    if (willUpdate) updates.push(update);
   }
 
-  Logger.log(`📊 Checked rows: ${checked} | Empty Average Views found: ${emptyCount} | Could not compute: ${nullCount} | Will update: ${updates.length}`);
+  Logger.log(
+    `📊 Checked rows: ${checked} | Missing Average Views: ${avgMissingCount} | Missing Followers: ${followersMissingCount} | Filled Average Views: ${avgFilledCount} | Filled Followers: ${followersFilledCount} | Average Views unavailable: ${avgUnavailableCount} | Missing YouTube subscribers: ${missingFollowersCount} | Invalid YouTube subscribers: ${invalidFollowersCount} | Could not compute YouTube metrics: ${metricsUnavailableCount} | Rows to update: ${updates.length}`
+  );
 
   if (updates.length === 0) {
-    Logger.log("ℹ️ No missing Average Views to fill.");
+    Logger.log("ℹ️ No missing Average Views or Followers to fill.");
     return;
   }
 
   // (Optional) simple throttle to avoid quota spikes on big fills
   // Utilities.sleep(150);
 
-  updates.forEach(u => sh.getRange(u.row1, avgCol + 1).setValue(u.value));
-  Logger.log(`✅ Filled Average Views for ${updates.length} row(s).`);
+  updates.forEach(u => {
+    if (u.averageViews != null) {
+      sh.getRange(u.row1, avgCol + 1).setValue(u.averageViews).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+    }
+    if (u.followers != null) {
+      sh.getRange(u.row1, followersCol + 1).setValue(u.followers).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+    }
+  });
+  Logger.log(`✅ Filled missing Average Views / Followers for ${updates.length} row(s).`);
 }
 
 
@@ -268,12 +343,12 @@ function fillMissingAverageViews_Pitching() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
-    .addItem("Import HubSpot segment to Pitching", "importHubSpotDealsListToPitching")
+    .addItem("Import HubSpot segment 329 to Pitching", "importHubSpotDealsListToPitching")
     .addSeparator()
     .addItem("Push confirmed creators to Campaigns", "pushConfirmedCreatorsToCampaigns")
     .addItem("Archive pitches", "archivePitches")
     .addSeparator()
-    .addItem("Fill missing Average Views", "fillMissingAverageViews_Pitching")
+    .addItem("Fill missing Average Views + Followers", "fillMissingAverageViews_Pitching")
     .addToUi();
 }
 
@@ -387,10 +462,13 @@ function buildSignatureFromCampaignRow_(row, commonCols) {
 
 const YT_KEY_PROP_ = "YOUTUBE_API_KEY";
 const YT_AVG_CACHE_PREFIX_ = "AVG_VIEWS::";
+const YT_FOLLOWERS_CACHE_PREFIX_ = "FOLLOWERS::";
+const YT_CHANNEL_METRICS_CACHE_PREFIX_ = "YT_CHANNEL_METRICS::";
 const YT_KEY_VALID_CACHE_PREFIX_ = "YT_API_KEY_VALID::";
 const YT_CACHE_TTL_SECONDS_ = 21600;
 const YT_KEY_VALID_TTL_SECONDS_ = 1800;
 const YT_KEY_INVALID_TTL_SECONDS_ = 600;
+const YT_COUNT_NUMBER_FORMAT_ = "#,##0";
 const YT_MAX_PLAYLIST_ITEMS_ = 50;
 const YT_MAX_VIDEOS_FOR_AVG_ = 15;
 const YT_MIN_DURATION_SECONDS_ = 180;
@@ -408,6 +486,57 @@ const YT_CHANNEL_ID_PATTERNS_ = [
 var YT_API_KEY_INVALID_ = false;
 var YT_API_KEY_INVALID_LOGGED_ = false;
 
+function getChannelMetricsCached_(channelUrl) {
+  if (!channelUrl || typeof channelUrl !== "string") return null;
+
+  const apiKey = getYouTubeApiKey_();
+  if (!apiKey) {
+    Logger.log("❌ Missing YouTube API key. Set Script Property: YOUTUBE_API_KEY");
+    return null;
+  }
+  if (!validateYouTubeApiKey_(apiKey)) return null;
+
+  const normalized = normalizeChannelUrl_(channelUrl);
+  const cachedMetrics = getCachedChannelMetricsByNormalized_(normalized);
+  if (cachedMetrics && cachedMetrics.averageViews != null && cachedMetrics.followers != null) {
+    return cachedMetrics;
+  }
+
+  let averageViews = cachedMetrics && cachedMetrics.averageViews != null
+    ? cachedMetrics.averageViews
+    : getCachedScalarMetricByNormalized_(YT_AVG_CACHE_PREFIX_, normalized);
+  let followers = cachedMetrics && cachedMetrics.followers != null
+    ? cachedMetrics.followers
+    : getCachedScalarMetricByNormalized_(YT_FOLLOWERS_CACHE_PREFIX_, normalized);
+
+  if (averageViews != null && followers != null) {
+    const mergedCachedMetrics = { averageViews, followers };
+    storeChannelMetricsByNormalized_(normalized, mergedCachedMetrics);
+    return mergedCachedMetrics;
+  }
+
+  const metrics = computeChannelMetricsForChannel_(normalized, apiKey);
+  if (metrics) {
+    if (metrics.averageViews != null) averageViews = metrics.averageViews;
+    if (metrics.followers != null) followers = metrics.followers;
+  }
+
+  const mergedMetrics = {
+    averageViews: averageViews == null ? null : averageViews,
+    followers: followers == null ? null : followers
+  };
+  if (!hasUsableChannelMetrics_(mergedMetrics)) return null;
+
+  storeChannelMetricsByNormalized_(normalized, mergedMetrics);
+  if (mergedMetrics.averageViews != null) {
+    storeCachedScalarMetricByNormalized_(YT_AVG_CACHE_PREFIX_, normalized, mergedMetrics.averageViews);
+  }
+  if (mergedMetrics.followers != null) {
+    storeCachedScalarMetricByNormalized_(YT_FOLLOWERS_CACHE_PREFIX_, normalized, mergedMetrics.followers);
+  }
+  return mergedMetrics;
+}
+
 function getAverageViewsCached_(channelUrl) {
   if (!channelUrl || typeof channelUrl !== "string") return null;
 
@@ -419,26 +548,147 @@ function getAverageViewsCached_(channelUrl) {
   if (!validateYouTubeApiKey_(apiKey)) return null;
 
   const normalized = normalizeChannelUrl_(channelUrl);
-  const cacheKey = YT_AVG_CACHE_PREFIX_ + normalized;
+  const cachedMetrics = getCachedChannelMetricsByNormalized_(normalized);
+  if (cachedMetrics && cachedMetrics.averageViews != null) return cachedMetrics.averageViews;
+
+  const cachedAverageViews = getCachedScalarMetricByNormalized_(YT_AVG_CACHE_PREFIX_, normalized);
+  if (cachedAverageViews != null) return cachedAverageViews;
+
+  const averageViews = computeAverageViewsForChannel_(normalized, apiKey);
+  if (averageViews == null) return null;
+
+  storeCachedScalarMetricByNormalized_(YT_AVG_CACHE_PREFIX_, normalized, averageViews);
+  mergeChannelMetricsCache_(normalized, { averageViews });
+  return averageViews;
+}
+
+function getFollowersCached_(channelUrl) {
+  if (!channelUrl || typeof channelUrl !== "string") return null;
+
+  const apiKey = getYouTubeApiKey_();
+  if (!apiKey) {
+    Logger.log("❌ Missing YouTube API key. Set Script Property: YOUTUBE_API_KEY");
+    return null;
+  }
+  if (!validateYouTubeApiKey_(apiKey)) return null;
+
+  const normalized = normalizeChannelUrl_(channelUrl);
+  const cachedMetrics = getCachedChannelMetricsByNormalized_(normalized);
+  if (cachedMetrics && cachedMetrics.followers != null) return cachedMetrics.followers;
+
+  const cachedFollowers = getCachedScalarMetricByNormalized_(YT_FOLLOWERS_CACHE_PREFIX_, normalized);
+  if (cachedFollowers != null) return cachedFollowers;
+
+  const followers = computeFollowersForChannel_(normalized, apiKey);
+  if (followers == null) return null;
+
+  storeCachedScalarMetricByNormalized_(YT_FOLLOWERS_CACHE_PREFIX_, normalized, followers);
+  mergeChannelMetricsCache_(normalized, { followers });
+  return followers;
+}
+
+function getCachedChannelMetricsByNormalized_(normalized) {
+  const cacheKey = YT_CHANNEL_METRICS_CACHE_PREFIX_ + normalized;
   const cache = CacheService.getDocumentCache();
   const props = PropertiesService.getDocumentProperties();
 
   const shortCached = cache.get(cacheKey);
-  if (shortCached != null) return Number(shortCached);
+  if (shortCached != null) {
+    const cachedMetrics = parseCachedChannelMetrics_(shortCached);
+    if (cachedMetrics) return cachedMetrics;
+  }
 
   const persisted = props.getProperty(cacheKey);
   if (persisted != null) {
-    cache.put(cacheKey, persisted, YT_CACHE_TTL_SECONDS_);
-    return Number(persisted);
+    const persistedMetrics = parseCachedChannelMetrics_(persisted);
+    if (persistedMetrics) {
+      cache.put(cacheKey, persisted, YT_CACHE_TTL_SECONDS_);
+      return persistedMetrics;
+    }
   }
 
-  const avg = computeAverageViewsForChannel_(normalized, apiKey);
-  if (avg == null) return null;
+  return null;
+}
 
-  const stored = String(avg);
+function storeChannelMetricsByNormalized_(normalized, metrics) {
+  if (!hasUsableChannelMetrics_(metrics)) return;
+
+  const cacheKey = YT_CHANNEL_METRICS_CACHE_PREFIX_ + normalized;
+  const stored = JSON.stringify(metrics);
+  const cache = CacheService.getDocumentCache();
+  const props = PropertiesService.getDocumentProperties();
+
   props.setProperty(cacheKey, stored);
   cache.put(cacheKey, stored, YT_CACHE_TTL_SECONDS_);
-  return avg;
+}
+
+function mergeChannelMetricsCache_(normalized, partialMetrics) {
+  const cachedMetrics = getCachedChannelMetricsByNormalized_(normalized) || {};
+  const mergedMetrics = {
+    averageViews: partialMetrics.averageViews != null ? partialMetrics.averageViews : cachedMetrics.averageViews,
+    followers: partialMetrics.followers != null ? partialMetrics.followers : cachedMetrics.followers
+  };
+
+  if (hasUsableChannelMetrics_(mergedMetrics)) {
+    storeChannelMetricsByNormalized_(normalized, mergedMetrics);
+  }
+}
+
+function getCachedScalarMetricByNormalized_(prefix, normalized) {
+  const cacheKey = prefix + normalized;
+  const cache = CacheService.getDocumentCache();
+  const props = PropertiesService.getDocumentProperties();
+
+  const shortCached = cache.get(cacheKey);
+  if (shortCached != null) {
+    const parsed = Number(shortCached);
+    return isFinite(parsed) ? parsed : null;
+  }
+
+  const persisted = props.getProperty(cacheKey);
+  if (persisted != null) {
+    const parsed = Number(persisted);
+    if (isFinite(parsed)) {
+      cache.put(cacheKey, persisted, YT_CACHE_TTL_SECONDS_);
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+function storeCachedScalarMetricByNormalized_(prefix, normalized, value) {
+  if (value == null || !isFinite(Number(value))) return;
+
+  const cacheKey = prefix + normalized;
+  const stored = String(value);
+  const cache = CacheService.getDocumentCache();
+  const props = PropertiesService.getDocumentProperties();
+
+  props.setProperty(cacheKey, stored);
+  cache.put(cacheKey, stored, YT_CACHE_TTL_SECONDS_);
+}
+
+function parseCachedChannelMetrics_(value) {
+  if (value == null || value === "") return null;
+
+  try {
+    const parsed = JSON.parse(String(value));
+    const averageViews = parsed && parsed.averageViews != null ? Number(parsed.averageViews) : null;
+    const followers = parsed && parsed.followers != null ? Number(parsed.followers) : null;
+    const metrics = {
+      averageViews: averageViews == null || isFinite(averageViews) ? averageViews : null,
+      followers: followers == null || isFinite(followers) ? followers : null
+    };
+    return hasUsableChannelMetrics_(metrics) ? metrics : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function hasUsableChannelMetrics_(metrics) {
+  if (!metrics) return false;
+  return metrics.averageViews != null || metrics.followers != null;
 }
 
 function normalizeChannelUrl_(url) {
@@ -514,71 +764,167 @@ function computeAverageViewsForChannel_(channelUrl, apiKey) {
       return null;
     }
 
-    const uploadsPlaylistId = channelData.items[0].contentDetails.relatedPlaylists.uploads;
+    const channelItem = channelData.items[0];
+    const uploadsPlaylistId = channelItem.contentDetails &&
+      channelItem.contentDetails.relatedPlaylists
+      ? channelItem.contentDetails.relatedPlaylists.uploads
+      : "";
     if (!uploadsPlaylistId) {
       Logger.log(`uploads playlist missing for channelId=${channelId} url=${channelUrl}`);
       return null;
     }
 
-    const playlistData = ytFetchJson_(
-      `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=${YT_MAX_PLAYLIST_ITEMS_}&playlistId=${encodeURIComponent(uploadsPlaylistId)}&key=${encodeURIComponent(apiKey)}`
-    );
-    if (!playlistData.items || playlistData.items.length === 0) {
-      Logger.log(`uploads playlist returned no items for channelId=${channelId} url=${channelUrl}`);
-      return null;
-    }
-
-    const cutoff = new Date();
-    cutoff.setMonth(cutoff.getMonth() - YT_MONTHS_BACK_);
-    const candidateIds = [];
-
-    for (const item of playlistData.items) {
-      const snippet = item.snippet;
-      if (!snippet) continue;
-
-      const publishedAt = snippet.publishedAt ? new Date(snippet.publishedAt) : null;
-      if (!publishedAt || publishedAt < cutoff) continue;
-
-      const videoId = snippet.resourceId && snippet.resourceId.videoId ? snippet.resourceId.videoId : null;
-      if (videoId) candidateIds.push(videoId);
-    }
-
-    if (candidateIds.length === 0) {
-      Logger.log(`no uploads in last 6 months for channelId=${channelId} url=${channelUrl}`);
-      return null;
-    }
-
-    const ids = candidateIds.slice(0, YT_MAX_PLAYLIST_ITEMS_);
-    const videosData = ytFetchJson_(
-      `https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${encodeURIComponent(ids.join(","))}&key=${encodeURIComponent(apiKey)}`
-    );
-    if (!videosData.items || videosData.items.length === 0) {
-      Logger.log(`videos lookup returned no items for channelId=${channelId} url=${channelUrl}`);
-      return null;
-    }
-
-    const pickedViews = [];
-    for (const video of videosData.items) {
-      const duration = video.contentDetails && video.contentDetails.duration ? video.contentDetails.duration : null;
-      if (iso8601DurationToSeconds_(duration) <= YT_MIN_DURATION_SECONDS_) continue;
-
-      const rawViews = video.statistics && video.statistics.viewCount ? Number(video.statistics.viewCount) : null;
-      if (rawViews == null || isNaN(rawViews)) continue;
-
-      pickedViews.push(rawViews);
-      if (pickedViews.length >= YT_MAX_VIDEOS_FOR_AVG_) break;
-    }
-
-    if (pickedViews.length === 0) {
-      Logger.log(`no videos >3 minutes with viewCount in last 6 months for channelId=${channelId} url=${channelUrl}`);
-      return null;
-    }
-
-    return Math.round(pickedViews.reduce((sum, value) => sum + value, 0) / pickedViews.length);
+    return computeAverageViewsFromUploadsPlaylist_(uploadsPlaylistId, channelId, channelUrl, apiKey);
   } catch (e) {
     Logger.log("computeAverageViewsForChannel_ error: " + (e && e.stack ? e.stack : e));
     return null;
   }
+}
+
+function computeFollowersForChannel_(channelUrl, apiKey) {
+  try {
+    if (YT_API_KEY_INVALID_) return null;
+
+    const channelId = getChannelIdFromUrl(channelUrl, apiKey);
+    if (!channelId) {
+      Logger.log(`resolve failed for URL: ${channelUrl}`);
+      return null;
+    }
+
+    const channelData = ytFetchJson_(
+      `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${encodeURIComponent(channelId)}&key=${encodeURIComponent(apiKey)}`
+    );
+    if (!channelData.items || channelData.items.length === 0) {
+      Logger.log(`channel lookup returned no items for channelId=${channelId} url=${channelUrl}`);
+      return null;
+    }
+
+    const statistics = channelData.items[0].statistics || {};
+    return statistics.hiddenSubscriberCount === true
+      ? null
+      : parseYouTubeCount_(statistics.subscriberCount);
+  } catch (e) {
+    Logger.log("computeFollowersForChannel_ error: " + (e && e.stack ? e.stack : e));
+    return null;
+  }
+}
+
+function computeChannelMetricsForChannel_(channelUrl, apiKey) {
+  try {
+    if (YT_API_KEY_INVALID_) return null;
+
+    const channelId = getChannelIdFromUrl(channelUrl, apiKey);
+    if (!channelId) {
+      Logger.log(`resolve failed for URL: ${channelUrl}`);
+      return null;
+    }
+
+    const channelData = ytFetchJson_(
+      `https://www.googleapis.com/youtube/v3/channels?part=contentDetails,statistics&id=${encodeURIComponent(channelId)}&key=${encodeURIComponent(apiKey)}`
+    );
+    if (!channelData.items || channelData.items.length === 0) {
+      Logger.log(`channel lookup returned no items for channelId=${channelId} url=${channelUrl}`);
+      return null;
+    }
+
+    const channelItem = channelData.items[0];
+    const statistics = channelItem.statistics || {};
+    const followers = statistics.hiddenSubscriberCount === true
+      ? null
+      : parseYouTubeCount_(statistics.subscriberCount);
+    const uploadsPlaylistId = channelItem.contentDetails &&
+      channelItem.contentDetails.relatedPlaylists
+      ? channelItem.contentDetails.relatedPlaylists.uploads
+      : "";
+    if (!uploadsPlaylistId) {
+      Logger.log(`uploads playlist missing for channelId=${channelId} url=${channelUrl}`);
+      return { averageViews: null, followers };
+    }
+
+    const playlistData = ytFetchJson_(
+      `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=${YT_MAX_PLAYLIST_ITEMS_}&playlistId=${encodeURIComponent(uploadsPlaylistId)}&key=${encodeURIComponent(apiKey)}`
+    );
+    const averageViews = computeAverageViewsFromUploadsPlaylist_(uploadsPlaylistId, channelId, channelUrl, apiKey, playlistData);
+
+    return {
+      averageViews,
+      followers
+    };
+  } catch (e) {
+    Logger.log("computeChannelMetricsForChannel_ error: " + (e && e.stack ? e.stack : e));
+    return null;
+  }
+}
+
+function computeAverageViewsFromUploadsPlaylist_(uploadsPlaylistId, channelId, channelUrl, apiKey, playlistData) {
+  const data = playlistData || ytFetchJson_(
+    `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=${YT_MAX_PLAYLIST_ITEMS_}&playlistId=${encodeURIComponent(uploadsPlaylistId)}&key=${encodeURIComponent(apiKey)}`
+  );
+  if (!data.items || data.items.length === 0) {
+    Logger.log(`uploads playlist returned no items for channelId=${channelId} url=${channelUrl}`);
+    return null;
+  }
+
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - YT_MONTHS_BACK_);
+  const candidateIds = [];
+
+  for (const item of data.items) {
+    const snippet = item.snippet;
+    if (!snippet) continue;
+
+    const publishedAt = snippet.publishedAt ? new Date(snippet.publishedAt) : null;
+    if (!publishedAt || publishedAt < cutoff) continue;
+
+    const videoId = snippet.resourceId && snippet.resourceId.videoId ? snippet.resourceId.videoId : null;
+    if (videoId) candidateIds.push(videoId);
+  }
+
+  if (candidateIds.length === 0) {
+    Logger.log(`no uploads in last ${YT_MONTHS_BACK_} months for channelId=${channelId} url=${channelUrl}`);
+    return null;
+  }
+
+  const ids = candidateIds.slice(0, YT_MAX_PLAYLIST_ITEMS_);
+  const videosData = ytFetchJson_(
+    `https://www.googleapis.com/youtube/v3/videos?part=statistics,contentDetails&id=${encodeURIComponent(ids.join(","))}&key=${encodeURIComponent(apiKey)}`
+  );
+  if (!videosData.items || videosData.items.length === 0) {
+    Logger.log(`videos lookup returned no items for channelId=${channelId} url=${channelUrl}`);
+    return null;
+  }
+
+  const pickedViews = [];
+  for (const video of videosData.items) {
+    const duration = video.contentDetails && video.contentDetails.duration ? video.contentDetails.duration : null;
+    if (iso8601DurationToSeconds_(duration) <= YT_MIN_DURATION_SECONDS_) continue;
+
+    const rawViews = video.statistics && video.statistics.viewCount ? Number(video.statistics.viewCount) : null;
+    if (rawViews == null || isNaN(rawViews)) continue;
+
+    pickedViews.push(rawViews);
+    if (pickedViews.length >= YT_MAX_VIDEOS_FOR_AVG_) break;
+  }
+
+  if (pickedViews.length === 0) {
+    Logger.log(`no videos >${YT_MIN_DURATION_SECONDS_ / 60} minutes with viewCount in last ${YT_MONTHS_BACK_} months for channelId=${channelId} url=${channelUrl}`);
+    return null;
+  }
+
+  return Math.round(pickedViews.reduce((sum, value) => sum + value, 0) / pickedViews.length);
+}
+
+function parseYouTubeCount_(value) {
+  if (value == null || value === "") return null;
+  const num = Number(value);
+  return isFinite(num) ? num : null;
+}
+
+function roundToNearestHundred_(value) {
+  if (value == null || value === "") return null;
+  const num = Number(value);
+  if (!isFinite(num)) return null;
+  return Math.round(num / 100) * 100;
 }
 
 function getChannelIdFromUrl(channelUrl, apiKey, depth) {
@@ -778,21 +1124,33 @@ function iso8601DurationToSeconds_(duration) {
 
 const HUBSPOT_TOKEN_PROP_ = "HUBSPOT_PRIVATE_APP_TOKEN";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
+const HUBSPOT_SURFSHARK_SEGMENT_ID_ = "329";
+const HUBSPOT_ACTIVATIONS_OBJECT_SPEC_ = {
+  key: "activations",
+  label: "Activations",
+  aliases: ["Activation", "Activations"]
+};
+const HUBSPOT_ACTIVATION_TYPE_PROPERTY_LABEL_ = "Activation Type";
+const HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_ = "activation_type";
+const HUBSPOT_ACTIVATION_EXT_AMOUNT_PROPERTY_LABEL_ = "EXT Amount";
+const HUBSPOT_ACTIVATION_EXT_AMOUNT_PROPERTY_FALLBACK_ = "ext_amount";
+const PITCHING_DEFAULT_CONDITION_ = "Fee suggested (by creator or CP)";
+const PITCHING_RATE_BACKGROUND_ = "#FF9902";
 
 // Keep all guessed internal names here so they are easy to fix later.
 const HUBSPOT_PROP_MAP_ = {
   deal: {
-    dealType: "dealtype",
     activationType: "activation_type",
-    extAmount: "ext_amount"
+    extAmount: "ext_amount",
+    pitchingStatus: "pitching_status",
+    brands: "surfshark_brands"
   },
   contact: {
     firstName: "firstname",                 // often standard HubSpot field
     lastName: "lastname",                   // often standard HubSpot field
     youtubeUrl: "youtube_url",
     countryRegion: "country",
-    influencerVertical: "influencer_vertical",
-    youtubeVideoAverageViews: "youtube_video_average_views"
+    influencerVertical: "influencer_vertical"
   }
 };
 
@@ -800,11 +1158,6 @@ function importHubSpotDealsListToPitching() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Pitching");
   if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
-
-  const segmentId = promptForHubSpotSegmentId_();
-  if (!segmentId) {
-    return Logger.log("ℹ️ Import cancelled: no HubSpot segment ID provided.");
-  }
 
   const token = getHubSpotToken_();
   if (!token) {
@@ -819,14 +1172,17 @@ function importHubSpotDealsListToPitching() {
 
   const requiredSheetCols = [
     "Channel Name",
-    "Deal Type",
     "Activation Type",
     "Channel URL",
     "Country/Region",
     "Influencer Vertical",
+    "Condition",
     "Rate",
-    "Average Views",
-    "HubSpot Record ID"
+    "HubSpot Record ID",
+    "Status",
+    "Surfshark",
+    "Incogni",
+    "Saily"
   ];
 
   const missingSheetCols = requiredSheetCols.filter(name => header.indexOf(name) === -1);
@@ -844,18 +1200,59 @@ function importHubSpotDealsListToPitching() {
     return Logger.log("❌ Template row below 'Active Pitches' not found.");
   }
 
-  Logger.log(`▶️ Fetching deal IDs from HubSpot segment ${segmentId}...`);
-  const dealIds = fetchHubSpotListDealIds_(segmentId, token);
+  Logger.log(`▶️ Fetching deal IDs from HubSpot segment ${HUBSPOT_SURFSHARK_SEGMENT_ID_}...`);
+  const dealIds = fetchHubSpotListDealIds_(HUBSPOT_SURFSHARK_SEGMENT_ID_, token);
   if (!dealIds.length) {
-    return Logger.log(`ℹ️ No deal IDs found in HubSpot segment ${segmentId}.`);
+    return Logger.log(`ℹ️ No deal IDs found in HubSpot segment ${HUBSPOT_SURFSHARK_SEGMENT_ID_}.`);
   }
-  Logger.log(`✅ Got ${dealIds.length} deal ID(s) from HubSpot segment ${segmentId}.`);
+  Logger.log(`✅ Got ${dealIds.length} deal ID(s) from HubSpot segment ${HUBSPOT_SURFSHARK_SEGMENT_ID_}.`);
 
   const deals = fetchHubSpotDealsByIds_(dealIds, token);
   if (!deals.length) {
     return Logger.log("ℹ️ No deals returned from HubSpot batch read.");
   }
 
+  let activationsObjectInfo;
+  try {
+    activationsObjectInfo = loadHubSpotCustomObjectInfo_(HUBSPOT_ACTIVATIONS_OBJECT_SPEC_, token);
+  } catch (e) {
+    return Logger.log(`❌ Could not resolve HubSpot ${HUBSPOT_ACTIVATIONS_OBJECT_SPEC_.label} object: ${e}`);
+  }
+  const activationTypeProperty = findHubSpotPropertyByLabelOrName_(
+    activationsObjectInfo,
+    HUBSPOT_ACTIVATION_TYPE_PROPERTY_LABEL_,
+    HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_
+  );
+  if (!activationTypeProperty) {
+    return Logger.log(
+      `❌ Could not find "${HUBSPOT_ACTIVATION_TYPE_PROPERTY_LABEL_}" on the HubSpot ${activationsObjectInfo.label} object.`
+    );
+  }
+  const activationExtAmountProperty = findHubSpotPropertyByLabelOrName_(
+    activationsObjectInfo,
+    HUBSPOT_ACTIVATION_EXT_AMOUNT_PROPERTY_LABEL_,
+    HUBSPOT_ACTIVATION_EXT_AMOUNT_PROPERTY_FALLBACK_
+  );
+  if (!activationExtAmountProperty) {
+    return Logger.log(
+      `❌ Could not find "${HUBSPOT_ACTIVATION_EXT_AMOUNT_PROPERTY_LABEL_}" on the HubSpot ${activationsObjectInfo.label} object.`
+    );
+  }
+
+  const brandOptionLookup = fetchHubSpotPropertyOptionsLookup_("deals", HUBSPOT_PROP_MAP_.deal.brands, token);
+  const dealToActivationIds = fetchHubSpotAssociationIdsMap_(dealIds, "deals", activationsObjectInfo.objectTypeId, token);
+  const activationIds = collectAssociationIds_(dealToActivationIds);
+  if (!activationIds.length) {
+    return Logger.log(`ℹ️ No associated ${activationsObjectInfo.label} found for deals in HubSpot segment ${HUBSPOT_SURFSHARK_SEGMENT_ID_}.`);
+  }
+  const activationsById = activationIds.length
+    ? fetchHubSpotObjectsByIds_(
+      activationsObjectInfo.objectTypeId,
+      activationIds,
+      [activationTypeProperty.name, activationExtAmountProperty.name],
+      token
+    )
+    : {};
   const dealToContactId = fetchDealToPrimaryContactMap_(dealIds, token);
   const contactIds = Object.values(dealToContactId).filter(Boolean);
 
@@ -865,15 +1262,44 @@ function importHubSpotDealsListToPitching() {
   }
 
   const rowsToInsert = [];
+  const importedDealIds = [];
+  let dealsWithoutActivations = 0;
+  let missingActivationObjects = 0;
   for (const deal of deals) {
     const dealId = String(deal.id || "").trim();
     if (!dealId) continue;
 
     const contactId = dealToContactId[dealId];
     const contact = contactId ? contactsById[String(contactId)] : null;
+    const activationIdsForDeal = dealToActivationIds[dealId] || [];
 
-    const row = mapHubSpotDealAndContactToPitchingRow_(deal, contact, header);
-    rowsToInsert.push(row);
+    if (!activationIdsForDeal.length) {
+      dealsWithoutActivations++;
+      Logger.log(`⚠️ Deal ${dealId} has no associated Activation records. Skipping import for this deal.`);
+      continue;
+    }
+
+    for (const activationId of activationIdsForDeal) {
+      const activation = activationsById[String(activationId)];
+      if (!activation) {
+        missingActivationObjects++;
+        Logger.log(`⚠️ Could not load Activation ${activationId} for deal ${dealId}. Skipping this activation row.`);
+        continue;
+      }
+
+      const row = mapHubSpotDealAndContactToPitchingRow_(
+        deal,
+        contact,
+        activation,
+        activationTypeProperty.name,
+        activationExtAmountProperty.name,
+        header,
+        brandOptionLookup
+      );
+      fillPitchingMetricsForImportedRow_(row, header);
+      rowsToInsert.push(row);
+      importedDealIds.push(dealId);
+    }
   }
 
   if (!rowsToInsert.length) {
@@ -881,8 +1307,18 @@ function importHubSpotDealsListToPitching() {
   }
 
   insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1);
+  const statusUpdate = updateHubSpotDealsPitchingStatus_(importedDealIds, token, "Pitched");
 
-  Logger.log(`✅ Imported ${rowsToInsert.length} row(s) into Pitching.`);
+  if (statusUpdate.updatedCount !== statusUpdate.attemptedCount) {
+    Logger.log(
+      `⚠️ Imported ${rowsToInsert.length} row(s) into Pitching, but updated ${HUBSPOT_PROP_MAP_.deal.pitchingStatus} for ${statusUpdate.updatedCount}/${statusUpdate.attemptedCount} deal(s).`
+    );
+    return;
+  }
+
+  Logger.log(
+    `✅ Imported ${rowsToInsert.length} row(s) into Pitching and updated ${HUBSPOT_PROP_MAP_.deal.pitchingStatus} for ${statusUpdate.updatedCount} deal(s). Deals without Activations: ${dealsWithoutActivations}. Missing Activation records: ${missingActivationObjects}.`
+  );
 }
 
 
@@ -894,25 +1330,6 @@ function getHubSpotToken_() {
   return String(
     PropertiesService.getScriptProperties().getProperty(HUBSPOT_TOKEN_PROP_) || ""
   ).trim();
-}
-
-function promptForHubSpotSegmentId_() {
-  const ui = SpreadsheetApp.getUi();
-  const response = ui.prompt(
-    "Import HubSpot segment to Pitching",
-    "Paste the HubSpot segment ID to import.",
-    ui.ButtonSet.OK_CANCEL
-  );
-
-  if (response.getSelectedButton() !== ui.Button.OK) return "";
-
-  const segmentId = String(response.getResponseText() || "").trim();
-  if (!segmentId) {
-    ui.alert("HubSpot segment ID is required.");
-    return "";
-  }
-
-  return segmentId;
 }
 
 function hubspotHeaders_(token) {
@@ -984,9 +1401,9 @@ function fetchHubSpotDealsByIds_(dealIds, token) {
     const body = {
       inputs: chunk.map(id => ({ id: String(id) })),
       properties: [
-        HUBSPOT_PROP_MAP_.deal.dealType,
         HUBSPOT_PROP_MAP_.deal.activationType,
-        HUBSPOT_PROP_MAP_.deal.extAmount
+        HUBSPOT_PROP_MAP_.deal.extAmount,
+        HUBSPOT_PROP_MAP_.deal.brands
       ]
     };
 
@@ -1004,6 +1421,135 @@ function fetchHubSpotDealsByIds_(dealIds, token) {
   }
 
   return out;
+}
+
+function loadHubSpotCustomObjectInfo_(spec, token) {
+  const schemasResponse = hubspotFetchJson_(`${HUBSPOT_API_BASE_}/crm-object-schemas/v3/schemas`, token);
+  const schemas = Array.isArray(schemasResponse && schemasResponse.results)
+    ? schemasResponse.results
+    : [];
+  const schema = resolveHubSpotObjectSchemaByAliases_(spec, schemas);
+  const propertiesResponse = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/properties/${encodeURIComponent(schema.objectTypeId)}`,
+    token
+  );
+  const properties = Array.isArray(propertiesResponse && propertiesResponse.results)
+    ? propertiesResponse.results
+    : [];
+
+  return {
+    key: spec.key,
+    label: (schema.labels && (schema.labels.plural || schema.labels.singular)) || spec.label,
+    objectTypeId: schema.objectTypeId,
+    properties
+  };
+}
+
+function resolveHubSpotObjectSchemaByAliases_(spec, schemas) {
+  const wanted = (spec.aliases || [])
+    .map(normalizeHubSpotOptionToken_)
+    .filter(Boolean);
+  const matches = schemas.filter(schema => {
+    const candidates = [
+      schema && schema.name,
+      schema && schema.labels && schema.labels.singular,
+      schema && schema.labels && schema.labels.plural
+    ]
+      .map(normalizeHubSpotOptionToken_)
+      .filter(Boolean);
+
+    return wanted.some(alias => candidates.indexOf(alias) !== -1);
+  });
+
+  if (matches.length === 0) {
+    throw new Error(`Could not find the HubSpot custom object schema for ${spec.label}.`);
+  }
+  if (matches.length > 1) {
+    throw new Error(`Multiple HubSpot schemas matched ${spec.label}.`);
+  }
+
+  return matches[0];
+}
+
+function findHubSpotPropertyByLabelOrName_(objectInfo, label, fallbackName) {
+  const labelKey = normalizeHubSpotOptionToken_(label);
+  const nameKey = normalizeHubSpotOptionToken_(fallbackName);
+  const properties = objectInfo && Array.isArray(objectInfo.properties) ? objectInfo.properties : [];
+
+  for (const property of properties) {
+    const propertyLabelKey = normalizeHubSpotOptionToken_(property && property.label);
+    const propertyNameKey = normalizeHubSpotOptionToken_(property && property.name);
+    if (labelKey && (propertyLabelKey === labelKey || propertyNameKey === labelKey)) return property;
+    if (nameKey && propertyNameKey === nameKey) return property;
+  }
+
+  return null;
+}
+
+function fetchHubSpotPropertyOptionsLookup_(objectType, propertyName, token) {
+  const data = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/properties/${encodeURIComponent(objectType)}/${encodeURIComponent(propertyName)}`,
+    token
+  );
+  const options = data && Array.isArray(data.options) ? data.options : [];
+  const lookup = {};
+
+  for (const option of options) {
+    const normalizedValue = normalizeHubSpotOptionToken_(option && option.value);
+    const normalizedLabel = normalizeHubSpotOptionToken_(option && option.label);
+
+    if (normalizedValue && normalizedLabel) lookup[normalizedValue] = normalizedLabel;
+    if (normalizedLabel) lookup[normalizedLabel] = normalizedLabel;
+  }
+
+  return lookup;
+}
+
+function fetchHubSpotAssociationIdsMap_(fromIds, fromObjectType, toObjectType, token) {
+  const chunks = chunkArray_(fromIds, 1000);
+  const out = {};
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) }))
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v4/associations/${encodeURIComponent(fromObjectType)}/${encodeURIComponent(toObjectType)}/batch/read`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+
+    for (const item of data.results) {
+      const fromId = item && item.from && item.from.id != null ? String(item.from.id) : "";
+      const to = Array.isArray(item.to) ? item.to : [];
+      if (!fromId) continue;
+
+      out[fromId] = to
+        .map(entry => entry && entry.toObjectId != null ? String(entry.toObjectId) : "")
+        .filter(Boolean);
+    }
+  }
+
+  return out;
+}
+
+function collectAssociationIds_(associationMap) {
+  const ids = [];
+  const values = associationMap || {};
+
+  for (const key in values) {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+    const list = Array.isArray(values[key]) ? values[key] : [];
+    for (const id of list) ids.push(String(id || "").trim());
+  }
+
+  return uniqueStrings_(ids);
 }
 
 function fetchDealToPrimaryContactMap_(dealIds, token) {
@@ -1051,8 +1597,7 @@ function fetchHubSpotContactsByIds_(contactIds, token) {
         HUBSPOT_PROP_MAP_.contact.lastName,
         HUBSPOT_PROP_MAP_.contact.youtubeUrl,
         HUBSPOT_PROP_MAP_.contact.countryRegion,
-        HUBSPOT_PROP_MAP_.contact.influencerVertical,
-        HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews
+        HUBSPOT_PROP_MAP_.contact.influencerVertical
       ]
     };
 
@@ -1077,30 +1622,95 @@ function fetchHubSpotContactsByIds_(contactIds, token) {
   return out;
 }
 
+function fetchHubSpotObjectsByIds_(objectType, objectIds, propertyNames, token) {
+  const chunks = chunkArray_(uniqueStrings_(objectIds), 100);
+  const out = {};
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) })),
+      properties: uniqueStrings_(propertyNames)
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/${encodeURIComponent(objectType)}/batch/read`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+
+    for (const item of data.results) {
+      if (item && item.id != null) out[String(item.id)] = item;
+    }
+  }
+
+  return out;
+}
+
+function updateHubSpotDealsPitchingStatus_(dealIds, token, statusValue) {
+  const chunks = chunkArray_(uniqueStrings_(dealIds), 100);
+  let attemptedCount = 0;
+  let updatedCount = 0;
+
+  for (const chunk of chunks) {
+    const inputs = chunk.map(id => {
+      const properties = {};
+      properties[HUBSPOT_PROP_MAP_.deal.pitchingStatus] = statusValue;
+      return {
+        id: String(id),
+        properties
+      };
+    });
+
+    attemptedCount += chunk.length;
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/deals/batch/update`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify({ inputs })
+      }
+    );
+
+    if (data) updatedCount += chunk.length;
+  }
+
+  return { attemptedCount, updatedCount };
+}
+
 
 /***************************************
  * MAPPING + INSERT
  ***************************************/
 
-function mapHubSpotDealAndContactToPitchingRow_(deal, contact, header) {
+function mapHubSpotDealAndContactToPitchingRow_(deal, contact, activation, activationTypePropertyName, activationExtAmountPropertyName, header, brandOptionLookup) {
   const row = new Array(header.length).fill("");
 
   const dealProps = (deal && deal.properties) ? deal.properties : {};
   const contactProps = (contact && contact.properties) ? contact.properties : {};
+  const activationProps = (activation && activation.properties) ? activation.properties : {};
+  const selectedBrands = parseHubSpotMultiSelect_(dealProps[HUBSPOT_PROP_MAP_.deal.brands], brandOptionLookup);
 
   const firstName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.firstName]);
   const lastName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.lastName]);
   const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
 
   setIfColumnExists_(row, header, "Channel Name", fullName);
-  setIfColumnExists_(row, header, "Deal Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.dealType]));
-  setIfColumnExists_(row, header, "Activation Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.activationType]));
+  setIfColumnExists_(row, header, "Activation Type", safeHubSpotValue_(activationProps[activationTypePropertyName]));
   setIfColumnExists_(row, header, "Channel URL", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeUrl]));
   setIfColumnExists_(row, header, "Country/Region", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.countryRegion]));
   setIfColumnExists_(row, header, "Influencer Vertical", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.influencerVertical]));
-  setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.extAmount]));
-  setIfColumnExists_(row, header, "Average Views", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews]));
+  setIfColumnExists_(row, header, "Condition", PITCHING_DEFAULT_CONDITION_);
+  setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(activationProps[activationExtAmountPropertyName]));
   setIfColumnExists_(row, header, "HubSpot Record ID", String(deal.id || "").trim());
+  setIfColumnExists_(row, header, "Status", "PRESENTED");
+  setIfColumnExists_(row, header, "Surfshark", hubSpotMultiSelectHasOption_(selectedBrands, "Surfshark"));
+  setIfColumnExists_(row, header, "Incogni", hubSpotMultiSelectHasOption_(selectedBrands, "Incogni"));
+  setIfColumnExists_(row, header, "Saily", hubSpotMultiSelectHasOption_(selectedBrands, "Saily"));
 
   // Leave these blank on purpose:
   // Availability, CPM, ARCH. Comment, Approved, Rejected, Still Checking, Counteroffer
@@ -1122,8 +1732,22 @@ function insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1
 
   templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
   templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+  writeRange.setBackground("#ffffff");
   sheet.setRowHeights(insertAt1, rowsToInsert.length, sheet.getRowHeight(formatSourceRow1));
   writeRange.setValues(rowsToInsert);
+
+  const avgCol = header.indexOf("Average Views");
+  const followersCol = header.indexOf("Followers");
+  const rateCol = header.indexOf("Rate");
+  if (avgCol !== -1) {
+    sheet.getRange(insertAt1, avgCol + 1, rowsToInsert.length, 1).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+  }
+  if (followersCol !== -1) {
+    sheet.getRange(insertAt1, followersCol + 1, rowsToInsert.length, 1).setNumberFormat(YT_COUNT_NUMBER_FORMAT_);
+  }
+  if (rateCol !== -1) {
+    sheet.getRange(insertAt1, rateCol + 1, rowsToInsert.length, 1).setBackground(PITCHING_RATE_BACKGROUND_);
+  }
 }
 
 
@@ -1133,6 +1757,88 @@ function insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1
 
 function safeHubSpotValue_(value) {
   return value == null ? "" : value;
+}
+
+function fillPitchingMetricsForImportedRow_(row, header) {
+  const urlCol = header.indexOf("Channel URL");
+  const avgCol = header.indexOf("Average Views");
+  const followersCol = header.indexOf("Followers");
+  const nameCol = header.indexOf("Channel Name");
+  if (urlCol === -1 || (avgCol === -1 && followersCol === -1)) return;
+
+  const url = String(row[urlCol] || "").trim();
+  if (!url) return;
+
+  const channelName = nameCol === -1 ? "" : String(row[nameCol] || "").trim();
+  const needsAvg = avgCol !== -1 && String(row[avgCol] || "").trim() === "";
+  const needsFollowers = followersCol !== -1 && String(row[followersCol] || "").trim() === "";
+  if (!needsAvg && !needsFollowers) return;
+
+  let averageViews = null;
+  let followers = null;
+
+  if (needsAvg && needsFollowers) {
+    const metrics = getChannelMetricsCached_(url);
+    if (metrics) {
+      averageViews = metrics.averageViews;
+      followers = metrics.followers;
+    }
+  } else {
+    if (needsAvg) averageViews = getAverageViewsCached_(url);
+    if (needsFollowers) followers = getFollowersCached_(url);
+  }
+
+  if (needsAvg && averageViews != null) {
+    row[avgCol] = roundToNearestHundred_(averageViews);
+  } else if (needsAvg) {
+    Logger.log(`⚠️ Imported row (${channelName || "no name"}): could not compute Average Views. URL=${url}`);
+  }
+
+  if (needsFollowers && followers != null && followers > 0) {
+    row[followersCol] = roundToNearestHundred_(followers);
+  } else if (needsFollowers) {
+    Logger.log(`⚠️ Imported row (${channelName || "no name"}): could not compute Followers. URL=${url}`);
+  }
+}
+
+function parseHubSpotMultiSelect_(value, optionLookup) {
+  const selected = new Set();
+  const rawValues = Array.isArray(value)
+    ? value
+    : String(value == null ? "" : value).split(/[;,]/);
+
+  for (const rawValue of rawValues) {
+    const normalized = normalizeHubSpotOptionToken_(rawValue);
+    if (!normalized) continue;
+    selected.add(normalized);
+
+    const canonical = optionLookup && optionLookup[normalized] ? optionLookup[normalized] : "";
+    if (canonical) selected.add(canonical);
+  }
+
+  return selected;
+}
+
+function hubSpotMultiSelectHasOption_(selectedOptions, optionLabel) {
+  if (!(selectedOptions instanceof Set)) return false;
+  const normalizedOption = normalizeHubSpotOptionToken_(optionLabel);
+  if (!normalizedOption) return false;
+  if (selectedOptions.has(normalizedOption)) return true;
+
+  for (const selectedOption of selectedOptions) {
+    if (selectedOption.indexOf(normalizedOption) !== -1 || normalizedOption.indexOf(selectedOption) !== -1) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function normalizeHubSpotOptionToken_(value) {
+  return String(value == null ? "" : value)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
 }
 
 function setIfColumnExists_(row, header, columnName, value) {
