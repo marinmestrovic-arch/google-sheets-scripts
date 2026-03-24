@@ -1,4 +1,4 @@
-// Utilities for Pitching/Campaigns sync + archive + Average Views enrichment.
+// Utilities for Pitching/Campaigns sync + archive + Median Views enrichment.
 
 
 // 1) Push approved -> Campaigns
@@ -16,12 +16,12 @@ function pushConfirmedCreatorsToCampaigns() {
   const campHeader = (campData[0] || []).map(v => String(v || "").trim());
   const campNumCols = campHeader.length;
 
-  const pApprovedCol = pitchHeader.indexOf("Approved");
+  const pStatusCol = pitchHeader.indexOf("Status");
   const pAvailabilityCol = pitchHeader.indexOf("Availability");
   const pChannelCol = pitchHeader.indexOf("Channel Name");
   const cChannelCol = campHeader.indexOf("Channel Name");
-  if (pApprovedCol === -1 || pAvailabilityCol === -1 || pChannelCol === -1) {
-    return Logger.log("❌ Pitching missing required columns: Approved, Availability, Channel Name.");
+  if (pStatusCol === -1 || pAvailabilityCol === -1 || pChannelCol === -1) {
+    return Logger.log("❌ Pitching missing required columns: Status, Availability, Channel Name.");
   }
   if (cChannelCol === -1) return Logger.log("❌ Campaigns missing required column: Channel Name.");
 
@@ -30,13 +30,14 @@ function pushConfirmedCreatorsToCampaigns() {
 
   const commonCols = getCommonColumnsByHeader_(pitchHeader, campHeader);
   if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Pitching and Campaigns.");
+  const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
 
   const existingBySection = getExistingSignaturesBySection_(campData, commonCols);
   const candidates = [];
   for (let r = 1; r < archivedStart0; r++) {
     const row = pitchData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (!asBool_(row[pApprovedCol])) continue;
+    if (String(row[pStatusCol] || "").trim() !== "Approved") continue;
 
     const availability = String(row[pAvailabilityCol] || "").trim();
     const channelName = String(row[pChannelCol] || "").trim();
@@ -61,7 +62,7 @@ function pushConfirmedCreatorsToCampaigns() {
   let skippedNoSection = 0;
 
   for (const item of candidates) {
-    const signature = buildSignatureFromPitchRow_(item.values, commonCols);
+    const signature = buildSignatureFromPitchRow_(item.values, pitchHeader, commonCols);
     if (!existingBySection[item.availability]) existingBySection[item.availability] = new Set();
     if (existingBySection[item.availability].has(signature)) {
       skippedDup++;
@@ -87,7 +88,8 @@ function pushConfirmedCreatorsToCampaigns() {
     const formatSourceRow1 = firstEmptyRow1 + 1; // original empty row shifted down
 
     const out = new Array(campNumCols).fill("");
-    for (const m of commonCols) out[m.cIdx] = item.values[m.pIdx];
+    for (const m of commonCols) out[m.cIdx] = getPitchValueForCampaignColumn_(item.values, pitchHeader, m);
+    applyPitchSpecialCampaignMappings_(out, campHeader, item.values, pitchHeader, pitchRowsByKey);
 
     const targetRange = campaignsSheet.getRange(targetRow1, 1, 1, campNumCols);
     const templateRange = getSafeFormatRow_(campaignsSheet, formatSourceRow1, campNumCols);
@@ -102,14 +104,14 @@ function pushConfirmedCreatorsToCampaigns() {
 }
 
 
-// 2) Archive pitches (Approved + Rejected)
+// 2) Archive pitches (Status = Approved or Rejected)
 function archivePitches() {
   try {
-    Logger.log("▶️ Running pushConfirmedCreatorsToCampaigns() before archive.");
+    Logger.log("▶️ Running Pitching → Campaigns before archive.");
     pushConfirmedCreatorsToCampaigns();
     SpreadsheetApp.flush();
   } catch (e) {
-    Logger.log(`⚠️ Push step failed; continuing archive: ${e && e.stack ? e.stack : e}`);
+    Logger.log(`⚠️ Pitching → Campaigns step failed; continuing archive: ${e && e.stack ? e.stack : e}`);
   }
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -117,41 +119,67 @@ function archivePitches() {
   if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
 
   const data = sheet.getDataRange().getValues();
+  const header = (data[0] || []).map(v => String(v || "").trim());
+
+  const statusCol = header.indexOf("Status");
+  if (statusCol === -1) return Logger.log("❌ Pitching missing required column: Status.");
+
+  const activeStart0 = findSectionRowByLabel_(data, "Active Pitches");
   const archivedStart0 = findSectionRowByLabel_(data, "Archived");
+  if (activeStart0 === -1) return Logger.log("❌ Could not find 'Active Pitches' section in Pitching.");
   if (archivedStart0 === -1) return Logger.log("❌ Could not find 'Archived' section in Pitching.");
 
-  const header = (data[0] || []).map(v => String(v || "").trim());
-  const approvedCol = header.indexOf("Approved");
-  const rejectedCol = header.indexOf("Rejected");
-  const activationCol = header.indexOf("Activation");
-  if (approvedCol === -1 || rejectedCol === -1) {
-    return Logger.log("❌ Pitching missing required columns: Approved and/or Rejected.");
-  }
-
   const rowsToArchive = [];
-  for (let r = 1; r < archivedStart0; r++) {
+  for (let r = activeStart0 + 1; r < archivedStart0; r++) {
     const row = data[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (!(asBool_(row[approvedCol]) || asBool_(row[rejectedCol]))) continue;
+    const status = String(row[statusCol] || "").trim();
+    if (status !== "Approved" && status !== "Rejected") continue;
     rowsToArchive.push({ sourceRow1: r + 1, values: row.slice() });
   }
 
   if (rowsToArchive.length === 0) return Logger.log("ℹ️ No rows to archive.");
 
+  // Delete from bottom up to preserve row numbers
   for (const entry of rowsToArchive.slice().sort((a, b) => b.sourceRow1 - a.sourceRow1)) {
     sheet.deleteRow(entry.sourceRow1);
   }
 
+  // Re-read after deletions
   const refreshed = sheet.getDataRange().getValues();
+  const refreshedActiveStart0 = findSectionRowByLabel_(refreshed, "Active Pitches");
   const refreshedArchivedStart0 = findSectionRowByLabel_(refreshed, "Archived");
   if (refreshedArchivedStart0 === -1) return Logger.log("❌ Archived section disappeared after deletion.");
 
-  let insertAt1 = findFirstEmptyRowInSection1_(refreshed, refreshedArchivedStart0);
-  if (insertAt1 === -1) insertAt1 = refreshedArchivedStart0 + 2;
+  // Restore blank rows at the top of Active Pitches (right below the section label)
+  if (refreshedActiveStart0 !== -1) {
+    const restoreAt1 = refreshedActiveStart0 + 2; // 1-indexed row right below "Active Pitches" label
+    if (rowsToArchive.length > 1) {
+      sheet.insertRowsBefore(restoreAt1, rowsToArchive.length);
+    } else {
+      sheet.insertRowBefore(restoreAt1);
+    }
+    // Format/validation source: the original first data row, now shifted down by the inserted rows
+    const formatSourceRow1 = restoreAt1 + rowsToArchive.length;
+    const numColsActive = sheet.getLastColumn();
+    const templateActiveRange = getSafeFormatRow_(sheet, formatSourceRow1, numColsActive);
+    const restoreRange = sheet.getRange(restoreAt1, 1, rowsToArchive.length, numColsActive);
+    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+    sheet.setRowHeights(restoreAt1, rowsToArchive.length, sheet.getRowHeight(formatSourceRow1));
+  }
+
+  // Re-read again after blank rows were inserted
+  const refreshed2 = sheet.getDataRange().getValues();
+  const archivedStart0final = findSectionRowByLabel_(refreshed2, "Archived");
+  if (archivedStart0final === -1) return Logger.log("❌ Archived section not found after row restore.");
+
+  let insertAt1 = findFirstEmptyRowInSection1_(refreshed2, archivedStart0final);
+  if (insertAt1 === -1) insertAt1 = archivedStart0final + 2;
 
   const numCols = sheet.getLastColumn();
   const arrayFormulaCols0 = getArrayFormulaColumns_(sheet, 2, numCols);
-  const templateRange = getSafeFormatRow_(sheet, refreshedArchivedStart0 + 2, numCols);
+  const templateRange = getSafeFormatRow_(sheet, archivedStart0final + 2, numCols);
 
   if (rowsToArchive.length > 1) {
     sheet.insertRowsBefore(insertAt1, rowsToArchive.length);
@@ -165,16 +193,13 @@ function archivePitches() {
   for (const col0 of arrayFormulaCols0) {
     sheet.getRange(insertAt1, col0 + 1, rowsToArchive.length, 1).clearContent();
   }
-  if (activationCol !== -1) {
-    sheet.getRange(insertAt1, activationCol + 1, rowsToArchive.length, 1).setShowHyperlink(false);
-  }
 
   Logger.log(`✅ Archived ${rowsToArchive.length} row(s).`);
 }
 
 
-// 3) Fill missing Average Views (menu action)
-function fillMissingAverageViews_Pitching() {
+// 3) Fill missing Median Views (menu action)
+function fillMissingMedianViews_Pitching() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sh = ss.getSheetByName("Pitching");
   if (!sh) return Logger.log("❌ 'Pitching' sheet not found.");
@@ -187,11 +212,11 @@ function fillMissingAverageViews_Pitching() {
 
   const header = (values[0] || []).map(h => String(h || "").trim());
   const urlCol = header.indexOf("Channel URL");
-  const avgCol = header.indexOf("Average Views");
+  const medianCol = header.indexOf("Median Views");
   const nameCol = header.indexOf("Channel Name");
 
-  Logger.log(`🔎 Header lookup: Channel URL col=${urlCol} | Average Views col=${avgCol}`);
-  if (urlCol === -1 || avgCol === -1) {
+  Logger.log(`🔎 Header lookup: Channel URL col=${urlCol} | Median Views col=${medianCol}`);
+  if (urlCol === -1 || medianCol === -1) {
     Logger.log(`❌ Missing header(s). Found headers: ${header.join(" | ")}`);
     return;
   }
@@ -228,7 +253,7 @@ function fillMissingAverageViews_Pitching() {
     if (isBlankRow(row)) continue;
 
     const url = norm(row[urlCol]);
-    const cur = row[avgCol];
+    const cur = row[medianCol];
     const chName = (nameCol !== -1) ? norm(row[nameCol]) : "";
 
     checked++;
@@ -238,29 +263,98 @@ function fillMissingAverageViews_Pitching() {
 
     emptyCount++;
 
-    const avg = getAverageViewsCached_(url);
+    const median = computeMedianViewsForChannel_(url);
 
-    if (avg == null) {
+    if (median == null) {
       nullCount++;
-      Logger.log(`⚠️ Row ${r} (${chName || "no name"}): empty Average Views but could not compute. URL=${url}`);
+      Logger.log(`⚠️ Row ${r} (${chName || "no name"}): empty Median Views but could not compute. URL=${url}`);
       continue;
     }
 
-    updates.push({ row1: r, value: avg });
+    updates.push({ row1: r, value: median });
   }
 
-  Logger.log(`📊 Checked rows: ${checked} | Empty Average Views found: ${emptyCount} | Could not compute: ${nullCount} | Will update: ${updates.length}`);
+  Logger.log(`📊 Checked rows: ${checked} | Empty Median Views found: ${emptyCount} | Could not compute: ${nullCount} | Will update: ${updates.length}`);
 
   if (updates.length === 0) {
-    Logger.log("ℹ️ No missing Average Views to fill.");
+    Logger.log("ℹ️ No missing Median Views to fill.");
     return;
   }
 
   // (Optional) simple throttle to avoid quota spikes on big fills
   // Utilities.sleep(150);
 
-  updates.forEach(u => sh.getRange(u.row1, avgCol + 1).setValue(u.value));
-  Logger.log(`✅ Filled Average Views for ${updates.length} row(s).`);
+  updates.forEach(u => sh.getRange(u.row1, medianCol + 1).setValue(u.value));
+  Logger.log(`✅ Filled Median Views for ${updates.length} row(s).`);
+}
+
+
+// 4) Push published Campaigns rows -> Performance
+function pushPublishedCampaignsToPerformance() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const campaignsSheet = ss.getSheetByName("Campaigns");
+  const performanceSheet = ss.getSheetByName("Performance");
+  const pitchingSheet = ss.getSheetByName("Pitching");
+  if (!campaignsSheet || !performanceSheet) {
+    return Logger.log("❌ Missing 'Campaigns' or 'Performance' sheet.");
+  }
+
+  const campaignsData = campaignsSheet.getDataRange().getValues();
+  const performanceData = performanceSheet.getDataRange().getValues();
+  if (campaignsData.length < 2 || performanceData.length < 1) {
+    return Logger.log("ℹ️ One of the sheets has no data.");
+  }
+
+  const campaignsHeader = (campaignsData[0] || []).map(v => String(v || "").trim());
+  const performanceHeader = (performanceData[0] || []).map(v => String(v || "").trim());
+  const statusCol = campaignsHeader.indexOf("Status");
+  if (statusCol === -1) return Logger.log("❌ Campaigns missing required column: Status.");
+
+  const commonCols = getCommonColumnsByHeader_(campaignsHeader, performanceHeader);
+  if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Campaigns and Performance.");
+
+  // Build Pitching lookup by composite key (HubSpot Record ID + Deal Type + Activation Type)
+  let pitchRowsByKey = new Map();
+  let pitchHeader = [];
+  if (pitchingSheet) {
+    const pitchData = pitchingSheet.getDataRange().getValues();
+    if (pitchData.length >= 2) {
+      pitchHeader = (pitchData[0] || []).map(v => String(v || "").trim());
+      const archivedStart0 = findSectionRowByLabel_(pitchData, "Archived");
+      const endRow = archivedStart0 === -1 ? pitchData.length : archivedStart0;
+      pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, endRow);
+    }
+  }
+
+  const rowsToAppend = [];
+  for (let r = 1; r < campaignsData.length; r++) {
+    const row = campaignsData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    if (String(row[statusCol] || "").trim() !== "Published") continue;
+
+    const out = new Array(performanceHeader.length).fill("");
+    for (const m of commonCols) out[m.cIdx] = row[m.pIdx];
+
+    // Look up matching Pitching row and copy Median Views -> Expected Views, CPM -> Expected CPM
+    if (pitchRowsByKey.size > 0) {
+      const key = buildPitchCompositeKey_(row, campaignsHeader);
+      const pitchRow = key ? pitchRowsByKey.get(key) : null;
+      if (pitchRow) {
+        setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", getPitchValueByHeader_(pitchRow, pitchHeader, "Median Views"));
+        setValueIfTargetColumnExists_(out, performanceHeader, "Expected CPM", getPitchValueByHeader_(pitchRow, pitchHeader, "CPM"));
+      }
+    }
+
+    rowsToAppend.push(out);
+  }
+
+  if (rowsToAppend.length === 0) return Logger.log("ℹ️ No published Campaigns rows to push.");
+
+  const startRow1 = findFirstFreeRowFrom1_(performanceSheet, 3, performanceHeader.length);
+  const writeRange = performanceSheet.getRange(startRow1, 1, rowsToAppend.length, performanceHeader.length);
+  writeRange.setValues(rowsToAppend);
+
+  Logger.log(`✅ Pushed ${rowsToAppend.length} published row(s) to Performance starting at row ${startRow1}.`);
 }
 
 
@@ -268,12 +362,14 @@ function fillMissingAverageViews_Pitching() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
-    .addItem("Import HubSpot segment to Pitching", "importHubSpotDealsListToPitching")
+    .addItem("HubSpot → Pitching", "importHubSpotDealsListToPitching")
     .addSeparator()
-    .addItem("Push confirmed creators to Campaigns", "pushConfirmedCreatorsToCampaigns")
+    .addItem("Pitching → Campaigns", "pushConfirmedCreatorsToCampaigns")
     .addItem("Archive pitches", "archivePitches")
     .addSeparator()
-    .addItem("Fill missing Average Views", "fillMissingAverageViews_Pitching")
+    .addItem("Campaigns → Performance", "pushPublishedCampaignsToPerformance")
+    .addSeparator()
+    .addItem("Fill Median Views", "fillMissingMedianViews_Pitching")
     .addToUi();
 }
 
@@ -327,6 +423,21 @@ function findFirstEmptyRowInSection1_(data, sectionStart0) {
   return -1;
 }
 
+function findFirstFreeRowFrom1_(sheet, startRow1, numCols) {
+  const firstRow1 = Math.max(Number(startRow1) || 1, 1);
+  const width = Math.max(Number(numCols) || 1, 1);
+  const lastRow = Math.max(sheet.getLastRow(), firstRow1);
+
+  if (lastRow < firstRow1) return firstRow1;
+
+  const values = sheet.getRange(firstRow1, 1, lastRow - firstRow1 + 1, width).getValues();
+  for (let i = 0; i < values.length; i++) {
+    if (isBlankRow_(values[i])) return firstRow1 + i;
+  }
+
+  return lastRow + 1;
+}
+
 function getCommonColumnsByHeader_(sourceHeader, targetHeader) {
   const sourceMap = new Map();
   for (let i = 0; i < sourceHeader.length; i++) {
@@ -376,12 +487,89 @@ function getExistingSignaturesBySection_(campaignData, commonCols) {
   return out;
 }
 
-function buildSignatureFromPitchRow_(row, commonCols) {
-  return commonCols.map(m => String(row[m.pIdx] || "").trim()).join("||");
+function buildSignatureFromPitchRow_(row, pitchHeader, commonCols) {
+  return commonCols
+    .map(m => String(getPitchValueForCampaignColumn_(row, pitchHeader, m) || "").trim())
+    .join("||");
 }
 
 function buildSignatureFromCampaignRow_(row, commonCols) {
   return commonCols.map(m => String(row[m.cIdx] || "").trim()).join("||");
+}
+
+function getPitchValueForCampaignColumn_(row, pitchHeader, mapping) {
+  if (!mapping || !mapping.name) return "";
+  if (mapping.name === "Rate") return getNegotiatedRateValue_(row, pitchHeader);
+  if (mapping.name === "Status") return "Active";
+  return row[mapping.pIdx];
+}
+
+function getNegotiatedRateValue_(row, pitchHeader) {
+  const rateStart0 = pitchHeader.indexOf("Rate");
+  if (rateStart0 === -1) return "";
+
+  let rateEnd0 = pitchHeader.length - 1;
+  for (let c = rateStart0 + 1; c < pitchHeader.length; c++) {
+    if (String(pitchHeader[c] || "").trim() !== "") {
+      rateEnd0 = c - 1;
+      break;
+    }
+  }
+
+  for (let c = rateEnd0; c >= rateStart0; c--) {
+    const value = row[c];
+    if (String(value || "").trim() !== "") return value;
+  }
+
+  return "";
+}
+
+function getPitchValueByHeader_(row, pitchHeader, headerName) {
+  const idx = pitchHeader.indexOf(String(headerName || "").trim());
+  return idx === -1 ? "" : row[idx];
+}
+
+function applyPitchSpecialCampaignMappings_(outRow, campHeader, pitchRow, pitchHeader, pitchRowsByKey) {
+  const matchedPitchRow =
+    getPitchRowByCompositeKey_(pitchRow, pitchHeader, pitchRowsByKey) || pitchRow;
+
+  setValueIfTargetColumnExists_(outRow, campHeader, "Expected Views", getPitchValueByHeader_(matchedPitchRow, pitchHeader, "Median Views"));
+  setValueIfTargetColumnExists_(outRow, campHeader, "Expected CPM", getPitchValueByHeader_(matchedPitchRow, pitchHeader, "CPM"));
+}
+
+function setValueIfTargetColumnExists_(row, header, columnName, value) {
+  const idx = header.indexOf(String(columnName || "").trim());
+  if (idx !== -1) row[idx] = value;
+}
+
+function getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0) {
+  const out = new Map();
+  for (let r = 1; r < archivedStart0; r++) {
+    const row = pitchData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const key = buildPitchCompositeKey_(row, pitchHeader);
+    if (!key || out.has(key)) continue;
+    out.set(key, row);
+  }
+  return out;
+}
+
+function getPitchRowByCompositeKey_(row, pitchHeader, pitchRowsByKey) {
+  const key = buildPitchCompositeKey_(row, pitchHeader);
+  if (!key || !pitchRowsByKey) return null;
+  return pitchRowsByKey.get(key) || null;
+}
+
+function buildPitchCompositeKey_(row, pitchHeader) {
+  const keys = [
+    getPitchValueByHeader_(row, pitchHeader, "HubSpot Record ID"),
+    getPitchValueByHeader_(row, pitchHeader, "Deal Type"),
+    getPitchValueByHeader_(row, pitchHeader, "Activation Type")
+  ].map(v => String(v || "").trim());
+
+  if (!keys[0]) return "";
+  return keys.join("||");
 }
 
 
@@ -408,7 +596,7 @@ const YT_CHANNEL_ID_PATTERNS_ = [
 var YT_API_KEY_INVALID_ = false;
 var YT_API_KEY_INVALID_LOGGED_ = false;
 
-function getAverageViewsCached_(channelUrl) {
+function computeMedianViewsForChannel_(channelUrl) {
   if (!channelUrl || typeof channelUrl !== "string") return null;
 
   const apiKey = getYouTubeApiKey_();
@@ -432,13 +620,13 @@ function getAverageViewsCached_(channelUrl) {
     return Number(persisted);
   }
 
-  const avg = computeAverageViewsForChannel_(normalized, apiKey);
-  if (avg == null) return null;
+  const median = computeMedianViewsFromYouTube_(normalized, apiKey);
+  if (median == null) return null;
 
-  const stored = String(avg);
+  const stored = String(median);
   props.setProperty(cacheKey, stored);
   cache.put(cacheKey, stored, YT_CACHE_TTL_SECONDS_);
-  return avg;
+  return median;
 }
 
 function normalizeChannelUrl_(url) {
@@ -496,7 +684,7 @@ function resetYouTubeKeyValidationCache_() {
   Logger.log("✅ YouTube API key validation cache reset.");
 }
 
-function computeAverageViewsForChannel_(channelUrl, apiKey) {
+function computeMedianViewsFromYouTube_(channelUrl, apiKey) {
   try {
     if (YT_API_KEY_INVALID_) return null;
 
@@ -566,7 +754,7 @@ function computeAverageViewsForChannel_(channelUrl, apiKey) {
       if (rawViews == null || isNaN(rawViews)) continue;
 
       pickedViews.push(rawViews);
-      if (pickedViews.length >= YT_MAX_VIDEOS_FOR_AVG_) break;
+      if (pickedViews.length >= YT_MAX_VIDEOS_FOR_AVG_) break; // reused for median sample size
     }
 
     if (pickedViews.length === 0) {
@@ -574,9 +762,14 @@ function computeAverageViewsForChannel_(channelUrl, apiKey) {
       return null;
     }
 
-    return Math.round(pickedViews.reduce((sum, value) => sum + value, 0) / pickedViews.length);
+    const sorted = pickedViews.slice().sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 !== 0
+      ? sorted[mid]
+      : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+    return median;
   } catch (e) {
-    Logger.log("computeAverageViewsForChannel_ error: " + (e && e.stack ? e.stack : e));
+    Logger.log("computeMedianViewsFromYouTube_ error: " + (e && e.stack ? e.stack : e));
     return null;
   }
 }
@@ -779,20 +972,26 @@ function iso8601DurationToSeconds_(duration) {
 const HUBSPOT_TOKEN_PROP_ = "HUBSPOT_PRIVATE_APP_TOKEN";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
 
-// Keep all guessed internal names here so they are easy to fix later.
+// Internal name of the Activations custom object type in HubSpot.
+// Update this if the object type identifier differs in your portal.
+const HUBSPOT_ACTIVATION_OBJECT_TYPE_ = "activations";
+
+// Keep all internal property names here so they are easy to fix later.
 const HUBSPOT_PROP_MAP_ = {
   deal: {
     dealType: "dealtype",
+    pitchingStatus: "pitching_status"
+  },
+  activation: {
     activationType: "activation_type",
-    extAmount: "ext_amount"
+    amount: "ext_amount"
   },
   contact: {
-    firstName: "firstname",                 // often standard HubSpot field
-    lastName: "lastname",                   // often standard HubSpot field
-    youtubeUrl: "youtube_url",
+    firstName: "firstname",
+    lastName: "lastname",
+    influencerUrl: "influencer_url",
     countryRegion: "country",
-    influencerVertical: "influencer_vertical",
-    youtubeVideoAverageViews: "youtube_video_average_views"
+    influencerVertical: "influencer_vertical"
   }
 };
 
@@ -825,7 +1024,7 @@ function importHubSpotDealsListToPitching() {
     "Country/Region",
     "Influencer Vertical",
     "Rate",
-    "Average Views",
+    "Median Views",
     "HubSpot Record ID"
   ];
 
@@ -856,6 +1055,8 @@ function importHubSpotDealsListToPitching() {
     return Logger.log("ℹ️ No deals returned from HubSpot batch read.");
   }
 
+  const dealTypeLookup = fetchHubSpotPropertyLabelLookup_("deals", HUBSPOT_PROP_MAP_.deal.dealType, token);
+
   const dealToContactId = fetchDealToPrimaryContactMap_(dealIds, token);
   const contactIds = Object.values(dealToContactId).filter(Boolean);
 
@@ -864,16 +1065,45 @@ function importHubSpotDealsListToPitching() {
     contactsById = fetchHubSpotContactsByIds_(contactIds, token);
   }
 
+  let activationsObjectTypeId;
+  try {
+    const activationsInfo = loadHubSpotCustomObjectInfo_({ key: HUBSPOT_ACTIVATION_OBJECT_TYPE_, aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_TYPE_] }, token);
+    activationsObjectTypeId = activationsInfo.objectTypeId;
+    Logger.log(`✅ Resolved Activations object type ID: ${activationsObjectTypeId}`);
+  } catch (e) {
+    Logger.log(`❌ Could not resolve Activations object type: ${e}`);
+    return;
+  }
+
+  const dealToActivationIds = fetchDealToActivationIdsMap_(dealIds, activationsObjectTypeId, token);
+  const allActivationIds = uniqueStrings_(
+    Object.values(dealToActivationIds).reduce((acc, ids) => acc.concat(ids), [])
+  );
+  const activationsById = allActivationIds.length
+    ? fetchHubSpotActivationsByIds_(allActivationIds, activationsObjectTypeId, token)
+    : {};
+
   const rowsToInsert = [];
+  const insertedDealIds = new Set();
   for (const deal of deals) {
     const dealId = String(deal.id || "").trim();
     if (!dealId) continue;
 
     const contactId = dealToContactId[dealId];
     const contact = contactId ? contactsById[String(contactId)] : null;
+    const activationIds = dealToActivationIds[dealId] || [];
 
-    const row = mapHubSpotDealAndContactToPitchingRow_(deal, contact, header);
-    rowsToInsert.push(row);
+    if (activationIds.length === 0) {
+      Logger.log(`⚠️ Deal ${dealId} has no activations, skipping.`);
+      continue;
+    }
+
+    for (const activationId of activationIds) {
+      const activation = activationsById[activationId] || null;
+      const row = mapHubSpotDealAndContactToPitchingRow_(deal, contact, activation, header, dealTypeLookup);
+      rowsToInsert.push(row);
+    }
+    insertedDealIds.add(dealId);
   }
 
   if (!rowsToInsert.length) {
@@ -881,8 +1111,12 @@ function importHubSpotDealsListToPitching() {
   }
 
   insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1);
-
   Logger.log(`✅ Imported ${rowsToInsert.length} row(s) into Pitching.`);
+
+  updateHubSpotDealsPitchingStatus_(Array.from(insertedDealIds), "Pitched", token);
+
+  SpreadsheetApp.flush();
+  fillMissingMedianViews_Pitching();
 }
 
 
@@ -920,6 +1154,28 @@ function hubspotHeaders_(token) {
     Authorization: "Bearer " + token,
     "Content-Type": "application/json"
   };
+}
+
+function loadHubSpotCustomObjectInfo_(spec, token) {
+  const schemasResponse = hubspotFetchJson_(`${HUBSPOT_API_BASE_}/crm-object-schemas/v3/schemas`, token);
+  const schemas = Array.isArray(schemasResponse && schemasResponse.results)
+    ? schemasResponse.results
+    : [];
+  const wanted = (spec.aliases || [spec.key]).map(normalizeHubSpotOptionToken_).filter(Boolean);
+  const match = schemas.find(schema => {
+    const candidates = [
+      schema && schema.name,
+      schema && schema.labels && schema.labels.singular,
+      schema && schema.labels && schema.labels.plural
+    ].map(normalizeHubSpotOptionToken_).filter(Boolean);
+    return wanted.some(alias => candidates.indexOf(alias) !== -1);
+  });
+  if (!match) throw new Error(`Could not find HubSpot custom object schema for "${spec.key}".`);
+  return { objectTypeId: match.objectTypeId, label: (match.labels && (match.labels.plural || match.labels.singular)) || spec.key };
+}
+
+function normalizeHubSpotOptionToken_(s) {
+  return s ? String(s).toLowerCase().replace(/[^a-z0-9]/g, "") : "";
 }
 
 function hubspotFetchJson_(url, token, options) {
@@ -984,9 +1240,7 @@ function fetchHubSpotDealsByIds_(dealIds, token) {
     const body = {
       inputs: chunk.map(id => ({ id: String(id) })),
       properties: [
-        HUBSPOT_PROP_MAP_.deal.dealType,
-        HUBSPOT_PROP_MAP_.deal.activationType,
-        HUBSPOT_PROP_MAP_.deal.extAmount
+        HUBSPOT_PROP_MAP_.deal.dealType
       ]
     };
 
@@ -1049,10 +1303,9 @@ function fetchHubSpotContactsByIds_(contactIds, token) {
       properties: [
         HUBSPOT_PROP_MAP_.contact.firstName,
         HUBSPOT_PROP_MAP_.contact.lastName,
-        HUBSPOT_PROP_MAP_.contact.youtubeUrl,
+        HUBSPOT_PROP_MAP_.contact.influencerUrl,
         HUBSPOT_PROP_MAP_.contact.countryRegion,
-        HUBSPOT_PROP_MAP_.contact.influencerVertical,
-        HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews
+        HUBSPOT_PROP_MAP_.contact.influencerVertical
       ]
     };
 
@@ -1077,29 +1330,132 @@ function fetchHubSpotContactsByIds_(contactIds, token) {
   return out;
 }
 
+function fetchHubSpotPropertyLabelLookup_(objectType, propertyName, token) {
+  const data = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/properties/${encodeURIComponent(objectType)}/${encodeURIComponent(propertyName)}`,
+    token
+  );
+  const options = data && Array.isArray(data.options) ? data.options : [];
+  const lookup = {};
+  for (const option of options) {
+    if (option && option.value != null) {
+      lookup[String(option.value)] = option.label != null ? String(option.label) : String(option.value);
+    }
+  }
+  return lookup;
+}
+
+function updateHubSpotDealsPitchingStatus_(dealIds, status, token) {
+  const ids = (dealIds || []).map(id => String(id).trim()).filter(Boolean);
+  if (!ids.length) return;
+
+  const chunks = chunkArray_(ids, 100);
+  let updated = 0;
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({
+        id,
+        properties: { [HUBSPOT_PROP_MAP_.deal.pitchingStatus]: status }
+      }))
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/deals/batch/update`,
+      token,
+      { method: "post", payload: JSON.stringify(body) }
+    );
+
+    if (data && Array.isArray(data.results)) updated += data.results.length;
+  }
+
+  Logger.log(`✅ Updated Pitching Status to "${status}" for ${updated} deal(s) in HubSpot.`);
+}
+
+
+function fetchDealToActivationIdsMap_(dealIds, activationsObjectTypeId, token) {
+  const out = {};
+  const chunks = chunkArray_(dealIds, 100);
+
+  for (const chunk of chunks) {
+    const body = { inputs: chunk.map(id => ({ id: String(id) })) };
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v4/associations/deals/${encodeURIComponent(activationsObjectTypeId)}/batch/read`,
+      token,
+      { method: "post", payload: JSON.stringify(body) }
+    );
+    if (!data || !Array.isArray(data.results)) continue;
+    for (const item of data.results) {
+      const fromId = item && item.from && item.from.id != null ? String(item.from.id) : "";
+      const to = Array.isArray(item.to) ? item.to : [];
+      if (fromId) {
+        out[fromId] = to
+          .map(t => t && t.toObjectId != null ? String(t.toObjectId) : "")
+          .filter(Boolean);
+      }
+    }
+  }
+
+  return out;
+}
+
+function fetchHubSpotActivationsByIds_(activationIds, activationsObjectTypeId, token) {
+  const chunks = chunkArray_(activationIds, 100);
+  const out = {};
+
+  for (const chunk of chunks) {
+    const body = {
+      inputs: chunk.map(id => ({ id: String(id) })),
+      properties: [
+        HUBSPOT_PROP_MAP_.activation.activationType,
+        HUBSPOT_PROP_MAP_.activation.amount
+      ]
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/${encodeURIComponent(activationsObjectTypeId)}/batch/read`,
+      token,
+      { method: "post", payload: JSON.stringify(body) }
+    );
+
+    if (!data || !Array.isArray(data.results)) continue;
+
+    for (const item of data.results) {
+      if (item && item.id != null) out[String(item.id)] = item;
+    }
+  }
+
+  return out;
+}
+
 
 /***************************************
  * MAPPING + INSERT
  ***************************************/
 
-function mapHubSpotDealAndContactToPitchingRow_(deal, contact, header) {
+function mapHubSpotDealAndContactToPitchingRow_(deal, contact, activation, header, dealTypeLookup) {
   const row = new Array(header.length).fill("");
 
   const dealProps = (deal && deal.properties) ? deal.properties : {};
   const contactProps = (contact && contact.properties) ? contact.properties : {};
+  const activationProps = (activation && activation.properties) ? activation.properties : {};
 
   const firstName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.firstName]);
   const lastName = safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.lastName]);
   const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
 
+  const rawDealType = safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.dealType]);
+  const dealTypeLabel = (dealTypeLookup && rawDealType && dealTypeLookup[rawDealType]) ? dealTypeLookup[rawDealType] : rawDealType;
+
   setIfColumnExists_(row, header, "Channel Name", fullName);
-  setIfColumnExists_(row, header, "Deal Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.dealType]));
-  setIfColumnExists_(row, header, "Activation Type", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.activationType]));
-  setIfColumnExists_(row, header, "Channel URL", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeUrl]));
+  setIfColumnExists_(row, header, "Status", "Pitched");
+  setIfColumnExists_(row, header, "Deal Type", dealTypeLabel);
+  setIfColumnExists_(row, header, "Activation Type", safeHubSpotValue_(activationProps[HUBSPOT_PROP_MAP_.activation.activationType]));
+  setIfColumnExists_(row, header, "Channel URL", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.influencerUrl]));
   setIfColumnExists_(row, header, "Country/Region", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.countryRegion]));
   setIfColumnExists_(row, header, "Influencer Vertical", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.influencerVertical]));
-  setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(dealProps[HUBSPOT_PROP_MAP_.deal.extAmount]));
-  setIfColumnExists_(row, header, "Average Views", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.youtubeVideoAverageViews]));
+  setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(activationProps[HUBSPOT_PROP_MAP_.activation.amount]));
+  // Median Views is computed via YouTube API (fillMissingMedianViews_Pitching), not imported from HubSpot
   setIfColumnExists_(row, header, "HubSpot Record ID", String(deal.id || "").trim());
 
   // Leave these blank on purpose:
