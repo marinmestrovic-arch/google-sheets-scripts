@@ -194,7 +194,7 @@ function enrichAndImportToHubSpot() {
     row1: item.row1,
     values: freshData[item.row1 - 1]
   }));
-  importCreatorListToHubSpot_(ss, header, freshRowItems, ui);
+  importCreatorListToHubSpot_(ss, sheet, header, freshRowItems, ui);
 }
 
 
@@ -915,7 +915,7 @@ function getOpenAiModel_() {
 
 // ---- HubSpot import ----
 
-function importCreatorListToHubSpot_(ss, header, rowItems, ui) {
+function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
   const emailCol = header.indexOf("Email");
 
   // Validate emails
@@ -962,7 +962,8 @@ function importCreatorListToHubSpot_(ss, header, rowItems, ui) {
     try {
       const result = HubSpotSharedImporter.startImport(payload);
       if (result && result.ok) {
-        ui.alert(buildImportSuccessMessage_(payload.rowCount, result.importId));
+        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
+        ui.alert(buildImportSuccessMessage_(payload.rowCount, result.importId, result.state, savedRecordIds));
         return;
       }
       throw new Error(result && result.error ? result.error : "Library import failed.");
@@ -998,7 +999,8 @@ function importCreatorListToHubSpot_(ss, header, rowItems, ui) {
         throw new Error(parsed && parsed.error ? parsed.error : "Web app import failed.");
       }
 
-      ui.alert(buildImportSuccessMessage_(payload.rowCount, parsed.importId));
+      const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, parsed.dealRecordIds);
+      ui.alert(buildImportSuccessMessage_(payload.rowCount, parsed.importId, parsed.state, savedRecordIds));
       return;
     } catch (e) {
       ui.alert("❌ HubSpot import failed: " + e.message);
@@ -1015,12 +1017,41 @@ function importCreatorListToHubSpot_(ss, header, rowItems, ui) {
 }
 
 
-function buildImportSuccessMessage_(rowCount, importId) {
+function saveImportedHubSpotRecordIds_(sheet, header, dealRecordIds) {
+  const recordIdCol = header.indexOf("HubSpot Record ID");
+  if (recordIdCol === -1 || !Array.isArray(dealRecordIds) || dealRecordIds.length === 0) {
+    return 0;
+  }
+
+  let saved = 0;
+  dealRecordIds.forEach(item => {
+    const row1 = Number(item && item.sourceRowNumber);
+    const recordId = String(item && item.recordId || "").trim();
+    if (!isFinite(row1) || row1 < 2 || !recordId) return;
+
+    const cell = sheet.getRange(row1, recordIdCol + 1);
+    if (String(cell.getValue() || "").trim() === recordId) return;
+
+    cell.setValue(recordId);
+    saved++;
+  });
+
+  return saved;
+}
+
+function buildImportSuccessMessage_(rowCount, importId, state, savedRecordIds) {
+  const importState = String(state || "STARTED").trim() || "STARTED";
+  const suffix = importState === "DONE"
+    ? "HubSpot finished the import and the returned deal IDs were saved."
+    : "HubSpot continues processing the import in the background.";
+
   return (
     "✅ HubSpot import submitted.\n\n" +
     "Rows: " + rowCount + "\n" +
-    "Import ID: " + (importId || "N/A") + "\n\n" +
-    "HubSpot continues processing the import in the background."
+    "Import ID: " + (importId || "N/A") + "\n" +
+    "State: " + importState + "\n" +
+    "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
+    suffix
   );
 }
 

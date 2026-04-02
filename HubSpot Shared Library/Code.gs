@@ -4,6 +4,10 @@ var HUBSPOT_IMPORT_TOKEN_PROPS_ = [
   "HUBSPOT_PRIVATE_APP_TOKEN",
   "HUBSPOT_API_KEY"
 ];
+var HUBSPOT_IMPORT_STATUS_POLL_MS_ = 2000;
+var HUBSPOT_IMPORT_STATUS_MAX_WAIT_MS_ = 90000;
+var HUBSPOT_DEAL_LOOKUP_RETRY_COUNT_ = 3;
+var HUBSPOT_DEAL_LOOKUP_RETRY_MS_ = 1500;
 
 var HUBSPOT_IMPORT_OBJECT_SPECS_ = [
   {
@@ -126,14 +130,28 @@ function startImport(payload) {
     var normalizedPayload = parseHubSpotImportPayload_(payload);
     var prepared = prepareHubSpotImportFromPayload_(normalizedPayload, token);
     var startedImport = startHubSpotImport_(token, prepared.fileBlob, prepared.importRequest);
+    var importId = startedImport && startedImport.id != null ? String(startedImport.id) : "";
+    var finishedImport = waitForHubSpotImportToFinish_(token, importId);
+    var importState = finishedImport && finishedImport.state
+      ? finishedImport.state
+      : (startedImport && startedImport.state ? startedImport.state : "STARTED");
+
+    if (isHubSpotImportFailedState_(importState)) {
+      throw new Error("HubSpot import finished with state " + importState + ".");
+    }
+
+    var dealRecordIds = importState === "DONE"
+      ? resolveImportedDealRecordIds_(token, prepared.dealLookupRows)
+      : [];
 
     return {
       ok: true,
       rowCount: prepared.rowCount,
       columnCount: prepared.columnCount,
       objectLabels: prepared.objectLabels,
-      importId: startedImport && startedImport.id != null ? String(startedImport.id) : "not returned",
-      state: startedImport && startedImport.state ? startedImport.state : "STARTED"
+      importId: importId || "not returned",
+      state: importState,
+      dealRecordIds: dealRecordIds
     };
   } catch (error) {
     return {
@@ -242,7 +260,14 @@ function prepareHubSpotImportFromPayload_(payload, token, options) {
       importRequest: null,
       rowCount: payload.rowCount,
       columnCount: payload.columnCount,
-      objectLabels: resolvedColumns.objectLabels
+      objectLabels: resolvedColumns.objectLabels,
+      dealLookupRows: buildHubSpotDealLookupRows_(
+        payload.headers,
+        payload.rows,
+        resolvedColumns.mappings,
+        objectCatalog.byKey.deals,
+        payload.sourceRowNumbers
+      )
     };
   }
 
@@ -263,8 +288,211 @@ function prepareHubSpotImportFromPayload_(payload, token, options) {
     importRequest: importRequest,
     rowCount: payload.rowCount,
     columnCount: payload.columnCount,
-    objectLabels: resolvedColumns.objectLabels
+    objectLabels: resolvedColumns.objectLabels,
+    dealLookupRows: buildHubSpotDealLookupRows_(
+      payload.headers,
+      payload.rows,
+      resolvedColumns.mappings,
+      objectCatalog.byKey.deals,
+      payload.sourceRowNumbers
+    )
   };
+}
+
+function buildHubSpotDealLookupRows_(
+  headers,
+  rows,
+  columnMappings,
+  dealsObjectInfo,
+  sourceRowNumbers
+) {
+  var dealsObjectTypeId = dealsObjectInfo && dealsObjectInfo.objectTypeId
+    ? dealsObjectInfo.objectTypeId
+    : "0-3";
+  var lookupColumns = {
+    dealName: null,
+    dealType: null,
+    activationType: null
+  };
+
+  headers.forEach(function(header, idx) {
+    var mapping = columnMappings[idx];
+    if (!mapping || mapping.columnObjectTypeId !== dealsObjectTypeId || !mapping.propertyName) {
+      return;
+    }
+
+    var key = normalizeHubSpotLookupKey_(header);
+    if (mapping.propertyName === "dealname" || key === "deal name") {
+      lookupColumns.dealName = {
+        index: idx,
+        propertyName: mapping.propertyName || "dealname"
+      };
+      return;
+    }
+
+    if (key === "deal type") {
+      lookupColumns.dealType = {
+        index: idx,
+        propertyName: mapping.propertyName
+      };
+      return;
+    }
+
+    if (key === "activation type") {
+      lookupColumns.activationType = {
+        index: idx,
+        propertyName: mapping.propertyName
+      };
+    }
+  });
+
+  if (!lookupColumns.dealName) return [];
+
+  return rows.reduce(function(out, row, rowIdx) {
+    var filters = [];
+    var dealName = getHubSpotLookupCellValue_(row, lookupColumns.dealName);
+    if (!dealName) return out;
+
+    filters.push({
+      propertyName: lookupColumns.dealName.propertyName || "dealname",
+      value: dealName
+    });
+
+    var dealType = getHubSpotLookupCellValue_(row, lookupColumns.dealType);
+    if (dealType && lookupColumns.dealType && lookupColumns.dealType.propertyName) {
+      filters.push({
+        propertyName: lookupColumns.dealType.propertyName,
+        value: dealType
+      });
+    }
+
+    var activationType = getHubSpotLookupCellValue_(row, lookupColumns.activationType);
+    if (activationType && lookupColumns.activationType && lookupColumns.activationType.propertyName) {
+      filters.push({
+        propertyName: lookupColumns.activationType.propertyName,
+        value: activationType
+      });
+    }
+
+    out.push({
+      sourceRowNumber: getHubSpotImportSourceRowNumber_(sourceRowNumbers, rowIdx),
+      filters: filters
+    });
+    return out;
+  }, []);
+}
+
+function getHubSpotLookupCellValue_(row, columnInfo) {
+  if (!row || !columnInfo || columnInfo.index == null) return "";
+  return String(row[columnInfo.index] == null ? "" : row[columnInfo.index]).trim();
+}
+
+function waitForHubSpotImportToFinish_(token, importId) {
+  var id = String(importId || "").trim();
+  if (!id) return null;
+
+  var latest = null;
+  var deadline = Date.now() + HUBSPOT_IMPORT_STATUS_MAX_WAIT_MS_;
+
+  while (Date.now() <= deadline) {
+    latest = hubspotFetchJson_(
+      HUBSPOT_API_BASE_ + "/crm/v3/imports/" + encodeURIComponent(id),
+      token
+    );
+
+    if (isHubSpotImportTerminalState_(latest && latest.state)) {
+      return latest;
+    }
+
+    Utilities.sleep(HUBSPOT_IMPORT_STATUS_POLL_MS_);
+  }
+
+  return latest;
+}
+
+function isHubSpotImportTerminalState_(state) {
+  var normalized = String(state || "").toUpperCase();
+  return ["DONE", "FAILED", "CANCELED", "REVERTED", "COMPLETE", "COMPLETED"].indexOf(normalized) !== -1;
+}
+
+function isHubSpotImportFailedState_(state) {
+  var normalized = String(state || "").toUpperCase();
+  return ["FAILED", "CANCELED", "REVERTED"].indexOf(normalized) !== -1;
+}
+
+function resolveImportedDealRecordIds_(token, dealLookupRows) {
+  if (!Array.isArray(dealLookupRows) || dealLookupRows.length === 0) return [];
+
+  return dealLookupRows.reduce(function(out, rowInfo) {
+    var recordId = findImportedDealRecordId_(token, rowInfo.filters);
+    if (!recordId) return out;
+
+    out.push({
+      sourceRowNumber: rowInfo.sourceRowNumber,
+      recordId: String(recordId)
+    });
+    return out;
+  }, []);
+}
+
+function findImportedDealRecordId_(token, filters) {
+  if (!Array.isArray(filters) || filters.length === 0) return "";
+
+  for (var attempt = 0; attempt < HUBSPOT_DEAL_LOOKUP_RETRY_COUNT_; attempt++) {
+    var exactMatchId = searchHubSpotDealRecordId_(token, filters);
+    if (exactMatchId) return exactMatchId;
+
+    if (filters.length > 1) {
+      var fallbackId = searchHubSpotDealRecordId_(token, [filters[0]]);
+      if (fallbackId) return fallbackId;
+    }
+
+    if (attempt < HUBSPOT_DEAL_LOOKUP_RETRY_COUNT_ - 1) {
+      Utilities.sleep(HUBSPOT_DEAL_LOOKUP_RETRY_MS_);
+    }
+  }
+
+  return "";
+}
+
+function searchHubSpotDealRecordId_(token, filters) {
+  var payload = {
+    filterGroups: [
+      {
+        filters: filters.map(function(filter) {
+          return {
+            propertyName: filter.propertyName,
+            operator: "EQ",
+            value: String(filter.value)
+          };
+        })
+      }
+    ],
+    properties: ["hs_object_id"],
+    limit: 1,
+    sorts: [
+      {
+        propertyName: "createdate",
+        direction: "DESCENDING"
+      }
+    ]
+  };
+  var data = hubspotFetchJson_(
+    HUBSPOT_API_BASE_ + "/crm/v3/objects/deals/search",
+    token,
+    {
+      method: "post",
+      payload: JSON.stringify(payload)
+    }
+  );
+  var match = data && data.results && data.results[0];
+
+  if (!match) return "";
+  return String(
+    match.id ||
+    (match.properties && match.properties.hs_object_id) ||
+    ""
+  ).trim();
 }
 
 function normalizeHubSpotImportSourceRowNumbers_(rawRowNumbers, rowCount) {
