@@ -7,6 +7,7 @@
  * 3) INT Pitching → EXT Pitching
  * 4) Update INT Pitching from EXT
  * 5) Update INT Campaigns from EXT
+ * 6) Update INT Performance from EXT
  *********************************************/
 
 
@@ -15,6 +16,7 @@
 // ============================================================
 
 const EXT_SPREADSHEET_ID_PROP_ = "EXT_SPREADSHEET_ID";
+const EXT_SHEET_DROPDOWN_HEADER_ = "EXT Sheet";
 
 const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
   "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
@@ -50,11 +52,14 @@ var YT_API_KEY_INVALID_ = false;
 var YT_API_KEY_INVALID_LOGGED_ = false;
 
 // INT ↔ EXT column name mappings
-const INT_TO_EXT_PITCHING_MAP_ = { "EXT Rate": "Rate", "EXT CPM": "CPM" };
-const EXT_TO_INT_PITCHING_MAP_ = { "Rate": "EXT Rate", "CPM": "EXT CPM" };
+const INT_TO_EXT_PITCHING_MAP_ = { "EXT Rate": "Rate" };
+const EXT_TO_INT_PITCHING_MAP_ = {};
 const EXT_TO_INT_CAMPAIGNS_MAP_ = { "Rate": "EXT Rate" };
 const CREATOR_TO_PITCHING_NEGOTIATION_MAP_ = { "YouTube Video Median Views": "Median Views" };
-const INT_ONLY_PITCHING_COLS_ = new Set(["INT Rate", "INT CPM"]);
+const INT_ONLY_PITCHING_COLS_ = new Set(["INT Rate", "INT CPM", "EXT CPM"]);
+const EXT_ONLY_PITCHING_COLS_ = new Set(["Rate", "CPM"]);
+const INT_PITCHING_FORMULA_COLS_ = new Set(["INT CPM", "EXT CPM"]);
+const PITCHING_NEGOTIATION_BLOCK_WIDTH_ = 5;
 const CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_ = new Set(["Status"]);
 const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set(["Channel Name", "HubSpot Record ID", "Channel URL", "Status"]);
 const YOUTUBE_ENRICH_FIELDS_ = [
@@ -122,9 +127,10 @@ function onOpen() {
     .addSeparator()
     .addItem("Push to EXT Pitching", "pushReadyForPitchingToExt")
     .addItem("Update Pitching from EXT", "updatePitchingFromExt")
+    .addSeparator()
     .addItem("Update Campaigns from EXT", "updateCampaignsFromExt")
     .addSeparator()
-    .addItem("Fill Median Views", "fillMissingMedianViews_Pitching")
+    .addItem("Update Performance from EXT", "updatePerformanceFromExt")
     .addToUi();
 }
 
@@ -1255,7 +1261,7 @@ function pushReadyForPitchingToExt() {
     return Logger.log("ℹ️ No rows with Status 'Ready for pitching'.");
   }
 
-  // Column mapping: INT → EXT (rename EXT Rate→Rate, EXT CPM→CPM; skip INT Rate, INT CPM)
+  // Column mapping: INT → EXT (rename EXT Rate→Rate; skip INT-only fields and EXT CPM)
   const colMap = buildCrossSheetColumnMap_(intHeader, extHeader, INT_TO_EXT_PITCHING_MAP_, INT_ONLY_PITCHING_COLS_);
 
   // Duplicate detection via composite key
@@ -1344,8 +1350,8 @@ function updatePitchingFromExt() {
     if (key && !intRowMap.has(key)) intRowMap.set(key, r);
   }
 
-  // Column mapping: EXT → INT (Rate→EXT Rate, CPM→EXT CPM)
-  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, EXT_TO_INT_PITCHING_MAP_, new Set());
+  // Column mapping: EXT → INT, excluding the negotiation rate block and CPM.
+  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, EXT_TO_INT_PITCHING_MAP_, EXT_ONLY_PITCHING_COLS_);
 
   let updated = 0;
   for (let r = 1; r < extData.length; r++) {
@@ -1359,19 +1365,20 @@ function updatePitchingFromExt() {
     if (intRowIdx === undefined) continue;
 
     const intRow = intData[intRowIdx];
-    let changed = false;
+    const changedIndexes = new Set();
+
+    syncPitchingNegotiationBlock_(extRow, extHeader, intRow, intHeader).forEach(idx => changedIndexes.add(idx));
 
     for (const m of colMap) {
       const extVal = extRow[m.sourceIdx];
       if (String(extVal || "").trim() === "") continue;
       if (String(intRow[m.targetIdx] || "").trim() !== String(extVal || "").trim()) {
         intRow[m.targetIdx] = extVal;
-        changed = true;
+        changedIndexes.add(m.targetIdx);
       }
     }
 
-    if (changed) {
-      intPitching.getRange(intRowIdx + 1, 1, 1, intHeader.length).setValues([intRow]);
+    if (writeChangedRowCells_(intPitching, intRowIdx + 1, intHeader, intRow, changedIndexes, INT_PITCHING_FORMULA_COLS_)) {
       updated++;
     }
   }
@@ -1475,81 +1482,117 @@ function updateCampaignsFromExt() {
 
 
 // ============================================================
-//  FILL MEDIAN VIEWS (Pitching)
+//  (6) UPDATE INT PERFORMANCE FROM EXT
 // ============================================================
 
-function fillMissingMedianViews_Pitching() {
+function updatePerformanceFromExt() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName("Pitching");
-  if (!sh) return Logger.log("❌ 'Pitching' sheet not found.");
+  const intPerformance = ss.getSheetByName("Performance");
+  if (!intPerformance) return Logger.log("❌ 'Performance' sheet not found.");
 
-  const lastRow = sh.getLastRow();
-  const lastCol = sh.getLastColumn();
-  if (lastRow < 2 || lastCol < 1) return Logger.log("ℹ️ Pitching has no data.");
+  const extSs = getExtSpreadsheet_();
+  if (!extSs) return;
+  const extPerformance = extSs.getSheetByName("Performance");
+  if (!extPerformance) return Logger.log("❌ 'Performance' sheet not found in EXT spreadsheet.");
 
-  const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
-  const header = (values[0] || []).map(h => String(h || "").trim());
-
-  const urlCol = header.indexOf("Channel URL");
-  const medianCol = header.indexOf("Median Views");
-  if (urlCol === -1 || medianCol === -1) {
-    return Logger.log("❌ Missing 'Channel URL' or 'Median Views' column in Pitching.");
+  const intData = intPerformance.getDataRange().getValues();
+  const extData = extPerformance.getDataRange().getValues();
+  if (intData.length < 1 || extData.length < 2) {
+    return Logger.log("ℹ️ One of the sheets has insufficient data.");
   }
 
-  // Stop at Archived section
-  let stopAt = lastRow + 1;
-  for (let r = 2; r <= lastRow; r++) {
-    if (String(values[r - 1][0] || "").trim() === "Archived") { stopAt = r; break; }
-  }
+  const intHeader = intData[0].map(v => String(v || "").trim());
+  const extHeader = extData[0].map(v => String(v || "").trim());
 
-  const updates = [];
-  for (let r = 2; r < stopAt; r++) {
-    const row = values[r - 1];
+  // Build INT row lookup by composite key
+  const intRowMap = new Map();
+  for (let r = 1; r < intData.length; r++) {
+    const row = intData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    const url = String(row[urlCol] || "").trim();
-    if (!url) continue;
-    if (String(row[medianCol] || "").trim() !== "") continue;
-
-    const median = computeMedianViewsForChannel_(url);
-    if (median != null) updates.push({ row1: r, value: median });
+    const key = buildCompositeKey_(row, intHeader);
+    if (key && !intRowMap.has(key)) intRowMap.set(key, r);
   }
 
-  if (updates.length === 0) return Logger.log("ℹ️ No missing Median Views to fill.");
+  // Column mapping: EXT → INT using matching column names only.
+  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, {}, new Set());
+  const existingPerformanceSignatures = buildMappedRowSignatureSetFromTarget_(intData, colMap);
 
-  updates.forEach(u => sh.getRange(u.row1, medianCol + 1).setValue(u.value));
-  Logger.log(`✅ Filled Median Views for ${updates.length} row(s).`);
+  let updated = 0;
+  let inserted = 0;
+
+  for (let r = 1; r < extData.length; r++) {
+    const extRow = extData[r];
+    if (isBlankRow_(extRow) || isSectionLabelRow_(extRow)) continue;
+
+    const key = buildCompositeKey_(extRow, extHeader);
+    const signature = buildMappedRowSignatureFromSource_(extRow, colMap);
+
+    const intRowIdx = key ? intRowMap.get(key) : undefined;
+    if (intRowIdx !== undefined) {
+      // Update existing row
+      const intRow = intData[intRowIdx];
+      let changed = false;
+
+      for (const m of colMap) {
+        const extVal = extRow[m.sourceIdx];
+        if (String(extVal || "").trim() === "") continue;
+        if (String(intRow[m.targetIdx] || "").trim() !== String(extVal || "").trim()) {
+          intRow[m.targetIdx] = extVal;
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        intPerformance.getRange(intRowIdx + 1, 1, 1, intHeader.length).setValues([intRow]);
+        updated++;
+      }
+    } else {
+      if (signature && existingPerformanceSignatures.has(signature)) continue;
+
+      const intNumCols = intHeader.length;
+      const out = new Array(intNumCols).fill("");
+      for (const m of colMap) out[m.targetIdx] = extRow[m.sourceIdx];
+
+      const insertAt1 = findFirstFreeRowFrom1_(intPerformance, 3, intNumCols);
+      const targetRange = intPerformance.getRange(insertAt1, 1, 1, intNumCols);
+      targetRange.setValues([out]);
+
+      if (key) intRowMap.set(key, insertAt1 - 1);
+      if (signature) existingPerformanceSignatures.add(signature);
+      inserted++;
+    }
+  }
+
+  Logger.log(`✅ INT Performance: ${updated} updated, ${inserted} inserted from EXT.`);
 }
-
 
 // ============================================================
 //  CROSS-SPREADSHEET HELPERS
 // ============================================================
 
 function getExtSpreadsheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
-  let extId = String(props.getProperty(EXT_SPREADSHEET_ID_PROP_) || "").trim();
+  const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
+  const dropdownExtSheetValue = Array.isArray(dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_]) &&
+    dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_].length > 0
+    ? String(dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_][0] || "").trim()
+    : "";
+
+  let extId = extractSpreadsheetId_(dropdownExtSheetValue);
+  if (!extId) {
+    extId = extractSpreadsheetId_(props.getProperty(EXT_SPREADSHEET_ID_PROP_));
+  }
 
   if (!extId) {
-    const ui = SpreadsheetApp.getUi();
-    const response = ui.prompt(
-      "EXT Spreadsheet",
-      "Paste the EXT spreadsheet ID or URL:",
-      ui.ButtonSet.OK_CANCEL
+    SpreadsheetApp.getUi().alert(
+      "❌ EXT spreadsheet not configured.\n\n" +
+      "Add an 'EXT Sheet' column in 'Dropdown Values' and put the EXT spreadsheet ID or URL in row 2."
     );
-    if (response.getSelectedButton() !== ui.Button.OK) return null;
-
-    extId = String(response.getResponseText() || "").trim();
-    // Extract ID from URL if needed
-    const urlMatch = extId.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/);
-    if (urlMatch) extId = urlMatch[1];
-
-    if (!extId) {
-      ui.alert("EXT spreadsheet ID is required.");
-      return null;
-    }
-    props.setProperty(EXT_SPREADSHEET_ID_PROP_, extId);
+    return null;
   }
+
+  props.setProperty(EXT_SPREADSHEET_ID_PROP_, extId);
 
   try {
     return SpreadsheetApp.openById(extId);
@@ -1558,6 +1601,17 @@ function getExtSpreadsheet_() {
     SpreadsheetApp.getUi().alert("❌ Could not open EXT spreadsheet. Check the ID and permissions.");
     return null;
   }
+}
+
+function extractSpreadsheetId_(value) {
+  const raw = String(value || "").trim().replace(/^['"]|['"]$/g, "");
+  if (!raw) return "";
+
+  const urlMatch = raw.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/i);
+  if (urlMatch && urlMatch[1]) return urlMatch[1];
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(raw)) return raw;
+  return "";
 }
 
 
@@ -1606,6 +1660,58 @@ function buildCompositeKeySet_(data, header) {
     if (key) set.add(key);
   }
   return set;
+}
+
+function syncPitchingNegotiationBlock_(extRow, extHeader, intRow, intHeader) {
+  const extStartIdx = extHeader.indexOf("Rate");
+  const intStartIdx = intHeader.indexOf("EXT Rate");
+  if (extStartIdx === -1 || intStartIdx === -1) return [];
+
+  const changedIndexes = [];
+  const maxWidth = Math.min(
+    PITCHING_NEGOTIATION_BLOCK_WIDTH_,
+    extHeader.length - extStartIdx,
+    intHeader.length - intStartIdx
+  );
+
+  for (let offset = 0; offset < maxWidth; offset++) {
+    const extColumnName = String(extHeader[extStartIdx + offset] || "").trim();
+    const intColumnName = String(intHeader[intStartIdx + offset] || "").trim();
+    if (
+      extColumnName === "CPM" ||
+      intColumnName === "EXT CPM" ||
+      intColumnName === "INT CPM"
+    ) {
+      continue;
+    }
+
+    const extVal = extRow[extStartIdx + offset];
+    if (String(extVal || "").trim() === "") continue;
+
+    if (String(intRow[intStartIdx + offset] || "").trim() !== String(extVal || "").trim()) {
+      intRow[intStartIdx + offset] = extVal;
+      changedIndexes.push(intStartIdx + offset);
+    }
+  }
+
+  return changedIndexes;
+}
+
+function writeChangedRowCells_(sheet, row1, header, row, changedIndexes, skipHeaders) {
+  if (!changedIndexes || changedIndexes.size === 0) return false;
+
+  let wrote = false;
+  Array.from(changedIndexes)
+    .sort((a, b) => a - b)
+    .forEach(idx => {
+      const columnName = String(header[idx] || "").trim();
+      if (skipHeaders && skipHeaders.has(columnName)) return;
+
+      sheet.getRange(row1, idx + 1).setValue(row[idx]);
+      wrote = true;
+    });
+
+  return wrote;
 }
 
 
@@ -1694,6 +1800,21 @@ function findFirstEmptyRowInSection1_(data, sectionStart0) {
     if (isBlankRow_(data[r])) return r + 1;
   }
   return -1;
+}
+
+function findFirstFreeRowFrom1_(sheet, startRow1, numCols) {
+  const firstRow1 = Math.max(Number(startRow1) || 1, 1);
+  const width = Math.max(Number(numCols) || 1, 1);
+  const lastRow = Math.max(sheet.getLastRow(), firstRow1);
+
+  if (lastRow < firstRow1) return firstRow1;
+
+  const values = sheet.getRange(firstRow1, 1, lastRow - firstRow1 + 1, width).getValues();
+  for (let i = 0; i < values.length; i++) {
+    if (isBlankRow_(values[i])) return firstRow1 + i;
+  }
+
+  return lastRow + 1;
 }
 
 function getCommonColumnsByHeader_(sourceHeader, targetHeader) {

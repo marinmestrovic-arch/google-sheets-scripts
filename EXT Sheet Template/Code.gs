@@ -197,98 +197,6 @@ function archivePitches() {
   Logger.log(`✅ Archived ${rowsToArchive.length} row(s).`);
 }
 
-
-// 3) Fill missing Median Views (menu action)
-function fillMissingMedianViews_Pitching() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sh = ss.getSheetByName("Pitching");
-  if (!sh) return Logger.log("❌ 'Pitching' sheet not found.");
-
-  const lastRow = sh.getLastRow();
-  const lastCol = sh.getLastColumn();
-  if (lastRow < 2 || lastCol < 1) return Logger.log("ℹ️ Pitching has no data.");
-
-  const values = sh.getRange(1, 1, lastRow, lastCol).getDisplayValues();
-
-  const header = (values[0] || []).map(h => String(h || "").trim());
-  const urlCol = header.indexOf("Channel URL");
-  const medianCol = header.indexOf("Median Views");
-  const nameCol = header.indexOf("Channel Name");
-
-  Logger.log(`🔎 Header lookup: Channel URL col=${urlCol} | Median Views col=${medianCol}`);
-  if (urlCol === -1 || medianCol === -1) {
-    Logger.log(`❌ Missing header(s). Found headers: ${header.join(" | ")}`);
-    return;
-  }
-
-  const norm = v => String(v == null ? "" : v).trim();
-  const isEmptyCell = v => norm(v) === "";
-  const isBlankRow = rowArr => rowArr.join("").trim() === "";
-
-  function isSectionLabelRow(rowArr) {
-    const a = norm(rowArr[0]);
-    if (a === "Active Pitches" || a === "Archived") return true;
-    if (!a) return false;
-    for (let c = 1; c < rowArr.length; c++) {
-      if (!isEmptyCell(rowArr[c])) return false;
-    }
-    return true;
-  }
-
-  // stop at Archived
-  let stopAt = lastRow + 1;
-  for (let r = 2; r <= lastRow; r++) {
-    if (norm(values[r - 1][0]) === "Archived") { stopAt = r; break; }
-  }
-  Logger.log(`🧭 Scanning rows 2..${stopAt - 1} (stop at Archived row ${stopAt <= lastRow ? stopAt : "not found"})`);
-
-  const updates = [];
-  let checked = 0;
-  let emptyCount = 0;
-  let nullCount = 0;
-
-  for (let r = 2; r < stopAt; r++) {
-    const row = values[r - 1];
-    if (isSectionLabelRow(row)) continue;
-    if (isBlankRow(row)) continue;
-
-    const url = norm(row[urlCol]);
-    const cur = row[medianCol];
-    const chName = (nameCol !== -1) ? norm(row[nameCol]) : "";
-
-    checked++;
-
-    if (!url) continue;
-    if (!isEmptyCell(cur)) continue;
-
-    emptyCount++;
-
-    const median = computeMedianViewsForChannel_(url);
-
-    if (median == null) {
-      nullCount++;
-      Logger.log(`⚠️ Row ${r} (${chName || "no name"}): empty Median Views but could not compute. URL=${url}`);
-      continue;
-    }
-
-    updates.push({ row1: r, value: median });
-  }
-
-  Logger.log(`📊 Checked rows: ${checked} | Empty Median Views found: ${emptyCount} | Could not compute: ${nullCount} | Will update: ${updates.length}`);
-
-  if (updates.length === 0) {
-    Logger.log("ℹ️ No missing Median Views to fill.");
-    return;
-  }
-
-  // (Optional) simple throttle to avoid quota spikes on big fills
-  // Utilities.sleep(150);
-
-  updates.forEach(u => sh.getRange(u.row1, medianCol + 1).setValue(u.value));
-  Logger.log(`✅ Filled Median Views for ${updates.length} row(s).`);
-}
-
-
 // 4) Push published Campaigns rows -> Performance
 function pushPublishedCampaignsToPerformance() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -368,8 +276,6 @@ function onOpen() {
     .addItem("Archive pitches", "archivePitches")
     .addSeparator()
     .addItem("Campaigns → Performance", "pushPublishedCampaignsToPerformance")
-    .addSeparator()
-    .addItem("Fill Median Views", "fillMissingMedianViews_Pitching")
     .addToUi();
 }
 
@@ -1114,9 +1020,6 @@ function importHubSpotDealsListToPitching() {
   Logger.log(`✅ Imported ${rowsToInsert.length} row(s) into Pitching.`);
 
   updateHubSpotDealsPitchingStatus_(Array.from(insertedDealIds), "Pitched", token);
-
-  SpreadsheetApp.flush();
-  fillMissingMedianViews_Pitching();
 }
 
 
@@ -1455,7 +1358,7 @@ function mapHubSpotDealAndContactToPitchingRow_(deal, contact, activation, heade
   setIfColumnExists_(row, header, "Country/Region", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.countryRegion]));
   setIfColumnExists_(row, header, "Influencer Vertical", safeHubSpotValue_(contactProps[HUBSPOT_PROP_MAP_.contact.influencerVertical]));
   setIfColumnExists_(row, header, "Rate", safeHubSpotValue_(activationProps[HUBSPOT_PROP_MAP_.activation.amount]));
-  // Median Views is computed via YouTube API (fillMissingMedianViews_Pitching), not imported from HubSpot
+  // Median Views is not imported from HubSpot
   setIfColumnExists_(row, header, "HubSpot Record ID", String(deal.id || "").trim());
 
   // Leave these blank on purpose:
