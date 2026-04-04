@@ -19,11 +19,17 @@ function pushConfirmedCreatorsToCampaigns() {
   const pStatusCol = pitchHeader.indexOf("Status");
   const pAvailabilityCol = pitchHeader.indexOf("Availability");
   const pChannelCol = pitchHeader.indexOf("Channel Name");
+  const pRecordIdCol = pitchHeader.indexOf("HubSpot Record ID");
   const cChannelCol = campHeader.indexOf("Channel Name");
+  const cRecordIdCol = campHeader.indexOf("HubSpot Record ID");
+  const cActivationIdCol = campHeader.indexOf("HubSpot Activation ID");
   if (pStatusCol === -1 || pAvailabilityCol === -1 || pChannelCol === -1) {
     return Logger.log("❌ Pitching missing required columns: Status, Availability, Channel Name.");
   }
   if (cChannelCol === -1) return Logger.log("❌ Campaigns missing required column: Channel Name.");
+  if (pRecordIdCol === -1) return Logger.log("❌ Pitching missing required column: HubSpot Record ID.");
+  if (cRecordIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Record ID.");
+  if (cActivationIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Activation ID.");
 
   const archivedStart0 = findSectionRowByLabel_(pitchData, "Archived");
   if (archivedStart0 === -1) return Logger.log("❌ Pitching section 'Archived' not found.");
@@ -31,6 +37,23 @@ function pushConfirmedCreatorsToCampaigns() {
   const commonCols = getCommonColumnsByHeader_(pitchHeader, campHeader);
   if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Pitching and Campaigns.");
   const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
+  const token = getHubSpotToken_();
+  if (!token) {
+    return Logger.log("❌ Missing HubSpot token. Set Script Property: HUBSPOT_PRIVATE_APP_TOKEN");
+  }
+
+  let activationsInfo;
+  try {
+    activationsInfo = loadHubSpotCustomObjectInfo_(
+      {
+        key: HUBSPOT_ACTIVATION_OBJECT_TYPE_,
+        aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_TYPE_]
+      },
+      token
+    );
+  } catch (e) {
+    return Logger.log(`❌ Could not resolve Activations object type: ${e}`);
+  }
 
   const existingBySection = getExistingSignaturesBySection_(campData, commonCols);
   const candidates = [];
@@ -60,6 +83,8 @@ function pushConfirmedCreatorsToCampaigns() {
   let inserted = 0;
   let skippedDup = 0;
   let skippedNoSection = 0;
+  let skippedNoDealId = 0;
+  let skippedActivationCreate = 0;
 
   for (const item of candidates) {
     const signature = buildSignatureFromPitchRow_(item.values, pitchHeader, commonCols);
@@ -83,13 +108,29 @@ function pushConfirmedCreatorsToCampaigns() {
       continue;
     }
 
-    campaignsSheet.insertRowBefore(firstEmptyRow1);
-    const targetRow1 = firstEmptyRow1;
-    const formatSourceRow1 = firstEmptyRow1 + 1; // original empty row shifted down
-
     const out = new Array(campNumCols).fill("");
     for (const m of commonCols) out[m.cIdx] = getPitchValueForCampaignColumn_(item.values, pitchHeader, m);
     applyPitchSpecialCampaignMappings_(out, campHeader, item.values, pitchHeader, pitchRowsByKey);
+
+    const dealId = String(getPitchValueByHeader_(item.values, pitchHeader, "HubSpot Record ID") || "").trim();
+    if (!dealId) {
+      skippedNoDealId++;
+      Logger.log(`⚠️ Skipping "${item.channelName}" (row ${item.pitchRow1}): HubSpot Record ID is empty.`);
+      continue;
+    }
+
+    const activationId = createHubSpotActivationForCampaignRow_(out, campHeader, dealId, activationsInfo, token);
+    if (!activationId) {
+      skippedActivationCreate++;
+      Logger.log(`⚠️ Skipping "${item.channelName}" (row ${item.pitchRow1}): could not create associated Activation in HubSpot.`);
+      continue;
+    }
+    setValueIfTargetColumnExists_(out, campHeader, "HubSpot Record ID", dealId);
+    setValueIfTargetColumnExists_(out, campHeader, "HubSpot Activation ID", activationId);
+
+    campaignsSheet.insertRowBefore(firstEmptyRow1);
+    const targetRow1 = firstEmptyRow1;
+    const formatSourceRow1 = firstEmptyRow1 + 1; // original empty row shifted down
 
     const targetRange = campaignsSheet.getRange(targetRow1, 1, 1, campNumCols);
     const templateRange = getSafeFormatRow_(campaignsSheet, formatSourceRow1, campNumCols);
@@ -100,7 +141,11 @@ function pushConfirmedCreatorsToCampaigns() {
     inserted++;
   }
 
-  Logger.log(`✅ Push done. Inserted: ${inserted}. Skipped duplicates: ${skippedDup}. Missing section: ${skippedNoSection}.`);
+  Logger.log(
+    `✅ Push done. Inserted: ${inserted}. Skipped duplicates: ${skippedDup}. ` +
+    `Missing section: ${skippedNoSection}. Missing deal ID: ${skippedNoDealId}. ` +
+    `Activation create failed: ${skippedActivationCreate}.`
+  );
 }
 
 
@@ -243,13 +288,29 @@ function pushPublishedCampaignsToPerformance() {
     const out = new Array(performanceHeader.length).fill("");
     for (const m of commonCols) out[m.cIdx] = row[m.pIdx];
 
-    // Look up matching Pitching row and copy Median Views -> Expected Views, CPM -> Expected CPM
-    if (pitchRowsByKey.size > 0) {
+    const expectedViews = getPitchValueByHeader_(row, campaignsHeader, "Expected Views");
+    const expectedCpm = getPitchValueByHeader_(row, campaignsHeader, "Expected CPM");
+    if (String(expectedViews || "").trim() !== "") {
+      setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", expectedViews);
+    }
+    if (String(expectedCpm || "").trim() !== "") {
+      setValueIfTargetColumnExists_(out, performanceHeader, "Expected CPM", expectedCpm);
+    }
+
+    // Fall back to Pitching lookup when Campaigns does not already carry the expected metrics.
+    if (
+      pitchRowsByKey.size > 0 &&
+      (String(expectedViews || "").trim() === "" || String(expectedCpm || "").trim() === "")
+    ) {
       const key = buildPitchCompositeKey_(row, campaignsHeader);
       const pitchRow = key ? pitchRowsByKey.get(key) : null;
       if (pitchRow) {
-        setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", getPitchValueByHeader_(pitchRow, pitchHeader, "Median Views"));
-        setValueIfTargetColumnExists_(out, performanceHeader, "Expected CPM", getPitchValueByHeader_(pitchRow, pitchHeader, "CPM"));
+        if (String(expectedViews || "").trim() === "") {
+          setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", getPitchValueByHeader_(pitchRow, pitchHeader, "Median Views"));
+        }
+        if (String(expectedCpm || "").trim() === "") {
+          setValueIfTargetColumnExists_(out, performanceHeader, "Expected CPM", getPitchValueByHeader_(pitchRow, pitchHeader, "CPM"));
+        }
       }
     }
 
@@ -263,6 +324,179 @@ function pushPublishedCampaignsToPerformance() {
   writeRange.setValues(rowsToAppend);
 
   Logger.log(`✅ Pushed ${rowsToAppend.length} published row(s) to Performance starting at row ${startRow1}.`);
+}
+
+// 5) Sync Campaigns activation fields -> HubSpot Activations
+function syncCampaignActivationFieldsToHubSpot() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Campaigns");
+  if (!sheet) return Logger.log("❌ 'Campaigns' sheet not found.");
+
+  const token = getHubSpotToken_();
+  if (!token) {
+    return Logger.log("❌ Missing HubSpot token. Set Script Property: HUBSPOT_PRIVATE_APP_TOKEN");
+  }
+
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return Logger.log("ℹ️ Campaigns sheet has no data rows.");
+
+  const header = (data[0] || []).map(v => String(v || "").trim());
+  const dealIdCol = header.indexOf("HubSpot Record ID");
+  const activationIdCol = header.indexOf("HubSpot Activation ID");
+  if (activationIdCol === -1) {
+    return Logger.log("❌ Campaigns missing required column: HubSpot Activation ID.");
+  }
+  if (dealIdCol === -1) {
+    Logger.log("⚠️ Campaigns missing required column for deal sync: HubSpot Record ID.");
+  }
+
+  const availableFields = HUBSPOT_ACTIVATION_CAMPAIGN_SYNC_FIELDS_.filter(function (field) {
+    return header.indexOf(field) !== -1;
+  });
+  const availableDealCompletionRules = HUBSPOT_DEAL_ACTIVATION_COMPLETION_RULES_.filter(function (rule) {
+    return header.indexOf(rule.requiredColumn) !== -1;
+  });
+  if (availableFields.length === 0 && availableDealCompletionRules.length === 0) {
+    return Logger.log(
+      "❌ Campaigns is missing all Activation sync columns and deal completion columns."
+    );
+  }
+
+  const missingSheetFields = HUBSPOT_ACTIVATION_CAMPAIGN_SYNC_FIELDS_.filter(function (field) {
+    return availableFields.indexOf(field) === -1;
+  });
+  if (missingSheetFields.length > 0) {
+    Logger.log("⚠️ Campaigns is missing sync columns: " + missingSheetFields.join(", "));
+  }
+
+  let activationsInfo;
+  try {
+    activationsInfo = loadHubSpotCustomObjectInfo_(
+      {
+        key: HUBSPOT_ACTIVATION_OBJECT_TYPE_,
+        aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_TYPE_]
+      },
+      token
+    );
+  } catch (e) {
+    return Logger.log(`❌ Could not resolve Activations object type: ${e}`);
+  }
+
+  const spreadsheetTimeZone = ss.getSpreadsheetTimeZone() || Session.getScriptTimeZone() || "UTC";
+  const activationPropertyInfoByLabel = availableFields.length > 0
+    ? resolveHubSpotPropertyInfosByLabel_(activationsInfo.objectTypeId, availableFields, token)
+    : {};
+  const unresolvedActivationFields = availableFields.filter(function (field) {
+    return !activationPropertyInfoByLabel[field];
+  });
+  if (unresolvedActivationFields.length > 0) {
+    Logger.log("⚠️ Could not resolve Activation properties in HubSpot for: " + unresolvedActivationFields.join(", "));
+  }
+
+  const activationUpdates = [];
+  let scanned = 0;
+  let skippedMissingActivationId = 0;
+  let skippedNoActivationValues = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    scanned++;
+
+    const activationId = String(row[activationIdCol] || "").trim();
+    if (!activationId) {
+      skippedMissingActivationId++;
+      continue;
+    }
+
+    const properties = buildActivationSyncPropertiesFromCampaignRow_(
+      row,
+      header,
+      activationPropertyInfoByLabel,
+      spreadsheetTimeZone
+    );
+    if (Object.keys(properties).length === 0) {
+      skippedNoActivationValues++;
+      continue;
+    }
+
+    activationUpdates.push({
+      id: activationId,
+      properties: properties,
+      row1: r + 1
+    });
+  }
+
+  const activationResult = activationUpdates.length > 0
+    ? updateHubSpotObjectPropertiesBatch_(activationsInfo.objectTypeId, activationUpdates, token)
+    : { updated: 0, failed: 0 };
+
+  const dealPropertyInfoByLabel = (dealIdCol !== -1 && availableDealCompletionRules.length > 0)
+    ? resolveHubSpotPropertyInfosByLabel_(
+      "deals",
+      availableDealCompletionRules.map(function (rule) { return rule.propertyLabel; }),
+      token
+    )
+    : {};
+  const resolvedDealCompletionRules = availableDealCompletionRules.filter(function (rule) {
+    return !!dealPropertyInfoByLabel[rule.propertyLabel];
+  });
+  const unresolvedDealProperties = availableDealCompletionRules
+    .map(function (rule) { return rule.propertyLabel; })
+    .filter(function (label) { return !dealPropertyInfoByLabel[label]; });
+  if (unresolvedDealProperties.length > 0) {
+    Logger.log("⚠️ Could not resolve deal properties in HubSpot for: " + unresolvedDealProperties.join(", "));
+  }
+
+  const dealSync = buildDealCompletionUpdatesFromCampaignRows_(
+    data,
+    header,
+    resolvedDealCompletionRules,
+    dealPropertyInfoByLabel,
+    spreadsheetTimeZone
+  );
+  const dealStageResults = [];
+  let totalDealUpdated = 0;
+  let totalDealFailed = 0;
+
+  dealSync.stages.forEach(function (stage, index) {
+    const stageResult = stage && stage.updates && stage.updates.length > 0
+      ? updateHubSpotObjectPropertiesBatch_("deals", stage.updates, token)
+      : { updated: 0, failed: 0 };
+
+    dealStageResults.push({
+      propertyLabel: stage.propertyLabel,
+      updated: stageResult.updated,
+      failed: stageResult.failed
+    });
+    totalDealUpdated += stageResult.updated;
+    totalDealFailed += stageResult.failed;
+
+    const hasLaterStageWithUpdates = dealSync.stages.slice(index + 1).some(function (nextStage) {
+      return nextStage && Array.isArray(nextStage.updates) && nextStage.updates.length > 0;
+    });
+    if (stage && stage.updates && stage.updates.length > 0 && hasLaterStageWithUpdates) {
+      Logger.log(
+        `⏳ Waiting ${Math.round(HUBSPOT_DEAL_COMPLETION_STAGE_DELAY_MS_ / 1000)} seconds before updating ` +
+        `the next deal property stage.`
+      );
+      Utilities.sleep(HUBSPOT_DEAL_COMPLETION_STAGE_DELAY_MS_);
+    }
+  });
+
+  Logger.log(
+    `✅ Campaigns sync done. Rows scanned: ${scanned}. ` +
+    `Activation updates: ${activationResult.updated} updated, ${activationResult.failed} failed. ` +
+    `Deal updates: ${totalDealUpdated} updated, ${totalDealFailed} failed. ` +
+    `Deal stages: ${dealStageResults.map(function (stage) {
+      return `${stage.propertyLabel}=${stage.updated}/${stage.failed}`;
+    }).join(", ")}. ` +
+    `Missing Activation ID: ${skippedMissingActivationId}. ` +
+    `No Activation values: ${skippedNoActivationValues}. ` +
+    `Deals evaluated: ${dealSync.dealsEvaluated}. ` +
+    `Rows missing Deal ID: ${dealSync.skippedMissingDealId}. ` +
+    `Rows missing associated Activation ID for deal sync: ${dealSync.skippedMissingAssociatedActivationId}.`
+  );
 }
 
 
@@ -395,12 +629,20 @@ function getExistingSignaturesBySection_(campaignData, commonCols) {
 
 function buildSignatureFromPitchRow_(row, pitchHeader, commonCols) {
   return commonCols
+    .filter(m => !isCampaignTransferSignatureExcludedColumn_(m && m.name))
     .map(m => String(getPitchValueForCampaignColumn_(row, pitchHeader, m) || "").trim())
     .join("||");
 }
 
 function buildSignatureFromCampaignRow_(row, commonCols) {
-  return commonCols.map(m => String(row[m.cIdx] || "").trim()).join("||");
+  return commonCols
+    .filter(m => !isCampaignTransferSignatureExcludedColumn_(m && m.name))
+    .map(m => String(row[m.cIdx] || "").trim())
+    .join("||");
+}
+
+function isCampaignTransferSignatureExcludedColumn_(columnName) {
+  return String(columnName || "").trim() === "HubSpot Record ID";
 }
 
 function getPitchValueForCampaignColumn_(row, pitchHeader, mapping) {
@@ -881,6 +1123,33 @@ const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
 // Internal name of the Activations custom object type in HubSpot.
 // Update this if the object type identifier differs in your portal.
 const HUBSPOT_ACTIVATION_OBJECT_TYPE_ = "activations";
+const HUBSPOT_ACTIVATION_CAMPAIGN_SYNC_FIELDS_ = [
+  "Publication Date",
+  "Script URL",
+  "Preview URL",
+  "Activation URL"
+];
+const HUBSPOT_DEAL_ACTIVATION_COMPLETION_RULES_ = [
+  {
+    propertyLabel: "Script Approved",
+    requiredColumn: "Script URL",
+    completeValue: "Yes",
+    incompleteValue: "No"
+  },
+  {
+    propertyLabel: "Preview Approved",
+    requiredColumn: "Preview URL",
+    completeValue: "Yes",
+    incompleteValue: "No"
+  },
+  {
+    propertyLabel: "Published",
+    requiredColumn: "Activation URL",
+    completeValue: "Yes",
+    incompleteValue: "No"
+  }
+];
+const HUBSPOT_DEAL_COMPLETION_STAGE_DELAY_MS_ = 30000;
 
 // Keep all internal property names here so they are easy to fix later.
 const HUBSPOT_PROP_MAP_ = {
@@ -1074,7 +1343,49 @@ function loadHubSpotCustomObjectInfo_(spec, token) {
     return wanted.some(alias => candidates.indexOf(alias) !== -1);
   });
   if (!match) throw new Error(`Could not find HubSpot custom object schema for "${spec.key}".`);
-  return { objectTypeId: match.objectTypeId, label: (match.labels && (match.labels.plural || match.labels.singular)) || spec.key };
+  return {
+    objectTypeId: match.objectTypeId,
+    label: (match.labels && (match.labels.plural || match.labels.singular)) || spec.key,
+    primaryDisplayProperty: String(match.primaryDisplayProperty || "").trim()
+  };
+}
+
+function resolveHubSpotPropertyInfosByLabel_(objectType, propertyLabels, token) {
+  const propertiesResponse = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/properties/${encodeURIComponent(objectType)}`,
+    token
+  );
+  const properties = Array.isArray(propertiesResponse && propertiesResponse.results)
+    ? propertiesResponse.results
+    : [];
+
+  const lookup = {};
+  properties.forEach(function (property) {
+    if (!property) return;
+
+    const variants = uniqueStrings_([
+      property.label,
+      property.name
+    ]).map(normalizeHubSpotOptionToken_);
+
+    variants.forEach(function (variant) {
+      if (!variant || lookup[variant]) return;
+      lookup[variant] = {
+        name: String(property.name || "").trim(),
+        label: String(property.label || property.name || "").trim(),
+        type: String(property.type || "").trim(),
+        fieldType: String(property.fieldType || "").trim()
+      };
+    });
+  });
+
+  const out = {};
+  (propertyLabels || []).forEach(function (label) {
+    const key = normalizeHubSpotOptionToken_(label);
+    if (!key || !lookup[key]) return;
+    out[String(label)] = lookup[key];
+  });
+  return out;
 }
 
 function normalizeHubSpotOptionToken_(s) {
@@ -1275,6 +1586,149 @@ function updateHubSpotDealsPitchingStatus_(dealIds, status, token) {
   Logger.log(`✅ Updated Pitching Status to "${status}" for ${updated} deal(s) in HubSpot.`);
 }
 
+function updateHubSpotObjectPropertiesBatch_(objectTypeId, updates, token) {
+  const items = Array.isArray(updates) ? updates.filter(function (item) {
+    return item && item.id && item.properties && Object.keys(item.properties).length > 0;
+  }) : [];
+  if (items.length === 0) {
+    return { updated: 0, failed: 0 };
+  }
+
+  const chunks = chunkArray_(items, 100);
+  let updated = 0;
+  let failed = 0;
+
+  chunks.forEach(function (chunk) {
+    const body = {
+      inputs: chunk.map(function (item) {
+        return {
+          id: String(item.id).trim(),
+          properties: item.properties
+        };
+      })
+    };
+
+    const data = hubspotFetchJson_(
+      `${HUBSPOT_API_BASE_}/crm/v3/objects/${encodeURIComponent(objectTypeId)}/batch/update`,
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(body)
+      }
+    );
+
+    if (data && Array.isArray(data.results)) {
+      updated += data.results.length;
+      return;
+    }
+
+    chunk.forEach(function (item) {
+      if (updateHubSpotObjectProperties_(objectTypeId, item.id, item.properties, token)) {
+        updated++;
+      } else {
+        failed++;
+        Logger.log(`⚠️ Failed to update HubSpot object ${item.id} from Campaigns row ${item.row1}.`);
+      }
+    });
+  });
+
+  return {
+    updated: updated,
+    failed: failed
+  };
+}
+
+function updateHubSpotObjectProperties_(objectTypeId, objectId, properties, token) {
+  const data = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/objects/${encodeURIComponent(objectTypeId)}/${encodeURIComponent(objectId)}`,
+    token,
+    {
+      method: "patch",
+      payload: JSON.stringify({ properties: properties })
+    }
+  );
+  return !!(data && data.id != null);
+}
+
+function createHubSpotActivationForCampaignRow_(campaignRow, campHeader, dealId, activationsInfo, token) {
+  const objectTypeId = activationsInfo && activationsInfo.objectTypeId
+    ? String(activationsInfo.objectTypeId).trim()
+    : "";
+  if (!objectTypeId || !dealId) return "";
+
+  const properties = buildHubSpotActivationProperties_(campaignRow, campHeader, activationsInfo);
+  const created = hubspotFetchJson_(
+    `${HUBSPOT_API_BASE_}/crm/v3/objects/${encodeURIComponent(objectTypeId)}`,
+    token,
+    {
+      method: "post",
+      payload: JSON.stringify({ properties: properties })
+    }
+  );
+
+  const activationId = created && created.id != null ? String(created.id).trim() : "";
+  if (!activationId) return "";
+
+  if (!associateDealToActivation_(dealId, activationId, objectTypeId, token)) {
+    Logger.log(
+      `⚠️ Created Activation ${activationId} but could not associate it to deal ${dealId}.`
+    );
+    return "";
+  }
+
+  return activationId;
+}
+
+function buildHubSpotActivationProperties_(campaignRow, campHeader, activationsInfo) {
+  const properties = {};
+  const activationType = String(getPitchValueByHeader_(campaignRow, campHeader, "Activation Type") || "").trim();
+  const amount = String(getPitchValueByHeader_(campaignRow, campHeader, "Rate") || "").trim();
+  if (activationType) properties[HUBSPOT_PROP_MAP_.activation.activationType] = activationType;
+  if (amount) properties[HUBSPOT_PROP_MAP_.activation.amount] = amount;
+
+  const primaryDisplayProperty = activationsInfo && activationsInfo.primaryDisplayProperty
+    ? String(activationsInfo.primaryDisplayProperty).trim()
+    : "";
+  if (primaryDisplayProperty && !properties[primaryDisplayProperty]) {
+    const fallbackName = buildActivationDisplayValue_(campaignRow, campHeader);
+    if (fallbackName) properties[primaryDisplayProperty] = fallbackName;
+  }
+
+  return properties;
+}
+
+function buildActivationDisplayValue_(campaignRow, campHeader) {
+  const campaignName = String(getPitchValueByHeader_(campaignRow, campHeader, "Campaign Name") || "").trim();
+  const channelName = String(getPitchValueByHeader_(campaignRow, campHeader, "Channel Name") || "").trim();
+  const activationType = String(getPitchValueByHeader_(campaignRow, campHeader, "Activation Type") || "").trim();
+
+  return [channelName, campaignName, activationType]
+    .filter(Boolean)
+    .join(" - ")
+    .trim();
+}
+
+function associateDealToActivation_(dealId, activationId, activationsObjectTypeId, token) {
+  const response = UrlFetchApp.fetch(
+    `${HUBSPOT_API_BASE_}/crm/v4/objects/deals/${encodeURIComponent(dealId)}` +
+    `/associations/default/${encodeURIComponent(activationsObjectTypeId)}/${encodeURIComponent(activationId)}`,
+    {
+      method: "put",
+      muteHttpExceptions: true,
+      headers: hubspotHeaders_(token)
+    }
+  );
+
+  const code = response.getResponseCode();
+  const text = String(response.getContentText() || "");
+  if (code >= 400) {
+    Logger.log(`❌ HubSpot association error ${code}: ${text.slice(0, 1000)}`);
+    return false;
+  }
+
+  return true;
+}
+
 
 function fetchDealToActivationIdsMap_(dealIds, activationsObjectTypeId, token) {
   const out = {};
@@ -1385,6 +1839,137 @@ function insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1
   writeRange.setValues(rowsToInsert);
 }
 
+function buildActivationSyncPropertiesFromCampaignRow_(row, header, propertyInfoByLabel, spreadsheetTimeZone) {
+  const properties = {};
+
+  Object.keys(propertyInfoByLabel || {}).forEach(function (label) {
+    const colIdx = header.indexOf(String(label || "").trim());
+    if (colIdx === -1) return;
+
+    const rawValue = row[colIdx];
+    if (isEmptyCellValue_(rawValue)) return;
+
+    const propertyInfo = propertyInfoByLabel[label];
+    const serialized = serializeHubSpotPropertyValue_(rawValue, propertyInfo, spreadsheetTimeZone);
+    if (serialized === "") return;
+    properties[propertyInfo.name] = serialized;
+  });
+
+  return properties;
+}
+
+function buildDealCompletionUpdatesFromCampaignRows_(
+  data,
+  header,
+  completionRules,
+  propertyInfoByLabel,
+  spreadsheetTimeZone
+) {
+  const stages = [];
+  const rules = Array.isArray(completionRules) ? completionRules : [];
+  const dealIdCol = header.indexOf("HubSpot Record ID");
+  const activationIdCol = header.indexOf("HubSpot Activation ID");
+
+  if (rules.length === 0 || dealIdCol === -1 || activationIdCol === -1) {
+    return {
+      stages: stages,
+      dealsEvaluated: 0,
+      skippedMissingDealId: 0,
+      skippedMissingAssociatedActivationId: 0
+    };
+  }
+
+  const rowsByDealId = {};
+  let skippedMissingDealId = 0;
+  let skippedMissingAssociatedActivationId = 0;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const dealId = String(row[dealIdCol] || "").trim();
+    if (!dealId) {
+      skippedMissingDealId++;
+      continue;
+    }
+
+    const activationId = String(row[activationIdCol] || "").trim();
+    if (!activationId) {
+      skippedMissingAssociatedActivationId++;
+      continue;
+    }
+
+    if (!rowsByDealId[dealId]) {
+      rowsByDealId[dealId] = {
+        row1: r + 1,
+        rows: []
+      };
+    }
+    rowsByDealId[dealId].rows.push(row);
+  }
+
+  Object.keys(rowsByDealId).forEach(function (dealId) {
+    const entry = rowsByDealId[dealId];
+    if (!entry || !Array.isArray(entry.rows) || entry.rows.length === 0) return;
+
+    rules.forEach(function (rule) {
+      if (!rule || !rule.propertyLabel || !rule.requiredColumn) return;
+
+      const colIdx = header.indexOf(String(rule.requiredColumn || "").trim());
+      if (colIdx === -1) return;
+
+      const allAssociatedRowsHaveValue = entry.rows.every(function (row) {
+        return !isEmptyCellValue_(row[colIdx]);
+      });
+
+      const propertyInfo = propertyInfoByLabel[rule.propertyLabel];
+      if (!propertyInfo) return;
+
+      const nextValue = allAssociatedRowsHaveValue
+        ? rule.completeValue
+        : rule.incompleteValue;
+      const serializedValue = serializeHubSpotPropertyValue_(
+        nextValue,
+        propertyInfo,
+        spreadsheetTimeZone
+      );
+      if (serializedValue === "") return;
+
+      let stage = stages.find(function (item) {
+        return item.propertyLabel === rule.propertyLabel;
+      });
+      if (!stage) {
+        stage = {
+          propertyLabel: rule.propertyLabel,
+          updates: []
+        };
+        stages.push(stage);
+      }
+
+      const properties = {};
+      properties[propertyInfo.name] = serializedValue;
+      stage.updates.push({
+        id: dealId,
+        properties: properties,
+        row1: entry.row1
+      });
+    });
+  });
+
+  return {
+    stages: rules
+      .map(function (rule) {
+        return stages.find(function (stage) { return stage.propertyLabel === rule.propertyLabel; }) || {
+          propertyLabel: rule.propertyLabel,
+          updates: []
+        };
+      }),
+    dealsEvaluated: Object.keys(rowsByDealId).length,
+    skippedMissingDealId: skippedMissingDealId,
+    skippedMissingAssociatedActivationId: skippedMissingAssociatedActivationId
+  };
+}
+
 
 /***************************************
  * SMALL HELPERS
@@ -1392,6 +1977,58 @@ function insertRowsUnderActivePitches_(sheet, rowsToInsert, header, templateRow1
 
 function safeHubSpotValue_(value) {
   return value == null ? "" : value;
+}
+
+function isEmptyCellValue_(value) {
+  if (value == null) return true;
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return isNaN(value.getTime());
+  }
+  return String(value).trim() === "";
+}
+
+function serializeHubSpotPropertyValue_(value, propertyInfo, spreadsheetTimeZone) {
+  const type = String(propertyInfo && propertyInfo.type || "").trim().toLowerCase();
+  const fieldType = String(propertyInfo && propertyInfo.fieldType || "").trim().toLowerCase();
+
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    if (isNaN(value.getTime())) return "";
+
+    if (type === "date" || fieldType === "date") {
+      return String(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()));
+    }
+    if (type === "datetime") {
+      return String(value.getTime());
+    }
+
+    return Utilities.formatDate(
+      value,
+      spreadsheetTimeZone || Session.getScriptTimeZone() || "UTC",
+      "yyyy-MM-dd"
+    );
+  }
+
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return "";
+
+  if (type === "date" || fieldType === "date") {
+    const parsedDate = new Date(text);
+    if (isNaN(parsedDate.getTime())) return text;
+    return String(Date.UTC(parsedDate.getFullYear(), parsedDate.getMonth(), parsedDate.getDate()));
+  }
+
+  if (type === "datetime") {
+    const parsedDateTime = new Date(text);
+    return isNaN(parsedDateTime.getTime()) ? text : String(parsedDateTime.getTime());
+  }
+
+  if (type === "bool" || fieldType === "booleancheckbox") {
+    const normalized = text.toLowerCase();
+    if (normalized === "true" || normalized === "yes" || normalized === "1") return "true";
+    if (normalized === "false" || normalized === "no" || normalized === "0") return "false";
+  }
+
+  return text;
 }
 
 function setIfColumnExists_(row, header, columnName, value) {
