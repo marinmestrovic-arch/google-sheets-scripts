@@ -25,7 +25,20 @@ const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
 
 const OPENAI_API_KEY_PROP_ = "OPENAI_API_KEY";
 const OPENAI_MODEL_PROP_ = "OPENAI_MODEL";
-const OPENAI_DEFAULT_MODEL_ = "gpt-nano-5";
+const OPENAI_DEFAULT_MODEL_ = "gpt-5-nano";
+const OPENAI_CREATOR_PROFILE_BATCH_SIZE_ = 5;
+const CREATOR_LIST_ENRICH_BATCH_SIZE_ = 20;
+const CREATOR_LIST_ENRICH_CURSOR_PROP_ = "CREATOR_LIST_ENRICH_CURSOR";
+const CREATOR_YOUTUBE_INSIGHT_CACHE_PREFIX_ = "CREATOR_YOUTUBE_INSIGHT_V2::";
+const CREATOR_LONGFORM_SIGNAL_CACHE_PREFIX_ = "CREATOR_LONGFORM_SIGNAL_V2::";
+const CREATOR_CHANNEL_PAGE_SIGNAL_CACHE_PREFIX_ = "CREATOR_CHANNEL_PAGE_SIGNAL_V1::";
+const CREATOR_YOUTUBE_SIGNAL_TTL_SECONDS_ = 21600;
+const CREATOR_YOUTUBE_SIGNAL_SAMPLE_SIZE_ = 12;
+const CREATOR_YOUTUBE_SIGNAL_MIN_LONGFORM_SECONDS_ = 60;
+const CREATOR_YOUTUBE_DESCRIPTION_SAMPLE_SIZE_ = 6;
+const SHEETS_MULTISELECT_DELIMITER_ = ", ";
+const HUBSPOT_MULTISELECT_DELIMITER_ = ";";
+const HUBSPOT_MULTISELECT_FIELDS_ = new Set(["Influencer Vertical"]);
 
 // YouTube API
 const YT_KEY_PROP_ = "YOUTUBE_API_KEY";
@@ -37,6 +50,7 @@ const YT_KEY_INVALID_TTL_SECONDS_ = 600;
 const YT_MAX_PLAYLIST_ITEMS_ = 50;
 const YT_MAX_VIDEOS_FOR_AVG_ = 15;
 const YT_MIN_DURATION_SECONDS_ = 180;
+const YT_SHORTS_MAX_DURATION_SECONDS_ = 60;
 const YT_MONTHS_BACK_ = 6;
 
 const YT_SKIP_PATHS_ = ["watch", "shorts", "playlist", "results", "feed"];
@@ -50,12 +64,17 @@ const YT_CHANNEL_ID_PATTERNS_ = [
 
 var YT_API_KEY_INVALID_ = false;
 var YT_API_KEY_INVALID_LOGGED_ = false;
+var LAST_OPENAI_DIAGNOSTIC_ = "";
+var LAST_OPENAI_RAW_RESPONSE_ = "";
 
 // INT ↔ EXT column name mappings
 const INT_TO_EXT_PITCHING_MAP_ = { "EXT Rate": "Rate" };
 const EXT_TO_INT_PITCHING_MAP_ = {};
 const EXT_TO_INT_CAMPAIGNS_MAP_ = { "Rate": "EXT Rate" };
-const CREATOR_TO_PITCHING_NEGOTIATION_MAP_ = { "YouTube Video Median Views": "Median Views" };
+const CREATOR_TO_PITCHING_NEGOTIATION_MAP_ = {
+  "YouTube Average Views": "Median Views",
+  "YouTube Video Median Views": "Median Views"
+};
 const INT_ONLY_PITCHING_COLS_ = new Set(["INT Rate", "INT CPM", "EXT CPM"]);
 const EXT_ONLY_PITCHING_COLS_ = new Set(["Rate", "CPM"]);
 const INT_PITCHING_FORMULA_COLS_ = new Set(["INT CPM", "EXT CPM"]);
@@ -65,6 +84,7 @@ const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set(["Channel Name", "HubSpot Record I
 const YOUTUBE_ENRICH_FIELDS_ = [
   "YouTube Handle",
   "YouTube URL",
+  "YouTube Average Views",
   "YouTube Video Median Views",
   "YouTube Shorts Median Views",
   "YouTube Engagement Rate",
@@ -73,6 +93,7 @@ const YOUTUBE_ENRICH_FIELDS_ = [
 const PROFILE_LLM_FIELDS_ = [
   "First Name",
   "Last Name",
+  "Email",
   "Influencer Type",
   "Influencer Vertical",
   "Country/Region",
@@ -96,6 +117,11 @@ const PROFILE_LLM_CONTEXT_FIELDS_ = [
   "Email",
   "YouTube Handle",
   "YouTube URL",
+  "YouTube Average Views",
+  "YouTube Video Median Views",
+  "YouTube Shorts Median Views",
+  "YouTube Engagement Rate",
+  "YouTube Followers",
   "Instagram Handle",
   "Instagram URL",
   "TikTok Handle",
@@ -113,6 +139,16 @@ const MONTH_NAMES_ = [
   "July", "August", "September", "October", "November", "December"
 ];
 
+function isKnownSectionLabel_(value) {
+  const text = String(value || "").trim();
+  if (!text) return false;
+
+  const knownLabels = new Set(
+    ["Contacting", "Archived", "Negotiation", "Active Pitches"].concat(MONTH_NAMES_)
+  );
+  return knownLabels.has(text);
+}
+
 
 // ============================================================
 //  MENU
@@ -121,6 +157,12 @@ const MONTH_NAMES_ = [
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
+    .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
+    .addItem("Enrich selected Creator List rows", "enrichSelectedCreatorListRows")
+    .addItem("Diagnose Creator List enrichment", "diagnoseCreatorListEnrichment")
+    .addItem("Diagnose selected Creator row", "diagnoseSelectedCreatorListRow")
+    .addItem("Reset Creator List enrichment", "resetCreatorListEnrichmentProgress")
+    .addSeparator()
     .addItem("Enrich & Import to HubSpot", "enrichAndImportToHubSpot")
     .addSeparator()
     .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
@@ -136,6 +178,431 @@ function onOpen() {
 
 
 // ============================================================
+//  CREATOR LIST ENRICHMENT ONLY
+// ============================================================
+
+function enrichCreatorListRowsInBatches() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) {
+    showSpreadsheetToast_("Creator List sheet not found.");
+    return Logger.log("❌ 'Creator List' sheet not found.");
+  }
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) {
+    showSpreadsheetToast_("Creator List has no data.");
+    return Logger.log("ℹ️ Creator List has no data.");
+  }
+
+  const data = context.data;
+  const header = context.header;
+  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
+  const props = PropertiesService.getScriptProperties();
+  const startRow1 = Math.max(
+    Number(props.getProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_) || (context.headerRow1 + 1)),
+    context.headerRow1 + 1
+  );
+
+  const rowItems = [];
+  let lastScannedRow1 = startRow1 - 1;
+
+  for (let row1 = startRow1; row1 <= stopRow1; row1++) {
+    lastScannedRow1 = row1;
+    const row = data[row1 - 1];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
+
+    rowItems.push({ row1: row1, values: row.slice() });
+    if (rowItems.length >= CREATOR_LIST_ENRICH_BATCH_SIZE_) break;
+  }
+
+  if (rowItems.length === 0) {
+    props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+    showSpreadsheetToast_("Creator List enrichment complete. No remaining rows to process.");
+    return Logger.log("✅ Creator List enrichment complete. No remaining rows to process.");
+  }
+
+  const result = runCreatorListEnrichment_(sheet, rowItems, header);
+  if (lastScannedRow1 < stopRow1) {
+    props.setProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_, String(lastScannedRow1 + 1));
+    showSpreadsheetToast_(
+      `Batch done. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
+      `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
+    );
+    return Logger.log(
+      `✅ Creator List enrichment batch complete. Rows scanned through ${lastScannedRow1}. ` +
+      `Static: ${result.staticEnriched}, YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
+    );
+  }
+
+  props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+  showSpreadsheetToast_(
+    `Enrichment complete. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
+    `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
+  );
+  Logger.log(
+    `✅ Creator List enrichment complete. Static: ${result.staticEnriched}, ` +
+    `YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
+  );
+}
+
+function enrichSelectedCreatorListRows() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) {
+    showSpreadsheetToast_("Creator List sheet not found.");
+    return Logger.log("❌ 'Creator List' sheet not found.");
+  }
+
+  const activeSheet = ss.getActiveSheet();
+  if (!activeSheet || activeSheet.getSheetId() !== sheet.getSheetId()) {
+    showSpreadsheetToast_("Open Creator List and select rows first.");
+    return Logger.log("ℹ️ Open the 'Creator List' sheet and select the rows you want to enrich.");
+  }
+
+  const selection = activeSheet.getActiveRange();
+  if (!selection) {
+    showSpreadsheetToast_("Select at least one row on Creator List.");
+    return Logger.log("ℹ️ Select at least one row on 'Creator List'.");
+  }
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) {
+    showSpreadsheetToast_("Creator List has no data.");
+    return Logger.log("ℹ️ Creator List has no data.");
+  }
+
+  const data = context.data;
+  const header = context.header;
+  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
+  const rowStart1 = Math.max(selection.getRow(), context.headerRow1 + 1);
+  const rowEnd1 = Math.min(selection.getRow() + selection.getNumRows() - 1, stopRow1);
+
+  const rowItems = [];
+  for (let row1 = rowStart1; row1 <= rowEnd1; row1++) {
+    const row = data[row1 - 1];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
+    rowItems.push({ row1: row1, values: row.slice() });
+  }
+
+  if (rowItems.length === 0) {
+    showSpreadsheetToast_("No enrichable rows found in the selection.");
+    return Logger.log("ℹ️ No enrichable Creator List rows found in the current selection.");
+  }
+
+  const result = runCreatorListEnrichment_(sheet, rowItems, header);
+  showSpreadsheetToast_(
+    `Selected rows done. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
+    `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
+  );
+  Logger.log(
+    `✅ Selected Creator List rows enriched. Static: ${result.staticEnriched}, ` +
+    `YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
+  );
+}
+
+function resetCreatorListEnrichmentProgress() {
+  PropertiesService.getScriptProperties().deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+  showSpreadsheetToast_("Creator List enrichment progress reset.");
+  Logger.log("✅ Creator List enrichment progress reset.");
+}
+
+function diagnoseCreatorListEnrichment() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) {
+    showSpreadsheetToast_("Creator List sheet not found.");
+    return Logger.log("❌ 'Creator List' sheet not found.");
+  }
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) {
+    showSpreadsheetToast_("Creator List has no data.");
+    return Logger.log("ℹ️ Creator List has no data.");
+  }
+
+  const data = context.data;
+  const header = context.header;
+  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
+  const youtubeKeyPresent = !!getYouTubeApiKey_();
+  const openAiKeyPresent = !!getOpenAiApiKey_();
+  const expectedHeaders = ["Channel Name", "Channel URL", "Campaign Name", "Email", "Status"];
+  const missingHeaders = expectedHeaders.filter(name => findHeaderIndex_(header, name) === -1);
+
+  let candidateRows = 0;
+  let youtubeEligibleRows = 0;
+  let profileEligibleRows = 0;
+  const sampleNotes = [];
+
+  for (let row1 = context.headerRow1 + 1; row1 <= stopRow1; row1++) {
+    const row = data[row1 - 1];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
+
+    candidateRows++;
+
+    const missingYoutube = YOUTUBE_ENRICH_FIELDS_.some(field => {
+      const idx = header.indexOf(field);
+      return idx !== -1 && !String(row[idx] || "").trim();
+    });
+    if (missingYoutube) youtubeEligibleRows++;
+
+    const missingProfile = PROFILE_LLM_FIELDS_.some(field => {
+      const idx = header.indexOf(field);
+      return idx !== -1 && !String(row[idx] || "").trim();
+    });
+    if (missingProfile) profileEligibleRows++;
+
+    if (sampleNotes.length < 8) {
+      const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim() || "(blank)";
+      const reasons = [];
+      if (missingYoutube) reasons.push("needs YouTube");
+      if (missingProfile) reasons.push("needs AI");
+      if (reasons.length === 0) reasons.push("nothing missing");
+      sampleNotes.push(`Row ${row1} ${channelName}: ${reasons.join(", ")}`);
+    }
+  }
+
+  const message = [
+    `Header row: ${context.headerRow1}`,
+    `YouTube key present: ${youtubeKeyPresent ? "yes" : "no"}`,
+    `OpenAI key present: ${openAiKeyPresent ? "yes" : "no"}`,
+    `Rows before Archived: ${Math.max(stopRow1 - 1, 0)}`,
+    `Candidate rows: ${candidateRows}`,
+    `Rows needing YouTube enrichment: ${youtubeEligibleRows}`,
+    `Rows needing AI enrichment: ${profileEligibleRows}`
+  ].join(" | ");
+
+  showSpreadsheetToast_(message);
+  Logger.log("Creator List enrichment diagnosis: " + message);
+  if (missingHeaders.length > 0) {
+    Logger.log("Missing or unrecognized key headers: " + missingHeaders.join(", "));
+  }
+  Logger.log("Detected Creator List headers: " + header.join(" | "));
+  sampleNotes.forEach(note => Logger.log(note));
+}
+
+function diagnoseSelectedCreatorListRow() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) {
+    showSpreadsheetToast_("Creator List sheet not found.");
+    return Logger.log("❌ 'Creator List' sheet not found.");
+  }
+
+  const activeSheet = ss.getActiveSheet();
+  if (!activeSheet || activeSheet.getSheetId() !== sheet.getSheetId()) {
+    showSpreadsheetToast_("Open Creator List and select one row first.");
+    return Logger.log("ℹ️ Open the 'Creator List' sheet and select one row first.");
+  }
+
+  const selection = activeSheet.getActiveRange();
+  if (!selection) {
+    showSpreadsheetToast_("Select one row first.");
+    return Logger.log("ℹ️ Select one row first.");
+  }
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) {
+    showSpreadsheetToast_("Creator List has no data.");
+    return Logger.log("ℹ️ Creator List has no data.");
+  }
+
+  const row1 = selection.getRow();
+  if (row1 <= context.headerRow1) {
+    showSpreadsheetToast_("Select a data row, not the header.");
+    return Logger.log("ℹ️ Select a data row, not the header.");
+  }
+
+  const row = sheet.getRange(row1, 1, 1, context.header.length).getValues()[0];
+  const header = context.header;
+  const selectedInput = resolveCreatorYouTubeInputFromRow_(row, header);
+  const rawChannelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  const rawChannelUrl = String(getValueByHeader_(row, header, "Channel URL") || "").trim();
+  const rawYouTubeUrl = String(getValueByHeader_(row, header, "YouTube URL") || "").trim();
+  const rawYouTubeHandle = String(getValueByHeader_(row, header, "YouTube Handle") || "").trim();
+  const youtubeKeyPresent = !!getYouTubeApiKey_();
+  const openAiKeyPresent = !!getOpenAiApiKey_();
+  const youtubeKeyValid = youtubeKeyPresent ? validateYouTubeApiKey_(getYouTubeApiKey_()) : false;
+  const youtubeTargetColumns = YOUTUBE_ENRICH_FIELDS_.filter(field => findHeaderIndex_(header, field) !== -1);
+  const profileTargetColumns = PROFILE_LLM_FIELDS_.filter(field => findHeaderIndex_(header, field) !== -1);
+  const emptyYoutubeTargets = youtubeTargetColumns.filter(field => {
+    const idx = findHeaderIndex_(header, field);
+    return idx !== -1 && !String(row[idx] || "").trim();
+  });
+  const emptyProfileTargets = profileTargetColumns.filter(field => {
+    const idx = findHeaderIndex_(header, field);
+    return idx !== -1 && !String(row[idx] || "").trim();
+  });
+  const channelId = selectedInput && youtubeKeyValid
+    ? getChannelIdFromUrl(selectedInput, getYouTubeApiKey_())
+    : "";
+  const insight = selectedInput && youtubeKeyValid
+    ? getCreatorYouTubeInsight_(
+      selectedInput,
+      rawChannelName,
+      getYouTubeApiKey_(),
+      { includeEmailSignals: emptyProfileTargets.indexOf("Email") !== -1 }
+    )
+    : null;
+  const preferredEmailSignal = extractPreferredCreatorEmailFromContext_(row, header, insight);
+
+  let aiDraft = null;
+  let profileDropdownOptions = {};
+  if (openAiKeyPresent && emptyProfileTargets.length > 0) {
+    try {
+      const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
+      profileDropdownOptions = getProfileDropdownOptionsByHeader_(sheet, header, dropdownValuesByHeader);
+      const contextText = buildCreatorProfileContext_(row, header, insight);
+      aiDraft = callLlmForCreatorProfileEnrichment_(
+        getOpenAiApiKey_(),
+        getOpenAiModel_(),
+        rawChannelName,
+        selectedInput,
+        String(getValueByHeader_(row, header, "Campaign Name") || "").trim(),
+        emptyProfileTargets,
+        profileDropdownOptions,
+        contextText
+      );
+
+      const remainingClassificationFields = PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(field => {
+        return emptyProfileTargets.indexOf(field) !== -1;
+      });
+      if (remainingClassificationFields.length > 0) {
+        const fallbackDraft = callLlmForCreatorDropdownClassification_(
+          getOpenAiApiKey_(),
+          getOpenAiModel_(),
+          remainingClassificationFields,
+          profileDropdownOptions,
+          contextText
+        );
+        aiDraft = Object.assign({}, aiDraft || {}, fallbackDraft || {});
+      }
+    } catch (e) {
+      Logger.log("Selected Creator row AI dry-run error: " + (e && e.stack ? e.stack : e));
+    }
+  }
+
+  const message = [
+    `Row ${row1}`,
+    `YT key: ${youtubeKeyPresent ? "yes" : "no"}`,
+    `YT key valid: ${youtubeKeyValid ? "yes" : "no"}`,
+    `OpenAI key: ${openAiKeyPresent ? "yes" : "no"}`,
+    `Resolved input: ${selectedInput ? "yes" : "no"}`,
+    `Channel ID: ${channelId || "none"}`,
+    `Insight: ${insight ? "yes" : "no"}`,
+    `YT targets: ${youtubeTargetColumns.length}`,
+    `AI targets: ${profileTargetColumns.length}`
+  ].join(" | ");
+
+  const detailLines = [
+    "Selected Creator row diagnosis",
+    "This tool does not write values. It only shows what enrichment would return.",
+    "",
+    message,
+    "Resolved YouTube input: " + (selectedInput || "(blank)"),
+    "Detected AI target columns: " + (profileTargetColumns.join(", ") || "(none)"),
+    "Empty AI target columns: " + (emptyProfileTargets.join(", ") || "(none)"),
+    "Detected explicit email candidate: " + (
+      preferredEmailSignal.email
+        ? (preferredEmailSignal.email + " (" + preferredEmailSignal.source + ")")
+        : "(none)"
+    ),
+    "AI dropdown option counts: " + JSON.stringify({
+      "Influencer Type": (profileDropdownOptions["Influencer Type"] || []).length,
+      "Influencer Vertical": (profileDropdownOptions["Influencer Vertical"] || []).length,
+      "Country/Region": (profileDropdownOptions["Country/Region"] || []).length,
+      "Language": (profileDropdownOptions["Language"] || []).length
+    }),
+    "AI dry-run result: " + truncateForUi_(aiDraft ? JSON.stringify(aiDraft) : "(none)", 800),
+    "Last OpenAI diagnostic: " + truncateForUi_(LAST_OPENAI_DIAGNOSTIC_ || "(none)", 800)
+  ];
+
+  showSpreadsheetToast_(message);
+  showSpreadsheetAlert_(detailLines.join("\n"));
+  Logger.log("Selected Creator row diagnosis: " + message);
+  Logger.log("Channel Name raw: " + (rawChannelName || "(blank)"));
+  Logger.log("Channel URL raw: " + (rawChannelUrl || "(blank)"));
+  Logger.log("YouTube URL raw: " + (rawYouTubeUrl || "(blank)"));
+  Logger.log("YouTube Handle raw: " + (rawYouTubeHandle || "(blank)"));
+  Logger.log("Resolved YouTube input: " + (selectedInput || "(blank)"));
+  Logger.log("Detected YouTube target columns: " + (youtubeTargetColumns.join(", ") || "(none)"));
+  Logger.log("Empty YouTube target columns: " + (emptyYoutubeTargets.join(", ") || "(none)"));
+  Logger.log("Detected AI target columns: " + (profileTargetColumns.join(", ") || "(none)"));
+  Logger.log("Empty AI target columns: " + (emptyProfileTargets.join(", ") || "(none)"));
+  Logger.log(
+    "Detected explicit email candidate: " + (
+      preferredEmailSignal.email
+        ? (preferredEmailSignal.email + " (" + preferredEmailSignal.source + ")")
+        : "(none)"
+    )
+  );
+  Logger.log("AI dropdown option counts: " + JSON.stringify({
+    "Influencer Type": (profileDropdownOptions["Influencer Type"] || []).length,
+    "Influencer Vertical": (profileDropdownOptions["Influencer Vertical"] || []).length,
+    "Country/Region": (profileDropdownOptions["Country/Region"] || []).length,
+    "Language": (profileDropdownOptions["Language"] || []).length
+  }));
+  if (insight) {
+    Logger.log("Resolved channel name: " + (insight.channelName || "(blank)"));
+    Logger.log("Resolved handle: " + (insight.handle || "(blank)"));
+    Logger.log("Resolved canonical URL: " + (insight.canonicalUrl || "(blank)"));
+    Logger.log("Median video views: " + String(insight.medianVideoViews || ""));
+    Logger.log("Median shorts views: " + String(insight.medianShortsViews || ""));
+    Logger.log("Median engagement rate: " + String(insight.medianVideoEngagementRate || ""));
+  }
+  if (aiDraft) {
+    Logger.log("AI dry-run result: " + JSON.stringify(aiDraft));
+  } else {
+    Logger.log("AI dry-run result: (none)");
+  }
+  if (LAST_OPENAI_DIAGNOSTIC_) {
+    Logger.log("Last OpenAI diagnostic: " + LAST_OPENAI_DIAGNOSTIC_);
+  }
+  if (LAST_OPENAI_RAW_RESPONSE_) {
+    Logger.log("Last OpenAI raw response: " + LAST_OPENAI_RAW_RESPONSE_);
+  }
+}
+
+function runCreatorListEnrichment_(sheet, rowItems, header) {
+  const dropdownValuesByHeader = getDropdownValuesByHeader_(sheet.getParent(), "Dropdown Values");
+  const defaultClientName = getDefaultClientName_(dropdownValuesByHeader);
+
+  const staticUpdates = [];
+  for (const item of rowItems) {
+    const rowChanges = enrichCreatorRow_(item.values, header, defaultClientName);
+    if (rowChanges.length === 0) continue;
+    staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
+  }
+
+  const staticWrite = writeSparseCellUpdates_(sheet, header, staticUpdates, "Static enrichment");
+
+  const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header);
+  const profileEnriched = enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
+
+  return {
+    staticEnriched: staticWrite.writtenRowCount,
+    youtubeEnriched: youtubeEnriched,
+    profileEnriched: profileEnriched
+  };
+}
+
+function canAttemptCreatorListEnrichment_(row, header) {
+  const candidateFields = [
+    "Channel Name",
+    "Channel URL",
+    "Campaign Name",
+    "YouTube URL",
+    "YouTube Handle"
+  ];
+
+  return candidateFields.some(field => String(getValueByHeader_(row, header, field) || "").trim());
+}
+
+
+// ============================================================
 //  (1) CREATOR LIST → HUBSPOT (+ ENRICHMENT)
 // ============================================================
 
@@ -145,10 +612,11 @@ function enrichAndImportToHubSpot() {
   const sheet = ss.getSheetByName("Creator List");
   if (!sheet) return ui.alert("❌ 'Creator List' sheet not found.");
 
-  const data = sheet.getDataRange().getValues();
-  if (data.length < 2) return ui.alert("ℹ️ Creator List has no data.");
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) return ui.alert("ℹ️ Creator List has no data.");
 
-  const header = data[0].map(v => String(v || "").trim());
+  const data = context.data;
+  const header = context.header;
   const numCols = header.length;
   const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
   const defaultClientName = getDefaultClientName_(dropdownValuesByHeader);
@@ -158,7 +626,7 @@ function enrichAndImportToHubSpot() {
   if (contactingStart0 === -1) return ui.alert("❌ 'Contacting' section not found.");
   if (archivedStart0 === -1) return ui.alert("❌ 'Archived' section not found.");
 
-  const emailCol = header.indexOf("Email");
+  const emailCol = findHeaderIndex_(header, "Email");
   if (emailCol === -1) return ui.alert("❌ 'Email' column not found.");
 
   // Collect rows with email in Contacting section
@@ -174,21 +642,19 @@ function enrichAndImportToHubSpot() {
   if (rowItems.length === 0) return ui.alert("ℹ️ No rows with emails in Contacting section.");
 
   // Stage 1: Static enrichment (in memory)
-  let enrichedCount = 0;
+  const staticUpdates = [];
   for (const item of rowItems) {
-    if (enrichCreatorRow_(item.values, header, defaultClientName)) enrichedCount++;
+    const rowChanges = enrichCreatorRow_(item.values, header, defaultClientName);
+    if (rowChanges.length === 0) continue;
+    staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
   }
 
   // Batch write enriched data back
-  for (const item of rowItems) {
-    sheet.getRange(item.row1, 1, 1, numCols).setValues([item.values]);
-  }
-  SpreadsheetApp.flush();
-  Logger.log(`✅ Static enrichment done for ${enrichedCount} row(s).`);
+  const staticWrite = writeSparseCellUpdates_(sheet, header, staticUpdates, "Static enrichment");
+  Logger.log(`✅ Static enrichment done for ${staticWrite.writtenRowCount} row(s).`);
 
   // Stage 2: YouTube API enrichment
   enrichYouTubeDataForRows_(sheet, rowItems, header);
-  SpreadsheetApp.flush();
 
   // Stage 3: LLM enrichment (optional, requires OPENAI_API_KEY script property)
   enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
@@ -209,29 +675,15 @@ function enrichAndImportToHubSpot() {
  * Modifies the row array in place.
  */
 function enrichCreatorRow_(row, header, defaultClientName) {
-  const idx = name => header.indexOf(name);
+  const idx = name => findHeaderIndex_(header, name);
   const get = name => { const i = idx(name); return i === -1 ? "" : String(row[i] || "").trim(); };
-  let changed = false;
-  const set = (name, value) => {
-    const i = idx(name);
-    const nextValue = value == null ? "" : value;
-    if (i === -1) return;
-    if (String(row[i] == null ? "" : row[i]) === String(nextValue)) return;
-    row[i] = nextValue;
-    changed = true;
-  };
-  const setIfEmpty = (name, value) => {
-    const i = idx(name);
-    const nextValue = value == null ? "" : value;
-    if (i === -1 || nextValue === "") return;
-    if (String(row[i] || "").trim()) return;
-    row[i] = nextValue;
-    changed = true;
-  };
+  const changeMap = {};
+  const set = (name, value) => setTrackedValueByHeader_(row, header, name, value, changeMap);
+  const setIfEmpty = (name, value) => setIfEmpty_(row, header, name, value, changeMap);
 
   const channelName = get("Channel Name");
   const campaignName = get("Campaign Name");
-  if (!channelName && !campaignName) return false;
+  if (!channelName && !campaignName) return [];
 
   // Contact Type: always Influencer
   set("Contact Type", "Influencer");
@@ -254,7 +706,7 @@ function enrichCreatorRow_(row, header, defaultClientName) {
   // Deal stage: always Scouted
   set("Deal stage", "Scouted");
 
-  return changed;
+  return trackedChangeMapToRowChanges_(changeMap);
 }
 
 function parseCampaignName_(campaignName) {
@@ -282,72 +734,429 @@ function enrichYouTubeDataForRows_(sheet, rowItems, header) {
   const apiKey = getYouTubeApiKey_();
   if (!apiKey) {
     Logger.log("ℹ️ YouTube API key not set. Skipping YouTube enrichment.");
-    return;
+    return 0;
   }
-  if (!validateYouTubeApiKey_(apiKey)) return;
+  if (!validateYouTubeApiKey_(apiKey)) return 0;
 
-  let filled = 0;
+  const updates = [];
   for (const item of rowItems) {
     const needsYoutubeFields = YOUTUBE_ENRICH_FIELDS_.some(field => {
-      const fieldIdx = header.indexOf(field);
+      const fieldIdx = findHeaderIndex_(header, field);
       return fieldIdx !== -1 && !String(item.values[fieldIdx] || "").trim();
     });
     if (!needsYoutubeFields) continue;
 
     try {
-      if (enrichSingleYouTubeRow_(item.values, header, apiKey)) {
-        sheet.getRange(item.row1, 1, 1, header.length).setValues([item.values]);
-        filled++;
-      }
+      const result = enrichSingleYouTubeRow_(item, header, apiKey);
+      if (result.updates.length === 0) continue;
+      updates.push.apply(updates, trackedRowChangesToSheetUpdates_(item, result.updates));
     } catch (e) {
       Logger.log(`⚠️ YouTube enrichment failed for row ${item.row1}: ${e}`);
     }
   }
-  Logger.log(`✅ YouTube enrichment: filled ${filled} row(s).`);
+  const writeResult = writeSparseCellUpdates_(sheet, header, updates, "YouTube enrichment");
+  Logger.log(`✅ YouTube enrichment: filled ${writeResult.writtenRowCount} row(s).`);
+  return writeResult.writtenRowCount;
 }
 
 
-function enrichSingleYouTubeRow_(row, header, apiKey) {
-  const channelUrl = String(getValueByHeader_(row, header, "Channel URL") || "").trim();
+function enrichSingleYouTubeRow_(item, header, apiKey) {
+  const row = item.values;
+  const channelUrl = resolveCreatorYouTubeInputFromRow_(row, header);
   const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  const insight = item.youtubeInsight || getCreatorYouTubeInsight_(channelUrl, channelName, apiKey);
+  if (!insight || !insight.channelId) {
+    return {
+      insight: null,
+      updates: []
+    };
+  }
+
+  item.youtubeInsight = insight;
+  const changeMap = {};
+  if (insight.subscribers != null) {
+    setIfEmpty_(row, header, "YouTube Followers", insight.subscribers, changeMap);
+  }
+  if (insight.handle) setIfEmpty_(row, header, "YouTube Handle", insight.handle, changeMap);
+  if (insight.canonicalUrl) setIfEmpty_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+
+  if (insight.medianVideoViews != null) {
+    setIfEmpty_(row, header, "YouTube Video Median Views", insight.medianVideoViews, changeMap);
+    setIfEmpty_(row, header, "YouTube Average Views", insight.medianVideoViews, changeMap);
+  }
+  if (insight.medianShortsViews != null) {
+    setIfEmpty_(row, header, "YouTube Shorts Median Views", insight.medianShortsViews, changeMap);
+  }
+  if (insight.medianVideoEngagementRate != null) {
+    setIfEmpty_(row, header, "YouTube Engagement Rate", insight.medianVideoEngagementRate, changeMap);
+  }
+
+  return {
+    insight: insight,
+    updates: trackedChangeMapToRowChanges_(changeMap)
+  };
+}
+
+function getCreatorYouTubeInsight_(channelUrl, channelName, apiKey, options) {
+  const includeEmailSignals = !!(options && options.includeEmailSignals);
   const resolved = resolveYouTubeChannelForEnrichment_(channelUrl, channelName, apiKey);
-  if (!resolved || !resolved.channelId) return false;
+  if (!resolved || !resolved.channelId) return null;
 
-  let changed = false;
+  const cacheKey = CREATOR_YOUTUBE_INSIGHT_CACHE_PREFIX_ + resolved.channelId;
+  const cached = getJsonFromScriptCache_(cacheKey);
+  if (cached) return decorateCreatorInsightWithEmailSignals_(cached, includeEmailSignals);
 
-  // Channel statistics and snippet (subscribers, handle)
   const channelData = ytFetchJson_(
-    "https://www.googleapis.com/youtube/v3/channels?part=statistics,snippet" +
+    "https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics,contentDetails,brandingSettings" +
     "&id=" + encodeURIComponent(resolved.channelId) +
     "&key=" + encodeURIComponent(apiKey)
   );
+  const item = channelData.items && channelData.items[0];
+  if (!item) return null;
 
-  if (channelData.items && channelData.items.length > 0) {
-    const item = channelData.items[0];
-    const stats = item.statistics || {};
+  const snippet = item.snippet || {};
+  const branding = item.brandingSettings && item.brandingSettings.channel
+    ? item.brandingSettings.channel
+    : {};
+  const statistics = item.statistics || {};
+  const uploadsPlaylistId =
+    item.contentDetails &&
+    item.contentDetails.relatedPlaylists &&
+    item.contentDetails.relatedPlaylists.uploads;
+
+  const videoStats = computeYouTubeVideoStats_(resolved.channelId, apiKey) || {};
+  const longformSignals = uploadsPlaylistId
+    ? getCreatorLongformSignals_(uploadsPlaylistId, apiKey)
+    : null;
+
+  let handle = normalizeYouTubeHandle_(snippet.customUrl);
+  if (!handle && /\/@/i.test(String(resolved.canonicalUrl || ""))) {
+    handle = normalizeYouTubeHandle_(resolved.canonicalUrl);
+  }
+
+  const insight = {
+    channelId: resolved.channelId,
+    channelName: String(snippet.title || channelName || "").trim(),
+    handle: handle,
+    canonicalUrl: resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl),
+    description: String(snippet.description || branding.description || "").trim(),
+    countryCode: String(snippet.country || branding.country || "").trim(),
+    subscribers: Number(statistics.subscriberCount || 0),
+    medianVideoViews: videoStats.medianVideoViews != null ? videoStats.medianVideoViews : null,
+    medianShortsViews: videoStats.medianShortsViews != null ? videoStats.medianShortsViews : null,
+    medianVideoEngagementRate: videoStats.medianVideoEngagementRate != null ? videoStats.medianVideoEngagementRate : null,
+    dominantCategoryName: longformSignals && longformSignals.dominantCategoryName
+      ? longformSignals.dominantCategoryName
+      : "",
+    sampleSize: longformSignals && longformSignals.sampleSize ? longformSignals.sampleSize : 0,
+    sampledTitles: longformSignals && longformSignals.sampledTitles ? longformSignals.sampledTitles : [],
+    sampledVideoDescriptions: longformSignals && longformSignals.sampledVideoDescriptions
+      ? longformSignals.sampledVideoDescriptions
+      : []
+  };
+
+  putJsonInScriptCache_(cacheKey, insight, CREATOR_YOUTUBE_SIGNAL_TTL_SECONDS_);
+  return decorateCreatorInsightWithEmailSignals_(insight, includeEmailSignals);
+}
+
+function getCreatorLongformSignals_(uploadsPlaylistId, apiKey) {
+  const cacheKey = CREATOR_LONGFORM_SIGNAL_CACHE_PREFIX_ + uploadsPlaylistId;
+  const cached = getJsonFromScriptCache_(cacheKey);
+  if (cached) return cached;
+
+  const sampledTitles = [];
+  const sampledVideoDescriptions = [];
+  const sampledCategories = [];
+  let pageToken = "";
+
+  while (sampledTitles.length < CREATOR_YOUTUBE_SIGNAL_SAMPLE_SIZE_) {
+    const playlistData = ytFetchJson_(
+      "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails" +
+      "&maxResults=50" +
+      "&playlistId=" + encodeURIComponent(uploadsPlaylistId) +
+      "&key=" + encodeURIComponent(apiKey) +
+      (pageToken ? "&pageToken=" + encodeURIComponent(pageToken) : "")
+    );
+
+    const items = Array.isArray(playlistData.items) ? playlistData.items : [];
+    if (items.length === 0) break;
+
+    const videoIds = items
+      .map(item => item && item.contentDetails && item.contentDetails.videoId
+        ? String(item.contentDetails.videoId || "").trim()
+        : "")
+      .filter(Boolean);
+
+    const videos = getCreatorVideosByIds_(videoIds, apiKey);
+    videos.forEach(video => {
+      if (video.durationSeconds < CREATOR_YOUTUBE_SIGNAL_MIN_LONGFORM_SECONDS_) return;
+      if (sampledTitles.length >= CREATOR_YOUTUBE_SIGNAL_SAMPLE_SIZE_) return;
+
+      if (video.title) sampledTitles.push(video.title);
+      if (
+        video.description &&
+        sampledVideoDescriptions.length < CREATOR_YOUTUBE_DESCRIPTION_SAMPLE_SIZE_ &&
+        sampledVideoDescriptions.indexOf(video.description) === -1
+      ) {
+        sampledVideoDescriptions.push(video.description);
+      }
+      if (video.categoryId) sampledCategories.push(video.categoryId);
+    });
+
+    pageToken = String(playlistData.nextPageToken || "");
+    if (!pageToken) break;
+  }
+
+  if (sampledTitles.length === 0) return null;
+
+  const dominantCategoryId = modeStringArray_(sampledCategories);
+  const result = {
+    sampleSize: sampledTitles.length,
+    sampledTitles: sampledTitles,
+    sampledVideoDescriptions: sampledVideoDescriptions,
+    dominantCategoryName: getEnglishYouTubeCategoryName_(dominantCategoryId)
+  };
+
+  putJsonInScriptCache_(cacheKey, result, CREATOR_YOUTUBE_SIGNAL_TTL_SECONDS_);
+  return result;
+}
+
+function getCreatorVideosByIds_(ids, apiKey) {
+  if (!ids || ids.length === 0) return [];
+
+  const data = ytFetchJson_(
+    "https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails" +
+    "&id=" + encodeURIComponent(ids.join(",")) +
+    "&key=" + encodeURIComponent(apiKey)
+  );
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  return items.map(item => {
     const snippet = item.snippet || {};
-    const canonicalUrl = resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl);
-    const handle = normalizeYouTubeHandle_(snippet.customUrl);
-    if (setIfEmpty_(row, header, "YouTube Followers", stats.subscriberCount || "")) changed = true;
-    if (handle && setIfEmpty_(row, header, "YouTube Handle", handle)) changed = true;
-    if (canonicalUrl && setIfEmpty_(row, header, "YouTube URL", canonicalUrl)) changed = true;
+    return {
+      title: String(snippet.title || "").trim(),
+      description: String(snippet.description || "").trim(),
+      categoryId: String(snippet.categoryId || "").trim(),
+      durationSeconds: iso8601DurationToSeconds_(item.contentDetails && item.contentDetails.duration)
+    };
+  });
+}
+
+function decorateCreatorInsightWithEmailSignals_(insight, includeEmailSignals) {
+  if (!insight) return null;
+
+  const out = Object.assign({}, insight);
+  out.sampledTitles = uniqueNonEmptyStrings_(out.sampledTitles || []);
+  out.sampledVideoDescriptions = uniqueNonEmptyStrings_(out.sampledVideoDescriptions || []);
+  out.bioEmails = extractExplicitEmailsFromText_(out.description || "");
+  out.videoDescriptionEmails = extractExplicitEmailsFromTextList_(out.sampledVideoDescriptions || []);
+
+  let channelPageEmails = Array.isArray(out.channelPageEmails)
+    ? uniqueNonEmptyStrings_(out.channelPageEmails)
+    : [];
+  let channelPageSnippet = String(out.channelPageSnippet || "");
+
+  if (includeEmailSignals && out.canonicalUrl && channelPageEmails.length === 0 && !channelPageSnippet) {
+    const channelPageSignal = getYouTubeChannelPageEmailSignal_(out.canonicalUrl);
+    if (channelPageSignal) {
+      channelPageEmails = Array.isArray(channelPageSignal.emails)
+        ? uniqueNonEmptyStrings_(channelPageSignal.emails)
+        : [];
+      channelPageSnippet = String(channelPageSignal.snippet || "");
+    }
   }
 
-  // Video stats for long-form median views, shorts median views, and engagement rate
-  const videoStats = computeYouTubeVideoStats_(resolved.channelId, apiKey);
-  if (videoStats) {
-    if (videoStats.medianVideoViews != null) {
-      if (setIfEmpty_(row, header, "YouTube Video Median Views", videoStats.medianVideoViews)) changed = true;
-    }
-    if (videoStats.medianShortsViews != null) {
-      if (setIfEmpty_(row, header, "YouTube Shorts Median Views", videoStats.medianShortsViews)) changed = true;
-    }
-    if (videoStats.medianVideoEngagementRate != null) {
-      if (setIfEmpty_(row, header, "YouTube Engagement Rate", videoStats.medianVideoEngagementRate)) changed = true;
+  out.channelPageEmails = channelPageEmails;
+  out.channelPageSnippet = channelPageSnippet;
+
+  const preferredEmailSignal = pickPreferredCreatorEmailSignal_(out);
+  out.preferredEmail = preferredEmailSignal.email;
+  out.preferredEmailSource = preferredEmailSignal.source;
+  return out;
+}
+
+function pickPreferredCreatorEmailSignal_(insight) {
+  const sources = [
+    { source: "channel bio", emails: insight && insight.bioEmails },
+    { source: "channel page", emails: insight && insight.channelPageEmails },
+    { source: "video description", emails: insight && insight.videoDescriptionEmails }
+  ];
+
+  for (let i = 0; i < sources.length; i++) {
+    const emails = Array.isArray(sources[i].emails) ? sources[i].emails : [];
+    if (emails.length > 0) {
+      return {
+        email: emails[0],
+        source: sources[i].source
+      };
     }
   }
 
-  return changed;
+  return {
+    email: "",
+    source: ""
+  };
+}
+
+function extractPreferredCreatorEmailFromContext_(row, header, youtubeInsight) {
+  const prioritizedInsightSignal = pickPreferredCreatorEmailSignal_(youtubeInsight || {});
+  if (prioritizedInsightSignal.email) return prioritizedInsightSignal;
+
+  const fallbackParts = [];
+  (header || []).forEach(function (field, index) {
+    if (normalizeHeaderName_(field) === normalizeHeaderName_("Email")) return;
+    const value = normalizeLlmString_(row && row[index]);
+    if (!value) return;
+    fallbackParts.push(String(field || "").trim() + ": " + value);
+  });
+
+  const fallbackEmails = extractExplicitEmailsFromText_(fallbackParts.join("\n"));
+  return {
+    email: fallbackEmails.length > 0 ? fallbackEmails[0] : "",
+    source: fallbackEmails.length > 0 ? "row context" : ""
+  };
+}
+
+function getYouTubeChannelPageEmailSignal_(canonicalUrl) {
+  const normalizedUrl = String(canonicalUrl || "").trim().replace(/\/+$/, "");
+  if (!normalizedUrl) {
+    return { emails: [], snippet: "" };
+  }
+
+  const cacheKey = CREATOR_CHANNEL_PAGE_SIGNAL_CACHE_PREFIX_ + normalizedUrl;
+  const cached = getJsonFromScriptCache_(cacheKey);
+  if (cached) return cached;
+
+  const fetchUrls = uniqueNonEmptyStrings_([
+    buildYouTubeAboutPageUrl_(normalizedUrl),
+    normalizedUrl
+  ]);
+
+  const emails = [];
+  let snippet = "";
+
+  for (let i = 0; i < fetchUrls.length; i++) {
+    const url = fetchUrls[i];
+    const text = fetchUrlTextForEmailScan_(url);
+    if (!text) continue;
+
+    const foundEmails = extractExplicitEmailsFromText_(text);
+    foundEmails.forEach(function (email) {
+      if (emails.indexOf(email) !== -1) return;
+      emails.push(email);
+    });
+
+    if (!snippet && emails.length > 0) {
+      snippet = extractEmailSnippetFromText_(text, emails[0]);
+    }
+    if (emails.length > 0) break;
+  }
+
+  const result = {
+    emails: emails,
+    snippet: snippet
+  };
+  putJsonInScriptCache_(cacheKey, result, CREATOR_YOUTUBE_SIGNAL_TTL_SECONDS_);
+  return result;
+}
+
+function buildYouTubeAboutPageUrl_(canonicalUrl) {
+  const base = String(canonicalUrl || "").trim().replace(/\/+$/, "");
+  if (!base) return "";
+  return /\/about$/i.test(base) ? base : (base + "/about");
+}
+
+function fetchUrlTextForEmailScan_(url) {
+  const target = String(url || "").trim();
+  if (!target) return "";
+
+  try {
+    const response = UrlFetchApp.fetch(target, {
+      muteHttpExceptions: true,
+      headers: {
+        "Accept-Language": "en-US,en;q=0.9"
+      }
+    });
+    if (response.getResponseCode() >= 400) return "";
+
+    return String(response.getContentText() || "").slice(0, 250000);
+  } catch (e) {
+    Logger.log("⚠️ Channel page fetch failed for email extraction: " + e);
+    return "";
+  }
+}
+
+function extractEmailSnippetFromText_(text, email) {
+  const raw = String(text || "");
+  const normalizedEmail = String(email || "").toLowerCase();
+  if (!raw || !normalizedEmail) return "";
+
+  const startIndex = raw.toLowerCase().indexOf(normalizedEmail);
+  if (startIndex === -1) return "";
+
+  const snippet = raw.slice(Math.max(0, startIndex - 160), startIndex + normalizedEmail.length + 160);
+  return truncateForUi_(snippet.replace(/\s+/g, " ").trim(), 400);
+}
+
+function extractExplicitEmailsFromTextList_(values) {
+  const results = [];
+  (values || []).forEach(function (value) {
+    extractExplicitEmailsFromText_(value).forEach(function (email) {
+      if (results.indexOf(email) !== -1) return;
+      results.push(email);
+    });
+  });
+  return results;
+}
+
+function extractExplicitEmailsFromText_(value) {
+  const raw = String(value || "");
+  if (!raw) return [];
+
+  const results = [];
+  const seen = {};
+
+  function collectFromText(text) {
+    const pattern = /(?:mailto:)?([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,63})/ig;
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const email = normalizeExtractedEmailCandidate_(match[1] || match[0]);
+      if (!email) continue;
+      if (getHubSpotImportEmailValidationIssue_(email)) continue;
+
+      const key = email.toLowerCase();
+      if (seen[key]) continue;
+      seen[key] = true;
+      results.push(email);
+    }
+  }
+
+  const decodedHtml = raw
+    .replace(/&commat;|&#64;|&#x40;/ig, "@")
+    .replace(/&period;|&#46;|&#x2e;/ig, ".");
+  collectFromText(decodedHtml);
+
+  const deobfuscated = decodedHtml
+    .replace(/\s*\[\s*at\s*\]\s*/ig, "@")
+    .replace(/\s*\(\s*at\s*\)\s*/ig, "@")
+    .replace(/\s+\bat\b\s+/ig, "@")
+    .replace(/\s*\[\s*dot\s*\]\s*/ig, ".")
+    .replace(/\s*\(\s*dot\s*\)\s*/ig, ".")
+    .replace(/\s+\bdot\b\s+/ig, ".");
+  if (deobfuscated !== decodedHtml) {
+    collectFromText(deobfuscated);
+  }
+
+  return results;
+}
+
+function normalizeExtractedEmailCandidate_(value) {
+  return String(value || "")
+    .replace(/^mailto:/i, "")
+    .replace(/^[<("'`\[]+/, "")
+    .replace(/[>"')\],;:!?]+$/, "")
+    .trim()
+    .toLowerCase();
 }
 
 function resolveYouTubeChannelForEnrichment_(channelUrl, channelName, apiKey) {
@@ -541,7 +1350,7 @@ function computeYouTubeVideoStats_(channelId, apiKey) {
         const comments = Number(video.statistics.commentCount || 0);
         erList.push((likes + comments) / views);
       }
-    } else if (shortsViewsList.length < YT_MAX_VIDEOS_FOR_AVG_) {
+    } else if (durationSeconds <= YT_SHORTS_MAX_DURATION_SECONDS_ && shortsViewsList.length < YT_MAX_VIDEOS_FOR_AVG_) {
       shortsViewsList.push(views);
     }
 
@@ -586,86 +1395,113 @@ function computeMedian_(arr) {
 
 function enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader) {
   const apiKey = getOpenAiApiKey_();
+  const model = apiKey ? getOpenAiModel_() : "";
   if (!apiKey) {
-    Logger.log("ℹ️ OpenAI API key not set. Skipping LLM enrichment.");
-    return;
+    Logger.log("ℹ️ OpenAI API key not set. AI enrichment will be skipped, but explicit email extraction will still run.");
   }
-
-  const model = getOpenAiModel_();
-
-  let enriched = 0;
+  const profileDropdownOptions = getProfileDropdownOptionsByHeader_(sheet, header, dropdownValuesByHeader);
+  const youtubeApiKey = getYouTubeApiKey_();
+  const validatedYouTubeApiKey = (youtubeApiKey && validateYouTubeApiKey_(youtubeApiKey))
+    ? youtubeApiKey
+    : "";
+  const aiRequests = [];
+  const directUpdates = [];
   for (const item of rowItems) {
-    const channelName = String(item.values[header.indexOf("Channel Name")] || "").trim();
-    const channelUrl = String(item.values[header.indexOf("Channel URL")] || "").trim();
-    const campaignName = String(item.values[header.indexOf("Campaign Name")] || "").trim();
+    const channelName = String(getValueByHeader_(item.values, header, "Channel Name") || "").trim();
+    const channelUrl = String(getValueByHeader_(item.values, header, "Channel URL") || "").trim();
+    const campaignName = String(getValueByHeader_(item.values, header, "Campaign Name") || "").trim();
     if (!channelName && !channelUrl && !campaignName) continue;
-    const contextText = buildCreatorProfileContext_(item.values, header);
 
     // Only attempt fields that are still empty
-    const emptyFields = PROFILE_LLM_FIELDS_.filter(f => {
-      const i = header.indexOf(f);
+    let emptyFields = PROFILE_LLM_FIELDS_.filter(f => {
+      const i = findHeaderIndex_(header, f);
       return i !== -1 && !String(item.values[i] || "").trim();
     });
     if (emptyFields.length === 0) continue;
 
     try {
-      const result = callLlmForCreatorProfileEnrichment_(
-        apiKey,
-        model,
-        channelName,
-        channelUrl,
-        campaignName,
-        emptyFields,
-        dropdownValuesByHeader,
-        contextText
-      );
+      const changeMap = {};
+      const needsEmail = emptyFields.indexOf("Email") !== -1;
+      let youtubeInsight = item.youtubeInsight || null;
 
-      let rowChanged = false;
-      if (result) {
-        const sanitized = sanitizeCreatorProfileEnrichment_(result, dropdownValuesByHeader);
-        if (applySanitizedProfileFields_(item.values, header, emptyFields, sanitized)) {
-          rowChanged = true;
-        }
+      if (youtubeInsight) {
+        youtubeInsight = decorateCreatorInsightWithEmailSignals_(youtubeInsight, needsEmail);
+        item.youtubeInsight = youtubeInsight;
+      } else if ((apiKey || needsEmail) && validatedYouTubeApiKey) {
+        youtubeInsight = getCreatorProfileInsightForLlm_(
+          item.values,
+          header,
+          validatedYouTubeApiKey,
+          { includeEmailSignals: needsEmail }
+        );
+        if (youtubeInsight) item.youtubeInsight = youtubeInsight;
       }
 
-      const remainingClassificationFields = PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(field => {
-        const i = header.indexOf(field);
-        return emptyFields.indexOf(field) !== -1 && i !== -1 && !String(item.values[i] || "").trim();
-      });
-
-      if (remainingClassificationFields.length > 0) {
-        const classificationResult = callLlmForCreatorDropdownClassification_(
-          apiKey,
-          model,
-          remainingClassificationFields,
-          dropdownValuesByHeader,
-          contextText
-        );
-        if (classificationResult) {
-          const sanitizedClassification = sanitizeCreatorProfileEnrichment_(
-            classificationResult,
-            dropdownValuesByHeader
-          );
-          if (applySanitizedProfileFields_(
+      if (needsEmail) {
+        const preferredEmailSignal = extractPreferredCreatorEmailFromContext_(item.values, header, youtubeInsight);
+        if (preferredEmailSignal.email) {
+          applySanitizedProfileFields_(
             item.values,
             header,
-            remainingClassificationFields,
-            sanitizedClassification
-          )) {
-            rowChanged = true;
-          }
+            ["Email"],
+            { "Email": preferredEmailSignal.email },
+            changeMap
+          );
         }
+
+        emptyFields = PROFILE_LLM_FIELDS_.filter(f => {
+          const i = findHeaderIndex_(header, f);
+          return i !== -1 && !String(item.values[i] || "").trim();
+        });
       }
 
-      if (rowChanged) {
-        sheet.getRange(item.row1, 1, 1, header.length).setValues([item.values]);
-        enriched++;
+      if (emptyFields.length === 0) {
+        directUpdates.push.apply(
+          directUpdates,
+          trackedRowChangesToSheetUpdates_(item, trackedChangeMapToRowChanges_(changeMap))
+        );
+        continue;
       }
+
+      if (!apiKey) {
+        directUpdates.push.apply(
+          directUpdates,
+          trackedRowChangesToSheetUpdates_(item, trackedChangeMapToRowChanges_(changeMap))
+        );
+        continue;
+      }
+
+      const contextText = buildCreatorProfileContext_(item.values, header, youtubeInsight);
+      aiRequests.push({
+        rowKey: String(item.row1),
+        item: item,
+        channelName: channelName,
+        channelUrl: channelUrl,
+        campaignName: campaignName,
+        requestedFields: emptyFields.slice(),
+        contextText: contextText,
+        changeMap: changeMap
+      });
     } catch (e) {
       Logger.log(`⚠️ LLM enrichment failed for row ${item.row1}: ${e}`);
     }
   }
-  Logger.log(`✅ LLM enrichment: filled ${enriched} row(s).`);
+
+  if (apiKey && aiRequests.length > 0) {
+    applyCreatorProfileBatchResults_(apiKey, model, header, profileDropdownOptions, aiRequests);
+  }
+
+  const updates = directUpdates.slice();
+  aiRequests.forEach(function (request) {
+    updates.push.apply(
+      updates,
+      trackedRowChangesToSheetUpdates_(request.item, trackedChangeMapToRowChanges_(request.changeMap))
+    );
+  });
+
+  const writeResult = writeSparseCellUpdates_(sheet, header, updates, "Profile enrichment");
+  Logger.log(`✅ Profile enrichment: filled ${writeResult.writtenRowCount} row(s).`);
+  return writeResult.writtenRowCount;
 }
 
 
@@ -680,12 +1516,19 @@ function callLlmForCreatorProfileEnrichment_(
   contextText
 ) {
   const prompt = [
-    "Return a JSON object only.",
-    "Fill only the requested fields that you are confident about.",
-    "If a field is uncertain, omit it.",
+    "Return JSON only.",
+    "Fill only the requested fields.",
+    "Use an empty string when a field is uncertain.",
     "Only include First Name and Last Name when the creator is clearly an individual person and the split is unambiguous.",
-    "For Influencer Type, Influencer Vertical, Country/Region, and Language, use only exact values from the allowed lists below.",
-    "Prefer filling Influencer Vertical, Country/Region, and Language with the closest exact allowed value instead of omitting them.",
+    "Only include Email when an explicit email address appears in the provided evidence.",
+    "If multiple explicit emails appear, prefer the one from the channel bio, then the channel page/about text, then video descriptions.",
+    "Return Email as a plain email address only.",
+    "For Influencer Type, Country/Region, and Language, use only exact values from the allowed lists below.",
+    "For Influencer Vertical, return an array of exact allowed values.",
+    "Use 1 Influencer Vertical whenever a single best fit exists.",
+    "Only return 2 or 3 Influencer Vertical values when one value would clearly lose important context.",
+    "Never return more than 3 Influencer Vertical values.",
+    "Do not infer sensitive traits.",
     "",
     "Requested fields: " + emptyFields.join(", "),
     "Channel Name: " + (channelName || "(blank)"),
@@ -701,11 +1544,12 @@ function callLlmForCreatorProfileEnrichment_(
     "Allowed Language values: " + JSON.stringify(dropdownValuesByHeader["Language"] || [])
   ].join("\n");
 
-  return callOpenAiJsonChat_(
+  return callOpenAiStructuredCreatorProfile_(
     apiKey,
     model,
-    "You enrich creator CRM rows. Only provide values you are confident about. Respond with valid JSON only.",
-    prompt
+    "You enrich creator CRM rows using explicit creator evidence. Respond with valid JSON only.",
+    prompt,
+    dropdownValuesByHeader
   );
 }
 
@@ -717,31 +1561,349 @@ function callLlmForCreatorDropdownClassification_(
   contextText
 ) {
   const prompt = [
-    "Return a JSON object only.",
-    "Choose the single best exact allowed value for each requested field.",
-    "Do not invent values outside the lists.",
-    "These are required CRM classification fields, so prefer the best exact allowed match instead of omitting a field.",
-    "Only omit a field when there is truly no reasonable signal in the creator context.",
+    "Return JSON only.",
+    "Choose the best exact allowed value for each requested field when the creator context supports it.",
+    "For these CRM classification fields, prefer the closest exact allowed match over leaving a field blank.",
+    "Use an empty string only when there is truly no reasonable signal.",
+    "For Influencer Vertical, return an array of 1 to 3 exact allowed values.",
+    "Return 1 Influencer Vertical whenever possible.",
+    "Only return 2 or 3 Influencer Vertical values when one value would clearly lose important context.",
+    "Never return more than 3 Influencer Vertical values.",
     "",
     "Requested fields: " + requestedFields.join(", "),
     "",
     "Creator context:",
     contextText || "(blank)",
     "",
+    "Allowed Influencer Type values: " + JSON.stringify(dropdownValuesByHeader["Influencer Type"] || []),
     "Allowed Influencer Vertical values: " + JSON.stringify(dropdownValuesByHeader["Influencer Vertical"] || []),
     "Allowed Country/Region values: " + JSON.stringify(dropdownValuesByHeader["Country/Region"] || []),
     "Allowed Language values: " + JSON.stringify(dropdownValuesByHeader["Language"] || [])
   ].join("\n");
 
-  return callOpenAiJsonChat_(
+  return callOpenAiStructuredCreatorProfile_(
     apiKey,
     model,
-    "You classify creator CRM fields. Pick only exact values from the allowed lists and respond with valid JSON only.",
-    prompt
+    "You classify creator CRM fields from creator evidence. Use exact allowed values and respond with valid JSON only.",
+    prompt,
+    dropdownValuesByHeader
   );
 }
 
-function callOpenAiJsonChat_(apiKey, model, systemPrompt, userPrompt) {
+function applyCreatorProfileBatchResults_(apiKey, model, header, dropdownValuesByHeader, requests) {
+  const requestChunks = chunkArray_(requests || [], OPENAI_CREATOR_PROFILE_BATCH_SIZE_);
+
+  requestChunks.forEach(function (requestChunk) {
+    if (!requestChunk || requestChunk.length === 0) return;
+
+    try {
+      const profileResultsByRowKey = callLlmForCreatorProfileEnrichmentBatch_(
+        apiKey,
+        model,
+        requestChunk,
+        dropdownValuesByHeader
+      );
+
+      requestChunk.forEach(function (request) {
+        const result = profileResultsByRowKey[request.rowKey];
+        if (!result) return;
+
+        const sanitized = sanitizeCreatorProfileEnrichment_(result, dropdownValuesByHeader);
+        applySanitizedProfileFields_(
+          request.item.values,
+          header,
+          request.requestedFields,
+          sanitized,
+          request.changeMap
+        );
+      });
+
+      const classificationRequests = requestChunk
+        .map(function (request) {
+          const remainingClassificationFields = PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(function (field) {
+            const i = findHeaderIndex_(header, field);
+            return request.requestedFields.indexOf(field) !== -1 && i !== -1 && !String(request.item.values[i] || "").trim();
+          });
+
+          return {
+            rowKey: request.rowKey,
+            item: request.item,
+            contextText: request.contextText,
+            requestedFields: remainingClassificationFields,
+            changeMap: request.changeMap
+          };
+        })
+        .filter(function (request) {
+          return request.requestedFields.length > 0;
+        });
+
+      if (classificationRequests.length === 0) return;
+
+      const classificationResultsByRowKey = callLlmForCreatorDropdownClassificationBatch_(
+        apiKey,
+        model,
+        classificationRequests,
+        dropdownValuesByHeader
+      );
+
+      classificationRequests.forEach(function (request) {
+        const result = classificationResultsByRowKey[request.rowKey];
+        if (!result) return;
+
+        const sanitized = sanitizeCreatorProfileEnrichment_(result, dropdownValuesByHeader);
+        applySanitizedProfileFields_(
+          request.item.values,
+          header,
+          request.requestedFields,
+          sanitized,
+          request.changeMap
+        );
+      });
+    } catch (e) {
+      Logger.log("⚠️ Batched LLM enrichment failed: " + (e && e.stack ? e.stack : e));
+    }
+  });
+}
+
+function callLlmForCreatorProfileEnrichmentBatch_(
+  apiKey,
+  model,
+  requests,
+  dropdownValuesByHeader
+) {
+  const prompt = [
+    "Return JSON only.",
+    "Process each creator independently.",
+    "Return exactly one result object for each provided row_key.",
+    "Use the same row_key values provided in the input.",
+    "Fill only the requested fields for each row.",
+    "For any field not listed in requested_fields for that row, return an empty string or an empty array.",
+    "Use an empty string when a requested scalar field is uncertain.",
+    "Use an empty array when a requested Influencer Vertical value is uncertain.",
+    "Only include First Name and Last Name when the creator is clearly an individual person and the split is unambiguous.",
+    "Only include Email when an explicit email address appears in the provided evidence.",
+    "If multiple explicit emails appear, prefer the one from the channel bio, then the channel page/about text, then video descriptions.",
+    "Return Email as a plain email address only.",
+    "For Influencer Type, Country/Region, and Language, use only exact values from the allowed lists below.",
+    "For Influencer Vertical, return an array of exact allowed values.",
+    "Use 1 Influencer Vertical whenever a single best fit exists.",
+    "Only return 2 or 3 Influencer Vertical values when one value would clearly lose important context.",
+    "Never return more than 3 Influencer Vertical values.",
+    "Do not infer sensitive traits.",
+    "",
+    "Rows to process:",
+    JSON.stringify(buildCreatorProfileBatchPromptRows_(requests), null, 2),
+    "",
+    "Allowed Influencer Type values: " + JSON.stringify(dropdownValuesByHeader["Influencer Type"] || []),
+    "Allowed Influencer Vertical values: " + JSON.stringify(dropdownValuesByHeader["Influencer Vertical"] || []),
+    "Allowed Country/Region values: " + JSON.stringify(dropdownValuesByHeader["Country/Region"] || []),
+    "Allowed Language values: " + JSON.stringify(dropdownValuesByHeader["Language"] || [])
+  ].join("\n");
+
+  return callOpenAiStructuredCreatorProfileBatch_(
+    apiKey,
+    model,
+    "You enrich creator CRM rows using explicit creator evidence. Respond with valid JSON only.",
+    prompt,
+    dropdownValuesByHeader,
+    requests,
+    "creator_profile_enrichment_batch"
+  );
+}
+
+function callLlmForCreatorDropdownClassificationBatch_(
+  apiKey,
+  model,
+  requests,
+  dropdownValuesByHeader
+) {
+  const prompt = [
+    "Return JSON only.",
+    "Process each creator independently.",
+    "Return exactly one result object for each provided row_key.",
+    "Use the same row_key values provided in the input.",
+    "Choose the best exact allowed value for each requested field when the creator context supports it.",
+    "For these CRM classification fields, prefer the closest exact allowed match over leaving a field blank.",
+    "Use an empty string only when there is truly no reasonable signal.",
+    "For any field not listed in requested_fields for that row, return an empty string or an empty array.",
+    "For Influencer Vertical, return an array of 1 to 3 exact allowed values.",
+    "Return 1 Influencer Vertical whenever possible.",
+    "Only return 2 or 3 Influencer Vertical values when one value would clearly lose important context.",
+    "Never return more than 3 Influencer Vertical values.",
+    "",
+    "Rows to process:",
+    JSON.stringify(buildCreatorProfileBatchPromptRows_(requests), null, 2),
+    "",
+    "Allowed Influencer Type values: " + JSON.stringify(dropdownValuesByHeader["Influencer Type"] || []),
+    "Allowed Influencer Vertical values: " + JSON.stringify(dropdownValuesByHeader["Influencer Vertical"] || []),
+    "Allowed Country/Region values: " + JSON.stringify(dropdownValuesByHeader["Country/Region"] || []),
+    "Allowed Language values: " + JSON.stringify(dropdownValuesByHeader["Language"] || [])
+  ].join("\n");
+
+  return callOpenAiStructuredCreatorProfileBatch_(
+    apiKey,
+    model,
+    "You classify creator CRM fields from creator evidence. Use exact allowed values and respond with valid JSON only.",
+    prompt,
+    dropdownValuesByHeader,
+    requests,
+    "creator_profile_classification_batch"
+  );
+}
+
+function buildCreatorProfileBatchPromptRows_(requests) {
+  return (requests || []).map(function (request) {
+    return {
+      row_key: String(request.rowKey || "").trim(),
+      requested_fields: Array.isArray(request.requestedFields) ? request.requestedFields : [],
+      channel_name: String(request.channelName || "").trim(),
+      channel_url: String(request.channelUrl || "").trim(),
+      campaign_name: String(request.campaignName || "").trim(),
+      creator_context: String(request.contextText || "")
+    };
+  });
+}
+
+function callOpenAiStructuredCreatorProfileBatch_(
+  apiKey,
+  model,
+  systemPrompt,
+  userPrompt,
+  dropdownValuesByHeader,
+  requests,
+  schemaName
+) {
+  const rowKeys = (requests || []).map(function (request) {
+    return String(request.rowKey || "").trim();
+  }).filter(Boolean);
+  if (rowKeys.length === 0) return {};
+
+  const schema = buildCreatorProfileBatchResponseSchema_(dropdownValuesByHeader, rowKeys.length);
+  const data = callOpenAiStructuredJson_(
+    apiKey,
+    model,
+    systemPrompt,
+    userPrompt,
+    schema,
+    String(schemaName || "creator_profile_batch")
+  );
+  if (!data || !Array.isArray(data.rows)) return {};
+
+  const out = {};
+  data.rows.forEach(function (row) {
+    const rowKey = String(row && row.row_key || "").trim();
+    if (!rowKey || rowKeys.indexOf(rowKey) === -1 || out[rowKey]) return;
+    out[rowKey] = row;
+  });
+  return out;
+}
+
+function callOpenAiStructuredCreatorProfile_(apiKey, model, systemPrompt, userPrompt, dropdownValuesByHeader) {
+  return callOpenAiStructuredJson_(
+    apiKey,
+    model,
+    systemPrompt,
+    userPrompt,
+    buildCreatorProfileResponseSchema_(dropdownValuesByHeader),
+    "creator_profile_enrichment"
+  );
+}
+
+function callOpenAiStructuredJson_(apiKey, model, systemPrompt, userPrompt, schema, schemaName) {
+  const responsesAttempt = callOpenAiResponsesJson_(
+    apiKey,
+    model,
+    systemPrompt,
+    userPrompt,
+    schema,
+    schemaName
+  );
+  if (responsesAttempt.ok) return responsesAttempt.data;
+
+  Logger.log("ℹ️ OpenAI Responses API fallback triggered: " + responsesAttempt.diagnostic);
+
+  const chatAttempt = callOpenAiChatCompletionsJson_(
+    apiKey,
+    model,
+    systemPrompt,
+    userPrompt,
+    schema,
+    schemaName
+  );
+  if (chatAttempt.ok) return chatAttempt.data;
+
+  setLastOpenAiDiagnostic_(
+    "failed",
+    "responses=" + responsesAttempt.diagnostic + " | chat=" + chatAttempt.diagnostic
+  );
+  if (chatAttempt.diagnostic) {
+    Logger.log("⚠️ OpenAI structured enrichment failed: " + chatAttempt.diagnostic);
+  }
+  return null;
+}
+
+function callOpenAiResponsesJson_(apiKey, model, systemPrompt, userPrompt, schema, schemaName) {
+  const response = UrlFetchApp.fetch("https://api.openai.com/v1/responses", {
+    method: "post",
+    muteHttpExceptions: true,
+    headers: {
+      Authorization: "Bearer " + apiKey,
+      "Content-Type": "application/json"
+    },
+    payload: JSON.stringify({
+      model: model,
+      instructions: systemPrompt,
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: userPrompt }
+          ]
+        }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: String(schemaName || "creator_profile_enrichment"),
+          strict: true,
+          schema: schema
+        }
+      }
+    })
+  });
+
+  const code = response.getResponseCode();
+  const text = String(response.getContentText() || "");
+  LAST_OPENAI_RAW_RESPONSE_ = text.slice(0, 1000);
+
+  if (code >= 400) {
+    const diagnostic = `responses ${code}: ${text.slice(0, 500)}`;
+    setLastOpenAiDiagnostic_("responses_error", diagnostic);
+    Logger.log("⚠️ OpenAI API error: " + diagnostic);
+    return { ok: false, diagnostic: diagnostic };
+  }
+
+  try {
+    const data = JSON.parse(text);
+    const content = stripJsonFences_(extractOpenAiTextFromResponses_(data));
+    if (!content) {
+      const diagnostic = "responses empty output";
+      setLastOpenAiDiagnostic_("responses_empty", diagnostic);
+      return { ok: false, diagnostic: diagnostic };
+    }
+
+    const parsed = JSON.parse(content);
+    setLastOpenAiDiagnostic_("responses_ok", "responses ok");
+    return { ok: true, data: parsed, diagnostic: "responses ok" };
+  } catch (e) {
+    const diagnostic = "responses parse error: " + e;
+    setLastOpenAiDiagnostic_("responses_parse_error", diagnostic);
+    Logger.log("⚠️ LLM returned invalid JSON: " + e);
+    return { ok: false, diagnostic: diagnostic };
+  }
+}
+
+function callOpenAiChatCompletionsJson_(apiKey, model, systemPrompt, userPrompt, schema, schemaName) {
   const response = UrlFetchApp.fetch("https://api.openai.com/v1/chat/completions", {
     method: "post",
     muteHttpExceptions: true,
@@ -755,25 +1917,136 @@ function callOpenAiJsonChat_(apiKey, model, systemPrompt, userPrompt) {
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt }
       ],
-      response_format: { type: "json_object" }
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: String(schemaName || "creator_profile_enrichment"),
+          strict: true,
+          schema: schema
+        }
+      }
     })
   });
 
   const code = response.getResponseCode();
+  const text = String(response.getContentText() || "");
+  LAST_OPENAI_RAW_RESPONSE_ = text.slice(0, 1000);
+
   if (code >= 400) {
-    Logger.log(`⚠️ OpenAI API error ${code}: ${response.getContentText().slice(0, 500)}`);
-    return null;
+    const diagnostic = `chat ${code}: ${text.slice(0, 500)}`;
+    Logger.log("⚠️ OpenAI chat completions error: " + diagnostic);
+    return { ok: false, diagnostic: diagnostic };
   }
 
   try {
-    const data = JSON.parse(response.getContentText());
-    const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (!content) return null;
-    return JSON.parse(content);
+    const data = JSON.parse(text);
+    const content = stripJsonFences_(
+      data &&
+      data.choices &&
+      data.choices[0] &&
+      data.choices[0].message &&
+      data.choices[0].message.content
+    );
+    if (!content) {
+      return { ok: false, diagnostic: "chat empty output" };
+    }
+
+    const parsed = JSON.parse(content);
+    setLastOpenAiDiagnostic_("chat_ok", "chat ok");
+    return { ok: true, data: parsed, diagnostic: "chat ok" };
   } catch (e) {
-    Logger.log("⚠️ LLM returned invalid JSON: " + e);
-    return null;
+    const diagnostic = "chat parse error: " + e;
+    Logger.log("⚠️ OpenAI chat completions invalid JSON: " + e);
+    return { ok: false, diagnostic: diagnostic };
   }
+}
+
+function setLastOpenAiDiagnostic_(status, details) {
+  LAST_OPENAI_DIAGNOSTIC_ = [String(status || "").trim(), String(details || "").trim()]
+    .filter(Boolean)
+    .join(": ");
+}
+
+function buildCreatorProfileResponseSchema_(dropdownValuesByHeader) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: PROFILE_LLM_FIELDS_,
+    properties: {
+      "First Name": { type: "string" },
+      "Last Name": { type: "string" },
+      "Email": { type: "string" },
+      "Influencer Type": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Type"]),
+      "Influencer Vertical": buildCreatorProfileVerticalSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Vertical"]),
+      "Country/Region": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Country/Region"]),
+      "Language": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Language"])
+    }
+  };
+}
+
+function buildCreatorProfileBatchResponseSchema_(dropdownValuesByHeader, rowCount) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["rows"],
+    properties: {
+      rows: {
+        type: "array",
+        minItems: Number(rowCount) || 0,
+        maxItems: Number(rowCount) || 0,
+        items: buildCreatorProfileBatchRowSchema_(dropdownValuesByHeader)
+      }
+    }
+  };
+}
+
+function buildCreatorProfileBatchRowSchema_(dropdownValuesByHeader) {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["row_key"].concat(PROFILE_LLM_FIELDS_),
+    properties: {
+      row_key: { type: "string" },
+      "First Name": { type: "string" },
+      "Last Name": { type: "string" },
+      "Email": { type: "string" },
+      "Influencer Type": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Type"]),
+      "Influencer Vertical": buildCreatorProfileVerticalSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Vertical"]),
+      "Country/Region": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Country/Region"]),
+      "Language": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Language"])
+    }
+  };
+}
+
+function buildCreatorProfileScalarEnumSchema_(options) {
+  const values = uniqueNonEmptyStrings_((options || []).concat([""]));
+  if (values.length <= 1) return { type: "string" };
+  return {
+    type: "string",
+    enum: values
+  };
+}
+
+function buildCreatorProfileVerticalSchema_(options) {
+  const values = uniqueNonEmptyStrings_(options || []);
+  if (values.length === 0) {
+    return {
+      type: "array",
+      items: { type: "string" },
+      minItems: 0,
+      maxItems: 3
+    };
+  }
+
+  return {
+    type: "array",
+    items: {
+      type: "string",
+      enum: values
+    },
+    minItems: 0,
+    maxItems: 3
+  };
 }
 
 function sanitizeCreatorProfileEnrichment_(result, dropdownValuesByHeader) {
@@ -786,39 +2059,80 @@ function sanitizeCreatorProfileEnrichment_(result, dropdownValuesByHeader) {
     out["Last Name"] = lastName;
   }
 
-  PROFILE_LLM_DROPDOWN_FIELDS_.forEach(field => {
-    const value = coerceDropdownValue_(dropdownValuesByHeader[field] || [], result[field]);
-    if (value) out[field] = value;
-  });
+  const email = coerceExplicitEmailValue_(result["Email"]);
+  if (email) out["Email"] = email;
+
+  const influencerType = coerceDropdownValue_(dropdownValuesByHeader["Influencer Type"] || [], result["Influencer Type"]);
+  if (influencerType) out["Influencer Type"] = influencerType;
+
+  const influencerVertical = coerceMultiSelectDropdownValues_(
+    dropdownValuesByHeader["Influencer Vertical"] || [],
+    result["Influencer Vertical"]
+  );
+  if (influencerVertical) out["Influencer Vertical"] = influencerVertical;
+
+  const countryRegion = coerceDropdownValue_(dropdownValuesByHeader["Country/Region"] || [], result["Country/Region"]);
+  if (countryRegion) out["Country/Region"] = countryRegion;
+
+  const language = coerceDropdownValue_(dropdownValuesByHeader["Language"] || [], result["Language"]);
+  if (language) out["Language"] = language;
 
   return out;
 }
 
-function applySanitizedProfileFields_(row, header, fields, sanitized) {
-  let changed = false;
-
+function applySanitizedProfileFields_(row, header, fields, sanitized, changeMap) {
   fields.forEach(field => {
     const value = sanitized[field];
     if (value == null || String(value).trim() === "") return;
 
-    const i = header.indexOf(field);
+    const i = findHeaderIndex_(header, field);
     if (i === -1 || String(row[i] || "").trim()) return;
 
-    row[i] = value;
-    changed = true;
+    setTrackedValue_(row, i, value, changeMap);
   });
-
-  return changed;
 }
 
-function buildCreatorProfileContext_(row, header) {
-  return PROFILE_LLM_CONTEXT_FIELDS_
+function buildCreatorProfileContext_(row, header, youtubeInsight) {
+  const lines = PROFILE_LLM_CONTEXT_FIELDS_
     .map(field => {
       const value = normalizeLlmString_(getValueByHeader_(row, header, field));
       return value ? (field + ": " + value) : "";
     })
-    .filter(Boolean)
-    .join("\n");
+    .filter(Boolean);
+
+  if (youtubeInsight) {
+    if (youtubeInsight.description) lines.push("Resolved YouTube Description: " + youtubeInsight.description);
+    if (youtubeInsight.countryCode) lines.push("Resolved YouTube Country Code: " + youtubeInsight.countryCode);
+    if (youtubeInsight.dominantCategoryName) lines.push("Resolved YouTube Category: " + youtubeInsight.dominantCategoryName);
+    if (youtubeInsight.preferredEmail) lines.push("Preferred Explicit Email: " + youtubeInsight.preferredEmail);
+    if (youtubeInsight.preferredEmailSource) lines.push("Preferred Explicit Email Source: " + youtubeInsight.preferredEmailSource);
+    if (youtubeInsight.bioEmails && youtubeInsight.bioEmails.length > 0) {
+      lines.push("Explicit Emails from YouTube Bio: " + youtubeInsight.bioEmails.join(" | "));
+    }
+    if (youtubeInsight.channelPageEmails && youtubeInsight.channelPageEmails.length > 0) {
+      lines.push("Explicit Emails from Channel Page: " + youtubeInsight.channelPageEmails.join(" | "));
+    }
+    if (youtubeInsight.videoDescriptionEmails && youtubeInsight.videoDescriptionEmails.length > 0) {
+      lines.push("Explicit Emails from Video Descriptions: " + youtubeInsight.videoDescriptionEmails.join(" | "));
+    }
+    if (youtubeInsight.channelPageSnippet) {
+      lines.push("Channel Page Snippet: " + truncateForUi_(youtubeInsight.channelPageSnippet, 400));
+    }
+    if (youtubeInsight.sampledTitles && youtubeInsight.sampledTitles.length > 0) {
+      lines.push("Sampled Video Titles: " + youtubeInsight.sampledTitles.slice(0, 10).join(" | "));
+    }
+    if (youtubeInsight.sampledVideoDescriptions && youtubeInsight.sampledVideoDescriptions.length > 0) {
+      lines.push(
+        "Sampled Video Descriptions: " +
+        youtubeInsight.sampledVideoDescriptions
+          .slice(0, 3)
+          .map(function (description) { return truncateForUi_(description, 280); })
+          .join(" || ")
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
 
 function normalizeLlmString_(value) {
@@ -863,6 +2177,50 @@ function coerceDropdownValue_(allowedValues, value) {
   }
 
   return "";
+}
+
+function coerceMultiSelectDropdownValues_(allowedValues, value) {
+  if (!Array.isArray(allowedValues) || allowedValues.length === 0) return "";
+
+  let rawValues = [];
+  if (Array.isArray(value)) {
+    rawValues = value;
+  } else {
+    const rawText = normalizeLlmString_(value);
+    if (!rawText) return "";
+    rawValues = rawText.split(/[;,|]/);
+  }
+
+  const normalizedValues = [];
+  rawValues.forEach(item => {
+    const coerced = coerceDropdownValue_(allowedValues, item);
+    if (!coerced) return;
+    if (normalizedValues.indexOf(coerced) !== -1) return;
+    if (normalizedValues.length >= 3) return;
+    normalizedValues.push(coerced);
+  });
+
+  return normalizedValues.join(SHEETS_MULTISELECT_DELIMITER_);
+}
+
+function normalizeHubSpotImportCellValue_(headerName, value) {
+  const raw = String(value == null ? "" : value).trim();
+  if (!raw) return "";
+  if (!HUBSPOT_MULTISELECT_FIELDS_.has(String(headerName || "").trim())) return raw;
+
+  return raw
+    .split(/\s*[;,|]\s*/)
+    .filter(Boolean)
+    .join(HUBSPOT_MULTISELECT_DELIMITER_);
+}
+
+function coerceExplicitEmailValue_(value) {
+  const matches = extractExplicitEmailsFromText_(value);
+  if (matches.length > 0) return matches[0];
+
+  const rawValue = normalizeExtractedEmailCandidate_(value);
+  if (!rawValue) return "";
+  return getHubSpotImportEmailValidationIssue_(rawValue) ? "" : rawValue;
 }
 
 function getDropdownMatchVariants_(value) {
@@ -918,6 +2276,15 @@ function getOpenAiModel_() {
   return configured || OPENAI_DEFAULT_MODEL_;
 }
 
+function getCreatorProfileInsightForLlm_(row, header, apiKey, options) {
+  if (!apiKey) return null;
+  const channelUrl = resolveCreatorYouTubeInputFromRow_(row, header);
+  const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  if (!channelUrl && !channelName) return null;
+
+  return getCreatorYouTubeInsight_(channelUrl, channelName, apiKey, options);
+}
+
 
 // ---- HubSpot import ----
 
@@ -949,7 +2316,7 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
 
   const activeHeaders = activeColIndexes.map(i => header[i]);
   const activeRows = rowItems.map(item =>
-    activeColIndexes.map(i => String(item.values[i] != null ? item.values[i] : ""))
+    activeColIndexes.map(i => normalizeHubSpotImportCellValue_(header[i], item.values[i]))
   );
 
   const payload = {
@@ -1108,7 +2475,7 @@ function pushRespondedToNegotiation() {
   }
 
   // Map Creator List columns → Pitching columns, excluding Status and
-  // mapping YouTube Video Median Views → Median Views.
+  // mapping YouTube Average Views / YouTube Video Median Views → Median Views.
   const colMap = buildCrossSheetColumnMap_(
     creatorHeader,
     pitchingHeader,
@@ -1618,6 +2985,7 @@ function extractSpreadsheetId_(value) {
 function buildCrossSheetColumnMap_(sourceHeader, targetHeader, renameMap, skipCols) {
   const map = [];
   const targetMap = new Map();
+  const usedTargetIndexes = new Set();
   for (let i = 0; i < targetHeader.length; i++) {
     const name = targetHeader[i];
     if (name) targetMap.set(name, i);
@@ -1630,8 +2998,9 @@ function buildCrossSheetColumnMap_(sourceHeader, targetHeader, renameMap, skipCo
 
     const targetName = renameMap[sourceName] || sourceName;
     const targetIdx = targetMap.get(targetName);
-    if (targetIdx !== undefined) {
+    if (targetIdx !== undefined && !usedTargetIndexes.has(targetIdx)) {
       map.push({ sourceIdx: i, targetIdx: targetIdx, sourceName: sourceName, targetName: targetName });
+      usedTargetIndexes.add(targetIdx);
     }
   }
 
@@ -1724,7 +3093,7 @@ function findRowSection_(data, rowIdx) {
 
 
 function getValueByHeader_(row, header, columnName) {
-  const idx = header.indexOf(columnName);
+  const idx = findHeaderIndex_(header, columnName);
   return idx === -1 ? "" : row[idx];
 }
 
@@ -1772,6 +3141,7 @@ function isSectionLabelRow_(row) {
   if (!row) return false;
   const first = String(row[0] || "").trim();
   if (!first) return false;
+  if (!isKnownSectionLabel_(first)) return false;
   for (let i = 1; i < row.length; i++) {
     if (String(row[i] || "").trim() !== "") return false;
   }
@@ -1833,12 +3203,72 @@ function getCommonColumnsByHeader_(sourceHeader, targetHeader) {
   return common;
 }
 
-function setIfEmpty_(row, header, columnName, value) {
-  const idx = header.indexOf(columnName);
-  if (idx === -1) return false;
-  if (String(row[idx] || "").trim() !== "") return false;
-  row[idx] = value;
+function setTrackedValue_(row, colIndex, value, changeMap) {
+  if (!Array.isArray(row) || colIndex < 0) return false;
+
+  const nextValue = value == null ? "" : value;
+  const currentValue = row[colIndex];
+  const currentText = String(currentValue == null ? "" : currentValue);
+  const nextText = String(nextValue);
+  if (currentText === nextText) return false;
+
+  row[colIndex] = nextValue;
+
+  if (!changeMap) return true;
+
+  const key = String(colIndex);
+  if (!changeMap[key]) {
+    changeMap[key] = {
+      colIndex: colIndex,
+      oldValue: currentValue,
+      newValue: nextValue
+    };
+  } else {
+    changeMap[key].newValue = nextValue;
+  }
+
+  const originalText = String(changeMap[key].oldValue == null ? "" : changeMap[key].oldValue);
+  if (originalText === nextText) delete changeMap[key];
   return true;
+}
+
+function setTrackedValueByHeader_(row, header, columnName, value, changeMap) {
+  const idx = findHeaderIndex_(header, columnName);
+  if (idx === -1) return false;
+  return setTrackedValue_(row, idx, value, changeMap);
+}
+
+function setIfEmpty_(row, header, columnName, value, changeMap) {
+  const idx = findHeaderIndex_(header, columnName);
+  if (idx === -1) return false;
+
+  const nextValue = value == null ? "" : value;
+  if (String(nextValue).trim() === "") return false;
+  if (String(row[idx] || "").trim() !== "") return false;
+  return setTrackedValue_(row, idx, nextValue, changeMap);
+}
+
+function trackedChangeMapToRowChanges_(changeMap) {
+  if (!changeMap) return [];
+
+  return Object.keys(changeMap)
+    .map(function (key) { return changeMap[key]; })
+    .filter(Boolean)
+    .sort(function (a, b) { return a.colIndex - b.colIndex; });
+}
+
+function trackedRowChangesToSheetUpdates_(item, rowChanges) {
+  if (!item || !item.row1 || !Array.isArray(rowChanges) || rowChanges.length === 0) return [];
+
+  return rowChanges.map(function (change) {
+    return {
+      rowItem: item,
+      row1: item.row1,
+      colIndex: change.colIndex,
+      oldValue: change.oldValue,
+      newValue: change.newValue
+    };
+  });
 }
 
 function getDefaultClientName_(dropdownValuesByHeader) {
@@ -1881,6 +3311,315 @@ function chunkArray_(arr, size) {
     out.push(arr.slice(i, i + size));
   }
   return out;
+}
+
+function writeSparseCellUpdates_(sheet, header, updates, stageLabel) {
+  if (!sheet || !Array.isArray(updates) || updates.length === 0) {
+    return {
+      writtenRowCount: 0,
+      writtenCellCount: 0,
+      skippedCellCount: 0
+    };
+  }
+
+  const deduped = {};
+  updates.forEach(function (update) {
+    if (!update || !update.row1 || update.colIndex == null) return;
+
+    const key = String(update.row1) + ":" + String(update.colIndex);
+    if (!deduped[key]) {
+      deduped[key] = {
+        rowItem: update.rowItem,
+        row1: update.row1,
+        colIndex: update.colIndex,
+        oldValue: update.oldValue,
+        newValue: update.newValue
+      };
+      return;
+    }
+
+    deduped[key].newValue = update.newValue;
+    if (update.rowItem) deduped[key].rowItem = update.rowItem;
+  });
+
+  const groupedByColumn = {};
+  Object.keys(deduped).forEach(function (key) {
+    const update = deduped[key];
+    const normalizedOldValue = String(update.oldValue == null ? "" : update.oldValue);
+    const normalizedNewValue = String(update.newValue == null ? "" : update.newValue);
+    if (normalizedOldValue === normalizedNewValue) return;
+
+    const columnKey = String(update.colIndex);
+    if (!groupedByColumn[columnKey]) groupedByColumn[columnKey] = [];
+    groupedByColumn[columnKey].push(update);
+  });
+
+  const writtenRows = {};
+  let writtenCellCount = 0;
+  let skippedCellCount = 0;
+
+  Object.keys(groupedByColumn)
+    .sort(function (a, b) { return Number(a) - Number(b); })
+    .forEach(function (columnKey) {
+      const columnUpdates = groupedByColumn[columnKey].sort(function (a, b) { return a.row1 - b.row1; });
+      let startIndex = 0;
+
+      while (startIndex < columnUpdates.length) {
+        const block = [columnUpdates[startIndex]];
+        let expectedRow1 = columnUpdates[startIndex].row1 + 1;
+        let cursor = startIndex + 1;
+
+        while (cursor < columnUpdates.length && columnUpdates[cursor].row1 === expectedRow1) {
+          block.push(columnUpdates[cursor]);
+          expectedRow1++;
+          cursor++;
+        }
+
+        const colIndex = block[0].colIndex;
+        const columnName = Array.isArray(header) ? String(header[colIndex] || "") : "";
+
+        try {
+          sheet
+            .getRange(block[0].row1, colIndex + 1, block.length, 1)
+            .setValues(block.map(function (update) { return [update.newValue]; }));
+
+          block.forEach(function (update) {
+            writtenRows[update.row1] = true;
+            writtenCellCount++;
+          });
+        } catch (e) {
+          Logger.log(
+            "⚠️ " + String(stageLabel || "Enrichment") +
+            " block write failed for column " +
+            buildSheetColumnLabel_(colIndex) +
+            (columnName ? (" (" + columnName + ")") : "") +
+            " rows " + block[0].row1 + "-" + block[block.length - 1].row1 +
+            ". Retrying per cell. " + e
+          );
+
+          block.forEach(function (update) {
+            try {
+              sheet.getRange(update.row1, update.colIndex + 1).setValue(update.newValue);
+              writtenRows[update.row1] = true;
+              writtenCellCount++;
+            } catch (cellError) {
+              if (update.rowItem && Array.isArray(update.rowItem.values)) {
+                update.rowItem.values[update.colIndex] = update.oldValue;
+              }
+              skippedCellCount++;
+              Logger.log(
+                "⚠️ " + String(stageLabel || "Enrichment") +
+                " skipped " + buildSheetColumnLabel_(update.colIndex) + update.row1 +
+                (columnName ? (" (" + columnName + ")") : "") +
+                " value \"" + truncateForUi_(String(update.newValue == null ? "" : update.newValue), 120) +
+                "\": " + cellError
+              );
+            }
+          });
+        }
+
+        startIndex = cursor;
+      }
+    });
+
+  return {
+    writtenRowCount: Object.keys(writtenRows).length,
+    writtenCellCount: writtenCellCount,
+    skippedCellCount: skippedCellCount
+  };
+}
+
+function buildSheetColumnLabel_(colIndex) {
+  let number = Number(colIndex) + 1;
+  if (!isFinite(number) || number < 1) return "?";
+
+  let out = "";
+  while (number > 0) {
+    const remainder = (number - 1) % 26;
+    out = String.fromCharCode(65 + remainder) + out;
+    number = Math.floor((number - 1) / 26);
+  }
+  return out;
+}
+
+function getCreatorListSheetContext_(sheet) {
+  if (!sheet) return null;
+
+  const data = sheet.getDataRange().getValues();
+  if (!data || data.length < 2) return null;
+
+  const headerRow0 = detectHeaderRow0ForColumns_(
+    data,
+    [
+      "Channel Name",
+      "Channel URL",
+      "Campaign Name",
+      "Email",
+      "Status",
+      "First Name",
+      "Last Name",
+      "Influencer Type",
+      "Influencer Vertical"
+    ],
+    10
+  );
+
+  if (headerRow0 === -1) return null;
+
+  const header = (data[headerRow0] || []).map(v => String(v || "").trim());
+  const archivedStart0 = findSectionRowByLabel_(data, "Archived");
+
+  return {
+    data: data,
+    header: header,
+    headerRow0: headerRow0,
+    headerRow1: headerRow0 + 1,
+    archivedStart0: archivedStart0
+  };
+}
+
+function detectHeaderRow0ForColumns_(data, expectedColumns, maxScanRows) {
+  const scanRows = Math.min(Number(maxScanRows) || 10, data.length);
+  let bestRow0 = -1;
+  let bestScore = -1;
+
+  for (let row0 = 0; row0 < scanRows; row0++) {
+    const header = (data[row0] || []).map(v => String(v || "").trim());
+    let score = 0;
+
+    (expectedColumns || []).forEach(columnName => {
+      if (findHeaderIndex_(header, columnName) !== -1) score++;
+    });
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRow0 = row0;
+    }
+  }
+
+  return bestScore > 0 ? bestRow0 : -1;
+}
+
+function resolveCreatorYouTubeInputFromRow_(row, header) {
+  const candidateFields = ["Channel URL", "YouTube URL", "YouTube Handle", "Channel Name"];
+
+  for (let i = 0; i < candidateFields.length; i++) {
+    const value = String(getValueByHeader_(row, header, candidateFields[i]) || "").trim();
+    if (!looksLikeYouTubeInput_(value)) continue;
+
+    if (value.charAt(0) === "@") {
+      return "https://www.youtube.com/" + value;
+    }
+    return value;
+  }
+
+  return "";
+}
+
+function looksLikeYouTubeInput_(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return false;
+  if (text.charAt(0) === "@") return true;
+  return /youtube\.com|youtu\.be/.test(text);
+}
+
+function findHeaderIndex_(header, columnName) {
+  const target = String(columnName || "").trim();
+  if (!Array.isArray(header) || !target) return -1;
+
+  const exactIdx = header.indexOf(target);
+  if (exactIdx !== -1) return exactIdx;
+
+  const normalizedTarget = normalizeHeaderName_(target);
+  for (let i = 0; i < header.length; i++) {
+    if (normalizeHeaderName_(header[i]) === normalizedTarget) return i;
+  }
+
+  return -1;
+}
+
+function normalizeHeaderName_(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function showSpreadsheetToast_(message) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) ss.toast(String(message || ""), "Scripts", 8);
+  } catch (e) {
+    // Ignore UI/toast errors when run outside the spreadsheet UI.
+  }
+}
+
+function showSpreadsheetAlert_(message) {
+  try {
+    SpreadsheetApp.getUi().alert(String(message || ""));
+  } catch (e) {
+    // Ignore UI/alert errors when run outside the spreadsheet UI.
+  }
+}
+
+function truncateForUi_(value, maxLength) {
+  const text = String(value == null ? "" : value);
+  const limit = Math.max(Number(maxLength) || 0, 0);
+  if (!limit || text.length <= limit) return text;
+  return text.slice(0, Math.max(limit - 3, 0)) + "...";
+}
+
+function getProfileDropdownOptionsByHeader_(sheet, header, dropdownValuesByHeader) {
+  const out = {};
+  PROFILE_LLM_DROPDOWN_FIELDS_.forEach(field => {
+    const explicitValues = Array.isArray(dropdownValuesByHeader[field]) ? dropdownValuesByHeader[field] : [];
+    if (explicitValues.length > 0) {
+      out[field] = explicitValues;
+      return;
+    }
+
+    out[field] = getDropdownOptionsByHeader_(sheet, header, field, 2);
+  });
+  return out;
+}
+
+function getDropdownOptionsByHeader_(sheet, header, columnName, templateRow1) {
+  const col0 = findHeaderIndex_(header, String(columnName || "").trim());
+  if (col0 === -1) return [];
+
+  const preferredRows = [templateRow1, 2, 3, 4, 5]
+    .filter((row1, index, arr) => row1 >= 1 && arr.indexOf(row1) === index);
+
+  for (let i = 0; i < preferredRows.length; i++) {
+    const options = extractValidationOptions_(sheet.getRange(preferredRows[i], col0 + 1).getDataValidation());
+    if (options.length > 0) return options;
+  }
+
+  const scanLimit = Math.min(sheet.getLastRow(), 200);
+  for (let row1 = 2; row1 <= scanLimit; row1++) {
+    const options = extractValidationOptions_(sheet.getRange(row1, col0 + 1).getDataValidation());
+    if (options.length > 0) return options;
+  }
+
+  return [];
+}
+
+function extractValidationOptions_(rule) {
+  if (!rule) return [];
+
+  const criteriaType = rule.getCriteriaType();
+  const args = rule.getCriteriaValues() || [];
+
+  if (criteriaType === SpreadsheetApp.DataValidationCriteria.VALUE_IN_LIST) {
+    return uniqueNonEmptyStrings_(args[0] || []);
+  }
+
+  if (criteriaType === SpreadsheetApp.DataValidationCriteria.VALUE_IN_RANGE) {
+    const range = args[0];
+    if (!range) return [];
+    return uniqueNonEmptyStrings_(flatten2d_(range.getDisplayValues()));
+  }
+
+  return [];
 }
 
 
@@ -2232,6 +3971,80 @@ function resetYouTubeKeyValidationCache_() {
   Logger.log("✅ YouTube API key validation cache reset.");
 }
 
+function getEnglishYouTubeCategoryName_(id) {
+  const map = {
+    1: "Film & Animation",
+    2: "Autos & Vehicles",
+    10: "Music",
+    15: "Pets & Animals",
+    17: "Sports",
+    19: "Travel & Events",
+    20: "Gaming",
+    22: "People & Blogs",
+    23: "Comedy",
+    24: "Entertainment",
+    25: "News & Politics",
+    26: "Howto & Style",
+    27: "Education",
+    28: "Science & Technology"
+  };
+  return map[id] || String(id || "");
+}
+
+function getJsonFromScriptCache_(key) {
+  const raw = CacheService.getScriptCache().get(String(key || ""));
+  if (!raw) return null;
+
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function putJsonInScriptCache_(key, value, ttlSeconds) {
+  CacheService.getScriptCache().put(
+    String(key || ""),
+    JSON.stringify(value),
+    Number(ttlSeconds) || CREATOR_YOUTUBE_SIGNAL_TTL_SECONDS_
+  );
+}
+
+function modeStringArray_(values) {
+  const counts = {};
+  (values || []).forEach(value => {
+    const key = String(value || "").trim();
+    if (!key) return;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+
+  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || "";
+}
+
+function flatten2d_(matrix) {
+  const out = [];
+  (matrix || []).forEach(row => {
+    (row || []).forEach(value => {
+      out.push(value);
+    });
+  });
+  return out;
+}
+
+function uniqueNonEmptyStrings_(values) {
+  const out = [];
+  const seen = {};
+
+  (values || []).forEach(value => {
+    const text = String(value || "").trim();
+    if (!text || seen[text]) return;
+    seen[text] = true;
+    out.push(text);
+  });
+
+  return out;
+}
+
 
 // ============================================================
 //  EMAIL VALIDATION (for HubSpot import)
@@ -2288,6 +4101,36 @@ function getHubSpotImportEmailValidationIssue_(value) {
 // ============================================================
 //  HUBSPOT SHARED LIBRARY CHECK
 // ============================================================
+
+function extractOpenAiTextFromResponses_(data) {
+  if (data && data.output_text) return String(data.output_text || "");
+
+  if (data && Array.isArray(data.output)) {
+    const parts = [];
+    data.output.forEach(item => {
+      const content = item && Array.isArray(item.content) ? item.content : [];
+      content.forEach(chunk => {
+        if (chunk && chunk.type === "output_text" && chunk.text) {
+          parts.push(String(chunk.text));
+        }
+      });
+    });
+    if (parts.length > 0) return parts.join("\n");
+  }
+
+  return "";
+}
+
+function stripJsonFences_(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return raw;
+
+  return raw
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+}
 
 function hasHubSpotSharedImporterLibrary_() {
   return (
