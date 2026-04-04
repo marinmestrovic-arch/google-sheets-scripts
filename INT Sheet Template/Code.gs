@@ -22,6 +22,15 @@ const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
   "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
 const HUBSPOT_SHARED_IMPORT_ACTION_ = "startImport";
 const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
+const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
+const HUBSPOT_API_TOKEN_PROPS_ = [
+  "HUBSPOT_ACCESS_TOKEN",
+  "HUBSPOT_PRIVATE_APP_TOKEN",
+  "HUBSPOT_API_KEY"
+];
+const HUBSPOT_DEALS_OBJECT_TYPE_ID_ = "0-3";
+const HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_ = "Pitching Status";
+const HUBSPOT_BATCH_UPDATE_SIZE_ = 100;
 
 const OPENAI_API_KEY_PROP_ = "OPENAI_API_KEY";
 const OPENAI_MODEL_PROP_ = "OPENAI_MODEL";
@@ -37,8 +46,6 @@ const CREATOR_YOUTUBE_SIGNAL_SAMPLE_SIZE_ = 12;
 const CREATOR_YOUTUBE_SIGNAL_MIN_LONGFORM_SECONDS_ = 60;
 const CREATOR_YOUTUBE_DESCRIPTION_SAMPLE_SIZE_ = 6;
 const SHEETS_MULTISELECT_DELIMITER_ = ", ";
-const HUBSPOT_MULTISELECT_DELIMITER_ = ";";
-const HUBSPOT_MULTISELECT_FIELDS_ = new Set(["Influencer Vertical"]);
 
 // YouTube API
 const YT_KEY_PROP_ = "YOUTUBE_API_KEY";
@@ -163,7 +170,7 @@ function onOpen() {
     .addItem("Diagnose selected Creator row", "diagnoseSelectedCreatorListRow")
     .addItem("Reset Creator List enrichment", "resetCreatorListEnrichmentProgress")
     .addSeparator()
-    .addItem("Enrich & Import to HubSpot", "enrichAndImportToHubSpot")
+    .addItem("Import to HubSpot", "importCreatorListToHubSpotOnly")
     .addSeparator()
     .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
     .addSeparator()
@@ -195,55 +202,43 @@ function enrichCreatorListRowsInBatches() {
     return Logger.log("ℹ️ Creator List has no data.");
   }
 
-  const data = context.data;
-  const header = context.header;
-  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
   const props = PropertiesService.getScriptProperties();
-  const startRow1 = Math.max(
-    Number(props.getProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_) || (context.headerRow1 + 1)),
-    context.headerRow1 + 1
-  );
+  props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+  const header = context.header;
+  const stopRow1 = context.archivedStart0 === -1 ? context.data.length : context.archivedStart0;
+  let nextStartRow1 = context.headerRow1 + 1;
+  let totalRows = 0;
+  let totalStatic = 0;
+  let totalYoutube = 0;
+  let totalProfile = 0;
 
-  const rowItems = [];
-  let lastScannedRow1 = startRow1 - 1;
+  while (nextStartRow1 <= stopRow1) {
+    const batch = collectCreatorListEnrichmentBatch_(context.data, header, nextStartRow1, stopRow1);
+    const rowItems = batch.rowItems;
+    if (rowItems.length === 0) break;
 
-  for (let row1 = startRow1; row1 <= stopRow1; row1++) {
-    lastScannedRow1 = row1;
-    const row = data[row1 - 1];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
-
-    rowItems.push({ row1: row1, values: row.slice() });
-    if (rowItems.length >= CREATOR_LIST_ENRICH_BATCH_SIZE_) break;
+    props.setProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_, String(batch.nextStartRow1));
+    const result = runCreatorListEnrichment_(sheet, rowItems, header);
+    totalRows += rowItems.length;
+    totalStatic += result.staticEnriched;
+    totalYoutube += result.youtubeEnriched;
+    totalProfile += result.profileEnriched;
+    nextStartRow1 = batch.nextStartRow1;
   }
 
-  if (rowItems.length === 0) {
-    props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+  props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
+  if (totalRows === 0) {
     showSpreadsheetToast_("Creator List enrichment complete. No remaining rows to process.");
     return Logger.log("✅ Creator List enrichment complete. No remaining rows to process.");
   }
 
-  const result = runCreatorListEnrichment_(sheet, rowItems, header);
-  if (lastScannedRow1 < stopRow1) {
-    props.setProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_, String(lastScannedRow1 + 1));
-    showSpreadsheetToast_(
-      `Batch done. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
-      `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
-    );
-    return Logger.log(
-      `✅ Creator List enrichment batch complete. Rows scanned through ${lastScannedRow1}. ` +
-      `Static: ${result.staticEnriched}, YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
-    );
-  }
-
-  props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
   showSpreadsheetToast_(
-    `Enrichment complete. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
-    `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
+    `Enrichment complete. Rows: ${totalRows}. Static: ${totalStatic}. ` +
+    `YouTube: ${totalYoutube}. AI: ${totalProfile}.`
   );
   Logger.log(
-    `✅ Creator List enrichment complete. Static: ${result.staticEnriched}, ` +
-    `YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
+    `✅ Creator List enrichment complete. Rows: ${totalRows}. Static: ${totalStatic}, ` +
+    `YouTube: ${totalYoutube}, AI: ${totalProfile}.`
   );
 }
 
@@ -601,12 +596,32 @@ function canAttemptCreatorListEnrichment_(row, header) {
   return candidateFields.some(field => String(getValueByHeader_(row, header, field) || "").trim());
 }
 
+function collectCreatorListEnrichmentBatch_(data, header, startRow1, stopRow1) {
+  const rowItems = [];
+  let lastScannedRow1 = Math.max(Number(startRow1) || 1, 1) - 1;
+
+  for (let row1 = Math.max(Number(startRow1) || 1, 1); row1 <= stopRow1; row1++) {
+    lastScannedRow1 = row1;
+    const row = data[row1 - 1];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
+
+    rowItems.push({ row1: row1, values: row.slice() });
+    if (rowItems.length >= CREATOR_LIST_ENRICH_BATCH_SIZE_) break;
+  }
+
+  return {
+    rowItems: rowItems,
+    nextStartRow1: lastScannedRow1 + 1
+  };
+}
+
 
 // ============================================================
-//  (1) CREATOR LIST → HUBSPOT (+ ENRICHMENT)
+//  (1) CREATOR LIST → HUBSPOT
 // ============================================================
 
-function enrichAndImportToHubSpot() {
+function importCreatorListToHubSpotOnly() {
   const ui = SpreadsheetApp.getUi();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Creator List");
@@ -617,9 +632,6 @@ function enrichAndImportToHubSpot() {
 
   const data = context.data;
   const header = context.header;
-  const numCols = header.length;
-  const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
-  const defaultClientName = getDefaultClientName_(dropdownValuesByHeader);
 
   const contactingStart0 = findSectionRowByLabel_(data, "Contacting");
   const archivedStart0 = findSectionRowByLabel_(data, "Archived");
@@ -641,32 +653,11 @@ function enrichAndImportToHubSpot() {
 
   if (rowItems.length === 0) return ui.alert("ℹ️ No rows with emails in Contacting section.");
 
-  // Stage 1: Static enrichment (in memory)
-  const staticUpdates = [];
-  for (const item of rowItems) {
-    const rowChanges = enrichCreatorRow_(item.values, header, defaultClientName);
-    if (rowChanges.length === 0) continue;
-    staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
-  }
+  importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui);
+}
 
-  // Batch write enriched data back
-  const staticWrite = writeSparseCellUpdates_(sheet, header, staticUpdates, "Static enrichment");
-  Logger.log(`✅ Static enrichment done for ${staticWrite.writtenRowCount} row(s).`);
-
-  // Stage 2: YouTube API enrichment
-  enrichYouTubeDataForRows_(sheet, rowItems, header);
-
-  // Stage 3: LLM enrichment (optional, requires OPENAI_API_KEY script property)
-  enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
-  SpreadsheetApp.flush();
-
-  // Stage 4: Re-read enriched data and import to HubSpot
-  const freshData = sheet.getDataRange().getValues();
-  const freshRowItems = rowItems.map(item => ({
-    row1: item.row1,
-    values: freshData[item.row1 - 1]
-  }));
-  importCreatorListToHubSpot_(ss, sheet, header, freshRowItems, ui);
+function enrichAndImportToHubSpot() {
+  importCreatorListToHubSpotOnly();
 }
 
 
@@ -697,7 +688,7 @@ function enrichCreatorRow_(row, header, defaultClientName) {
 
   // Deal name: Channel Name - Campaign Name
   if (channelName && campaignName) {
-    setIfEmpty("Deal name", channelName + " - " + campaignName);
+    set("Deal name", channelName + " - " + campaignName);
   }
 
   // Pipeline: always Sales Pipeline
@@ -740,11 +731,7 @@ function enrichYouTubeDataForRows_(sheet, rowItems, header) {
 
   const updates = [];
   for (const item of rowItems) {
-    const needsYoutubeFields = YOUTUBE_ENRICH_FIELDS_.some(field => {
-      const fieldIdx = findHeaderIndex_(header, field);
-      return fieldIdx !== -1 && !String(item.values[fieldIdx] || "").trim();
-    });
-    if (!needsYoutubeFields) continue;
+    if (!shouldRunYouTubeEnrichmentForRow_(item.values, header)) continue;
 
     try {
       const result = enrichSingleYouTubeRow_(item, header, apiKey);
@@ -757,6 +744,24 @@ function enrichYouTubeDataForRows_(sheet, rowItems, header) {
   const writeResult = writeSparseCellUpdates_(sheet, header, updates, "YouTube enrichment");
   Logger.log(`✅ YouTube enrichment: filled ${writeResult.writtenRowCount} row(s).`);
   return writeResult.writtenRowCount;
+}
+
+function shouldRunYouTubeEnrichmentForRow_(row, header) {
+  const needsYoutubeFields = YOUTUBE_ENRICH_FIELDS_.some(field => {
+    const fieldIdx = findHeaderIndex_(header, field);
+    return fieldIdx !== -1 && !String(row[fieldIdx] || "").trim();
+  });
+  if (needsYoutubeFields) return true;
+
+  const youtubeHandle = String(getValueByHeader_(row, header, "YouTube Handle") || "").trim();
+  const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  if (youtubeHandle && youtubeHandle !== channelName) return true;
+
+  const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
+  const dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
+  if (youtubeHandle && campaignName && dealName !== (youtubeHandle + " - " + campaignName)) return true;
+
+  return false;
 }
 
 
@@ -778,6 +783,7 @@ function enrichSingleYouTubeRow_(item, header, apiKey) {
     setIfEmpty_(row, header, "YouTube Followers", insight.subscribers, changeMap);
   }
   if (insight.handle) setIfEmpty_(row, header, "YouTube Handle", insight.handle, changeMap);
+  if (insight.handle) setTrackedValueByHeader_(row, header, "Channel Name", insight.handle, changeMap);
   if (insight.canonicalUrl) setIfEmpty_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
 
   if (insight.medianVideoViews != null) {
@@ -789,6 +795,12 @@ function enrichSingleYouTubeRow_(item, header, apiKey) {
   }
   if (insight.medianVideoEngagementRate != null) {
     setIfEmpty_(row, header, "YouTube Engagement Rate", insight.medianVideoEngagementRate, changeMap);
+  }
+
+  const finalChannelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
+  if (finalChannelName && campaignName) {
+    setTrackedValueByHeader_(row, header, "Deal name", finalChannelName + " - " + campaignName, changeMap);
   }
 
   return {
@@ -2203,17 +2215,6 @@ function coerceMultiSelectDropdownValues_(allowedValues, value) {
   return normalizedValues.join(SHEETS_MULTISELECT_DELIMITER_);
 }
 
-function normalizeHubSpotImportCellValue_(headerName, value) {
-  const raw = String(value == null ? "" : value).trim();
-  if (!raw) return "";
-  if (!HUBSPOT_MULTISELECT_FIELDS_.has(String(headerName || "").trim())) return raw;
-
-  return raw
-    .split(/\s*[;,|]\s*/)
-    .filter(Boolean)
-    .join(HUBSPOT_MULTISELECT_DELIMITER_);
-}
-
 function coerceExplicitEmailValue_(value) {
   const matches = extractExplicitEmailsFromText_(value);
   if (matches.length > 0) return matches[0];
@@ -2316,7 +2317,7 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
 
   const activeHeaders = activeColIndexes.map(i => header[i]);
   const activeRows = rowItems.map(item =>
-    activeColIndexes.map(i => normalizeHubSpotImportCellValue_(header[i], item.values[i]))
+    activeColIndexes.map(i => String(item.values[i] != null ? item.values[i] : ""))
   );
 
   const payload = {
@@ -2426,6 +2427,203 @@ function buildImportSuccessMessage_(rowCount, importId, state, savedRecordIds) {
     "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
     suffix
   );
+}
+
+function syncPitchingStatusesToHubSpot_(items) {
+  const prepared = prepareHubSpotPitchingStatusUpdates_(items);
+  if (prepared.updates.length === 0) {
+    Logger.log(
+      `ℹ️ HubSpot Pitching Status sync skipped. Missing record ID: ${prepared.missingRecordIdCount}, ` +
+      `missing status: ${prepared.missingStatusCount}.`
+    );
+    return {
+      attempted: 0,
+      updated: 0,
+      failed: 0,
+      skipped: prepared.skippedCount
+    };
+  }
+
+  const token = getHubSpotApiToken_();
+  if (!token) {
+    Logger.log("ℹ️ HubSpot token not set in this project. Skipping Pitching Status sync.");
+    return {
+      attempted: prepared.updates.length,
+      updated: 0,
+      failed: 0,
+      skipped: prepared.skippedCount
+    };
+  }
+
+  try {
+    const propertyName = resolveHubSpotDealPropertyName_(token, HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_);
+    if (!propertyName) {
+      throw new Error(`Deal property not found: ${HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_}`);
+    }
+
+    let updated = 0;
+    let failed = 0;
+    const chunks = chunkArray_(prepared.updates, HUBSPOT_BATCH_UPDATE_SIZE_);
+
+    chunks.forEach(chunk => {
+      try {
+        updateHubSpotDealPropertyBatch_(token, propertyName, chunk);
+        updated += chunk.length;
+      } catch (batchError) {
+        Logger.log("⚠️ HubSpot Pitching Status batch update failed. Retrying per deal. " + batchError);
+        chunk.forEach(item => {
+          try {
+            updateHubSpotDealPropertySingle_(token, propertyName, item);
+            updated++;
+          } catch (singleError) {
+            failed++;
+            Logger.log(
+              `⚠️ HubSpot Pitching Status sync failed for deal ${item.recordId} ` +
+              `(row ${item.row1}): ${singleError}`
+            );
+          }
+        });
+      }
+    });
+
+    Logger.log(
+      `✅ HubSpot Pitching Status synced for ${updated} deal(s). ` +
+      `Skipped ${prepared.skippedCount}. Failed ${failed}.`
+    );
+    return {
+      attempted: prepared.updates.length,
+      updated: updated,
+      failed: failed,
+      skipped: prepared.skippedCount
+    };
+  } catch (e) {
+    Logger.log("⚠️ HubSpot Pitching Status sync failed: " + (e && e.stack ? e.stack : e));
+    return {
+      attempted: prepared.updates.length,
+      updated: 0,
+      failed: prepared.updates.length,
+      skipped: prepared.skippedCount
+    };
+  }
+}
+
+function prepareHubSpotPitchingStatusUpdates_(items) {
+  const deduped = {};
+  let missingRecordIdCount = 0;
+  let missingStatusCount = 0;
+
+  (items || []).forEach(item => {
+    const recordId = String(item && item.recordId || "").trim();
+    const status = String(item && item.status || "").trim();
+    if (!recordId) {
+      missingRecordIdCount++;
+      return;
+    }
+    if (!status) {
+      missingStatusCount++;
+      return;
+    }
+
+    deduped[recordId] = {
+      row1: Number(item && item.row1) || 0,
+      recordId: recordId,
+      status: status
+    };
+  });
+
+  return {
+    updates: Object.keys(deduped).map(key => deduped[key]),
+    missingRecordIdCount: missingRecordIdCount,
+    missingStatusCount: missingStatusCount,
+    skippedCount: missingRecordIdCount + missingStatusCount
+  };
+}
+
+function getHubSpotApiToken_() {
+  const props = PropertiesService.getScriptProperties();
+  for (let i = 0; i < HUBSPOT_API_TOKEN_PROPS_.length; i++) {
+    const value = String(props.getProperty(HUBSPOT_API_TOKEN_PROPS_[i]) || "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function resolveHubSpotDealPropertyName_(token, propertyLabelOrName) {
+  const target = normalizeHeaderName_(propertyLabelOrName);
+  if (!target) return "";
+
+  const data = hubspotRequestJson_(
+    HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(HUBSPOT_DEALS_OBJECT_TYPE_ID_),
+    token
+  );
+  const properties = Array.isArray(data && data.results) ? data.results : [];
+
+  for (let i = 0; i < properties.length; i++) {
+    const property = properties[i] || {};
+    if (normalizeHeaderName_(property.name) === target) return String(property.name || "").trim();
+    if (normalizeHeaderName_(property.label) === target) return String(property.name || "").trim();
+  }
+
+  return "";
+}
+
+function updateHubSpotDealPropertyBatch_(token, propertyName, items) {
+  return hubspotRequestJson_(
+    HUBSPOT_API_BASE_ + "/crm/v3/objects/deals/batch/update",
+    token,
+    {
+      method: "post",
+      payload: JSON.stringify({
+        inputs: (items || []).map(item => ({
+          id: item.recordId,
+          properties: { [propertyName]: item.status }
+        }))
+      })
+    }
+  );
+}
+
+function updateHubSpotDealPropertySingle_(token, propertyName, item) {
+  return hubspotRequestJson_(
+    HUBSPOT_API_BASE_ + "/crm/v3/objects/deals/" + encodeURIComponent(item.recordId),
+    token,
+    {
+      method: "patch",
+      payload: JSON.stringify({
+        properties: { [propertyName]: item.status }
+      })
+    }
+  );
+}
+
+function hubspotRequestJson_(url, token, options) {
+  const response = UrlFetchApp.fetch(
+    String(url || ""),
+    Object.assign(
+      {
+        method: "get",
+        muteHttpExceptions: true,
+        headers: {
+          Authorization: "Bearer " + String(token || ""),
+          "Content-Type": "application/json"
+        }
+      },
+      options || {}
+    )
+  );
+
+  const code = response.getResponseCode();
+  const text = String(response.getContentText() || "");
+  if (code >= 400) {
+    throw new Error("HubSpot API error " + code + ": " + text.slice(0, 1000));
+  }
+  if (!text) return {};
+
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error("HubSpot API parse error: " + e);
+  }
 }
 
 
@@ -2719,6 +2917,9 @@ function updatePitchingFromExt() {
 
   // Column mapping: EXT → INT, excluding the negotiation rate block and CPM.
   const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, EXT_TO_INT_PITCHING_MAP_, EXT_ONLY_PITCHING_COLS_);
+  const hubSpotRecordIdIdx = findHeaderIndex_(intHeader, "HubSpot Record ID");
+  const statusIdx = findHeaderIndex_(intHeader, "Status");
+  const hubSpotPitchingStatusItems = [];
 
   let updated = 0;
   for (let r = 1; r < extData.length; r++) {
@@ -2745,12 +2946,24 @@ function updatePitchingFromExt() {
       }
     }
 
+    if (hubSpotRecordIdIdx !== -1 && statusIdx !== -1) {
+      hubSpotPitchingStatusItems.push({
+        row1: intRowIdx + 1,
+        recordId: String(intRow[hubSpotRecordIdIdx] || "").trim(),
+        status: String(intRow[statusIdx] || "").trim()
+      });
+    }
+
     if (writeChangedRowCells_(intPitching, intRowIdx + 1, intHeader, intRow, changedIndexes, INT_PITCHING_FORMULA_COLS_)) {
       updated++;
     }
   }
 
   Logger.log(`✅ Updated ${updated} row(s) in INT Pitching from EXT.`);
+  if (hubSpotRecordIdIdx === -1 || statusIdx === -1) {
+    return Logger.log("ℹ️ HubSpot Pitching Status sync skipped. Missing 'HubSpot Record ID' or 'Status' column in Pitching.");
+  }
+  syncPitchingStatusesToHubSpot_(hubSpotPitchingStatusItems);
 }
 
 
