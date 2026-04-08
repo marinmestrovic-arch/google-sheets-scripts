@@ -39,7 +39,7 @@ function pushConfirmedCreatorsToCampaigns() {
   const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
   const token = getHubSpotToken_();
   if (!token) {
-    return Logger.log("❌ Missing HubSpot token. Set Script Property: HUBSPOT_PRIVATE_APP_TOKEN");
+    return Logger.log("❌ Missing HubSpot token. Set HUBSPOT_PRIVATE_APP_TOKEN_");
   }
 
   let activationsInfo;
@@ -551,7 +551,7 @@ function buildPitchCompositeKey_(row, pitchHeader) {
 }
 
 
-const YT_KEY_PROP_ = "YOUTUBE_API_KEY";
+const YOUTUBE_API_KEY_ = "api key here";
 const YT_AVG_CACHE_PREFIX_ = "AVG_VIEWS::";
 const YT_KEY_VALID_CACHE_PREFIX_ = "YT_API_KEY_VALID::";
 const YT_CACHE_TTL_SECONDS_ = 21600;
@@ -579,7 +579,7 @@ function computeMedianViewsForChannel_(channelUrl) {
 
   const apiKey = getYouTubeApiKey_();
   if (!apiKey) {
-    Logger.log("❌ Missing YouTube API key. Set Script Property: YOUTUBE_API_KEY");
+    Logger.log("❌ Missing YouTube API key. Set YOUTUBE_API_KEY_");
     return null;
   }
   if (!validateYouTubeApiKey_(apiKey)) return null;
@@ -612,8 +612,7 @@ function normalizeChannelUrl_(url) {
 }
 
 function getYouTubeApiKey_() {
-  const value = PropertiesService.getScriptProperties().getProperty(YT_KEY_PROP_);
-  return String(value || "").trim();
+  return String(YOUTUBE_API_KEY_ || "").trim();
 }
 
 function validateYouTubeApiKey_(apiKey) {
@@ -904,7 +903,7 @@ function isInvalidApiKeyResponse_(text) {
 function markApiKeyInvalid_() {
   YT_API_KEY_INVALID_ = true;
   if (!YT_API_KEY_INVALID_LOGGED_) {
-    Logger.log("❌ YouTube API key invalid. Update Script Property YOUTUBE_API_KEY and rerun.");
+    Logger.log("❌ YouTube API key invalid. Update YOUTUBE_API_KEY_ and rerun.");
     YT_API_KEY_INVALID_LOGGED_ = true;
   }
 }
@@ -947,7 +946,7 @@ function iso8601DurationToSeconds_(duration) {
  * HUBSPOT -> PITCHING IMPORT
  ***************************************/
 
-const HUBSPOT_TOKEN_PROP_ = "HUBSPOT_PRIVATE_APP_TOKEN";
+const HUBSPOT_PRIVATE_APP_TOKEN_ = "api key here";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
 
 // Internal name of the Activations custom object type in HubSpot.
@@ -1286,9 +1285,7 @@ function fetchHubSpotActivationsByIds_(activationIds, activationsObjectTypeId, t
 
 
 function getHubSpotToken_() {
-  return String(
-    PropertiesService.getScriptProperties().getProperty(HUBSPOT_TOKEN_PROP_) || ""
-  ).trim();
+  return String(HUBSPOT_PRIVATE_APP_TOKEN_ || "").trim();
 }
 
 function hubspotHeaders_(token) {

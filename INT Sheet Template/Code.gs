@@ -23,13 +23,10 @@ const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
 const HUBSPOT_SHARED_IMPORT_ACTION_ = "startImport";
 const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
-const HUBSPOT_API_TOKEN_PROPS_ = [
-  "HUBSPOT_ACCESS_TOKEN",
-  "HUBSPOT_PRIVATE_APP_TOKEN",
-  "HUBSPOT_API_KEY"
-];
+const HUBSPOT_API_KEY_ = "api key here";
 const HUBSPOT_DEALS_OBJECT_TYPE_ID_ = "0-3";
 const HUBSPOT_DEALS_OBJECT_API_NAME_ = "deals";
+const HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_ = "Deal Stage";
 const HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_ = "Pitching Status";
 const HUBSPOT_BATCH_UPDATE_SIZE_ = 100;
 const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
@@ -103,7 +100,7 @@ const HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_ = [
   }
 ];
 
-const OPENAI_API_KEY_PROP_ = "OPENAI_API_KEY";
+const OPENAI_API_KEY_ = "api key here";
 const OPENAI_MODEL_PROP_ = "OPENAI_MODEL";
 const OPENAI_DEFAULT_MODEL_ = "gpt-5-nano";
 const OPENAI_CREATOR_PROFILE_BATCH_SIZE_ = 5;
@@ -119,7 +116,7 @@ const CREATOR_YOUTUBE_DESCRIPTION_SAMPLE_SIZE_ = 6;
 const SHEETS_MULTISELECT_DELIMITER_ = ", ";
 
 // YouTube API
-const YT_KEY_PROP_ = "YOUTUBE_API_KEY";
+const YOUTUBE_API_KEY_ = "api key here";
 const YT_AVG_CACHE_PREFIX_ = "AVG_VIEWS::";
 const YT_KEY_VALID_CACHE_PREFIX_ = "YT_API_KEY_VALID::";
 const YT_CACHE_TTL_SECONDS_ = 21600;
@@ -159,7 +156,19 @@ const INT_PITCHING_FORMULA_COLS_ = new Set(["INT CPM", "EXT CPM"]);
 const INT_PERFORMANCE_FORMULA_COLS_ = new Set(["CPM"]);
 const PITCHING_NEGOTIATION_BLOCK_WIDTH_ = 5;
 const CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_ = new Set(["Status"]);
-const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set(["Channel Name", "HubSpot Record ID", "Channel URL", "Status"]);
+const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set([
+  "Channel Name",
+  "HubSpot Record ID",
+  "Channel URL",
+  "Status",
+  "Activation Type",
+  "Activation name",
+  "Activation Name"
+]);
+const CREATOR_LIST_HUBSPOT_STAGE_TO_STATUS_ = {
+  contacted: "Contacted",
+  responded: "Responded"
+};
 const YOUTUBE_ENRICH_FIELDS_ = [
   "YouTube Handle",
   "YouTube URL",
@@ -237,12 +246,9 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("🧰 Scripts")
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
-    .addItem("Enrich selected Creator List rows", "enrichSelectedCreatorListRows")
-    .addItem("Diagnose Creator List enrichment", "diagnoseCreatorListEnrichment")
-    .addItem("Diagnose selected Creator row", "diagnoseSelectedCreatorListRow")
-    .addItem("Reset Creator List enrichment", "resetCreatorListEnrichmentProgress")
     .addSeparator()
     .addItem("Creator List → HubSpot", "importCreatorListToHubSpotOnly")
+    .addItem("Update Creator statuses from HubSpot", "updateCreatorListStatusesFromHubSpot")
     .addSeparator()
     .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
     .addSeparator()
@@ -314,325 +320,6 @@ function enrichCreatorListRowsInBatches() {
   );
 }
 
-function enrichSelectedCreatorListRows() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Creator List");
-  if (!sheet) {
-    showSpreadsheetToast_("Creator List sheet not found.");
-    return Logger.log("❌ 'Creator List' sheet not found.");
-  }
-
-  const activeSheet = ss.getActiveSheet();
-  if (!activeSheet || activeSheet.getSheetId() !== sheet.getSheetId()) {
-    showSpreadsheetToast_("Open Creator List and select rows first.");
-    return Logger.log("ℹ️ Open the 'Creator List' sheet and select the rows you want to enrich.");
-  }
-
-  const selection = activeSheet.getActiveRange();
-  if (!selection) {
-    showSpreadsheetToast_("Select at least one row on Creator List.");
-    return Logger.log("ℹ️ Select at least one row on 'Creator List'.");
-  }
-
-  const context = getCreatorListSheetContext_(sheet);
-  if (!context) {
-    showSpreadsheetToast_("Creator List has no data.");
-    return Logger.log("ℹ️ Creator List has no data.");
-  }
-
-  const data = context.data;
-  const header = context.header;
-  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
-  const rowStart1 = Math.max(selection.getRow(), context.headerRow1 + 1);
-  const rowEnd1 = Math.min(selection.getRow() + selection.getNumRows() - 1, stopRow1);
-
-  const rowItems = [];
-  for (let row1 = rowStart1; row1 <= rowEnd1; row1++) {
-    const row = data[row1 - 1];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
-    rowItems.push({ row1: row1, values: row.slice() });
-  }
-
-  if (rowItems.length === 0) {
-    showSpreadsheetToast_("No enrichable rows found in the selection.");
-    return Logger.log("ℹ️ No enrichable Creator List rows found in the current selection.");
-  }
-
-  const result = runCreatorListEnrichment_(sheet, rowItems, header);
-  showSpreadsheetToast_(
-    `Selected rows done. Rows: ${rowItems.length}. Static: ${result.staticEnriched}. ` +
-    `YouTube: ${result.youtubeEnriched}. AI: ${result.profileEnriched}.`
-  );
-  Logger.log(
-    `✅ Selected Creator List rows enriched. Static: ${result.staticEnriched}, ` +
-    `YouTube: ${result.youtubeEnriched}, AI: ${result.profileEnriched}.`
-  );
-}
-
-function resetCreatorListEnrichmentProgress() {
-  PropertiesService.getScriptProperties().deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
-  showSpreadsheetToast_("Creator List enrichment progress reset.");
-  Logger.log("✅ Creator List enrichment progress reset.");
-}
-
-function diagnoseCreatorListEnrichment() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Creator List");
-  if (!sheet) {
-    showSpreadsheetToast_("Creator List sheet not found.");
-    return Logger.log("❌ 'Creator List' sheet not found.");
-  }
-
-  const context = getCreatorListSheetContext_(sheet);
-  if (!context) {
-    showSpreadsheetToast_("Creator List has no data.");
-    return Logger.log("ℹ️ Creator List has no data.");
-  }
-
-  const data = context.data;
-  const header = context.header;
-  const stopRow1 = context.archivedStart0 === -1 ? data.length : context.archivedStart0;
-  const youtubeKeyPresent = !!getYouTubeApiKey_();
-  const openAiKeyPresent = !!getOpenAiApiKey_();
-  const expectedHeaders = ["Channel Name", "Channel URL", "Campaign Name", "Email", "Status"];
-  const missingHeaders = expectedHeaders.filter(name => findHeaderIndex_(header, name) === -1);
-
-  let candidateRows = 0;
-  let youtubeEligibleRows = 0;
-  let profileEligibleRows = 0;
-  const sampleNotes = [];
-
-  for (let row1 = context.headerRow1 + 1; row1 <= stopRow1; row1++) {
-    const row = data[row1 - 1];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (!canAttemptCreatorListEnrichment_(row, header)) continue;
-
-    candidateRows++;
-
-    const missingYoutube = YOUTUBE_ENRICH_FIELDS_.some(field => {
-      const idx = header.indexOf(field);
-      return idx !== -1 && !String(row[idx] || "").trim();
-    });
-    if (missingYoutube) youtubeEligibleRows++;
-
-    const missingProfile = PROFILE_LLM_FIELDS_.some(field => {
-      const idx = header.indexOf(field);
-      return idx !== -1 && !String(row[idx] || "").trim();
-    });
-    if (missingProfile) profileEligibleRows++;
-
-    if (sampleNotes.length < 8) {
-      const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim() || "(blank)";
-      const reasons = [];
-      if (missingYoutube) reasons.push("needs YouTube");
-      if (missingProfile) reasons.push("needs AI");
-      if (reasons.length === 0) reasons.push("nothing missing");
-      sampleNotes.push(`Row ${row1} ${channelName}: ${reasons.join(", ")}`);
-    }
-  }
-
-  const message = [
-    `Header row: ${context.headerRow1}`,
-    `YouTube key present: ${youtubeKeyPresent ? "yes" : "no"}`,
-    `OpenAI key present: ${openAiKeyPresent ? "yes" : "no"}`,
-    `Rows before Archived: ${Math.max(stopRow1 - 1, 0)}`,
-    `Candidate rows: ${candidateRows}`,
-    `Rows needing YouTube enrichment: ${youtubeEligibleRows}`,
-    `Rows needing AI enrichment: ${profileEligibleRows}`
-  ].join(" | ");
-
-  showSpreadsheetToast_(message);
-  Logger.log("Creator List enrichment diagnosis: " + message);
-  if (missingHeaders.length > 0) {
-    Logger.log("Missing or unrecognized key headers: " + missingHeaders.join(", "));
-  }
-  Logger.log("Detected Creator List headers: " + header.join(" | "));
-  sampleNotes.forEach(note => Logger.log(note));
-}
-
-function diagnoseSelectedCreatorListRow() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Creator List");
-  if (!sheet) {
-    showSpreadsheetToast_("Creator List sheet not found.");
-    return Logger.log("❌ 'Creator List' sheet not found.");
-  }
-
-  const activeSheet = ss.getActiveSheet();
-  if (!activeSheet || activeSheet.getSheetId() !== sheet.getSheetId()) {
-    showSpreadsheetToast_("Open Creator List and select one row first.");
-    return Logger.log("ℹ️ Open the 'Creator List' sheet and select one row first.");
-  }
-
-  const selection = activeSheet.getActiveRange();
-  if (!selection) {
-    showSpreadsheetToast_("Select one row first.");
-    return Logger.log("ℹ️ Select one row first.");
-  }
-
-  const context = getCreatorListSheetContext_(sheet);
-  if (!context) {
-    showSpreadsheetToast_("Creator List has no data.");
-    return Logger.log("ℹ️ Creator List has no data.");
-  }
-
-  const row1 = selection.getRow();
-  if (row1 <= context.headerRow1) {
-    showSpreadsheetToast_("Select a data row, not the header.");
-    return Logger.log("ℹ️ Select a data row, not the header.");
-  }
-
-  const row = sheet.getRange(row1, 1, 1, context.header.length).getValues()[0];
-  const header = context.header;
-  const selectedInput = resolveCreatorYouTubeInputFromRow_(row, header);
-  const rawChannelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
-  const rawChannelUrl = String(getValueByHeader_(row, header, "Channel URL") || "").trim();
-  const rawYouTubeUrl = String(getValueByHeader_(row, header, "YouTube URL") || "").trim();
-  const rawYouTubeHandle = String(getValueByHeader_(row, header, "YouTube Handle") || "").trim();
-  const youtubeKeyPresent = !!getYouTubeApiKey_();
-  const openAiKeyPresent = !!getOpenAiApiKey_();
-  const youtubeKeyValid = youtubeKeyPresent ? validateYouTubeApiKey_(getYouTubeApiKey_()) : false;
-  const youtubeTargetColumns = YOUTUBE_ENRICH_FIELDS_.filter(field => findHeaderIndex_(header, field) !== -1);
-  const profileTargetColumns = PROFILE_LLM_FIELDS_.filter(field => findHeaderIndex_(header, field) !== -1);
-  const emptyYoutubeTargets = youtubeTargetColumns.filter(field => {
-    const idx = findHeaderIndex_(header, field);
-    return idx !== -1 && !String(row[idx] || "").trim();
-  });
-  const emptyProfileTargets = profileTargetColumns.filter(field => {
-    const idx = findHeaderIndex_(header, field);
-    return idx !== -1 && !String(row[idx] || "").trim();
-  });
-  const channelId = selectedInput && youtubeKeyValid
-    ? getChannelIdFromUrl(selectedInput, getYouTubeApiKey_())
-    : "";
-  const insight = selectedInput && youtubeKeyValid
-    ? getCreatorYouTubeInsight_(
-      selectedInput,
-      rawChannelName,
-      getYouTubeApiKey_(),
-      { includeEmailSignals: emptyProfileTargets.indexOf("Email") !== -1 }
-    )
-    : null;
-  const preferredEmailSignal = extractPreferredCreatorEmailFromContext_(row, header, insight);
-
-  let aiDraft = null;
-  let profileDropdownOptions = {};
-  if (openAiKeyPresent && emptyProfileTargets.length > 0) {
-    try {
-      const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
-      profileDropdownOptions = getProfileDropdownOptionsByHeader_(sheet, header, dropdownValuesByHeader);
-      const contextText = buildCreatorProfileContext_(row, header, insight);
-      aiDraft = callLlmForCreatorProfileEnrichment_(
-        getOpenAiApiKey_(),
-        getOpenAiModel_(),
-        rawChannelName,
-        selectedInput,
-        String(getValueByHeader_(row, header, "Campaign Name") || "").trim(),
-        emptyProfileTargets,
-        profileDropdownOptions,
-        contextText
-      );
-
-      const remainingClassificationFields = PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(field => {
-        return emptyProfileTargets.indexOf(field) !== -1;
-      });
-      if (remainingClassificationFields.length > 0) {
-        const fallbackDraft = callLlmForCreatorDropdownClassification_(
-          getOpenAiApiKey_(),
-          getOpenAiModel_(),
-          remainingClassificationFields,
-          profileDropdownOptions,
-          contextText
-        );
-        aiDraft = Object.assign({}, aiDraft || {}, fallbackDraft || {});
-      }
-    } catch (e) {
-      Logger.log("Selected Creator row AI dry-run error: " + (e && e.stack ? e.stack : e));
-    }
-  }
-
-  const message = [
-    `Row ${row1}`,
-    `YT key: ${youtubeKeyPresent ? "yes" : "no"}`,
-    `YT key valid: ${youtubeKeyValid ? "yes" : "no"}`,
-    `OpenAI key: ${openAiKeyPresent ? "yes" : "no"}`,
-    `Resolved input: ${selectedInput ? "yes" : "no"}`,
-    `Channel ID: ${channelId || "none"}`,
-    `Insight: ${insight ? "yes" : "no"}`,
-    `YT targets: ${youtubeTargetColumns.length}`,
-    `AI targets: ${profileTargetColumns.length}`
-  ].join(" | ");
-
-  const detailLines = [
-    "Selected Creator row diagnosis",
-    "This tool does not write values. It only shows what enrichment would return.",
-    "",
-    message,
-    "Resolved YouTube input: " + (selectedInput || "(blank)"),
-    "Detected AI target columns: " + (profileTargetColumns.join(", ") || "(none)"),
-    "Empty AI target columns: " + (emptyProfileTargets.join(", ") || "(none)"),
-    "Detected explicit email candidate: " + (
-      preferredEmailSignal.email
-        ? (preferredEmailSignal.email + " (" + preferredEmailSignal.source + ")")
-        : "(none)"
-    ),
-    "AI dropdown option counts: " + JSON.stringify({
-      "Influencer Type": (profileDropdownOptions["Influencer Type"] || []).length,
-      "Influencer Vertical": (profileDropdownOptions["Influencer Vertical"] || []).length,
-      "Country/Region": (profileDropdownOptions["Country/Region"] || []).length,
-      "Language": (profileDropdownOptions["Language"] || []).length
-    }),
-    "AI dry-run result: " + truncateForUi_(aiDraft ? JSON.stringify(aiDraft) : "(none)", 800),
-    "Last OpenAI diagnostic: " + truncateForUi_(LAST_OPENAI_DIAGNOSTIC_ || "(none)", 800)
-  ];
-
-  showSpreadsheetToast_(message);
-  showSpreadsheetAlert_(detailLines.join("\n"));
-  Logger.log("Selected Creator row diagnosis: " + message);
-  Logger.log("Channel Name raw: " + (rawChannelName || "(blank)"));
-  Logger.log("Channel URL raw: " + (rawChannelUrl || "(blank)"));
-  Logger.log("YouTube URL raw: " + (rawYouTubeUrl || "(blank)"));
-  Logger.log("YouTube Handle raw: " + (rawYouTubeHandle || "(blank)"));
-  Logger.log("Resolved YouTube input: " + (selectedInput || "(blank)"));
-  Logger.log("Detected YouTube target columns: " + (youtubeTargetColumns.join(", ") || "(none)"));
-  Logger.log("Empty YouTube target columns: " + (emptyYoutubeTargets.join(", ") || "(none)"));
-  Logger.log("Detected AI target columns: " + (profileTargetColumns.join(", ") || "(none)"));
-  Logger.log("Empty AI target columns: " + (emptyProfileTargets.join(", ") || "(none)"));
-  Logger.log(
-    "Detected explicit email candidate: " + (
-      preferredEmailSignal.email
-        ? (preferredEmailSignal.email + " (" + preferredEmailSignal.source + ")")
-        : "(none)"
-    )
-  );
-  Logger.log("AI dropdown option counts: " + JSON.stringify({
-    "Influencer Type": (profileDropdownOptions["Influencer Type"] || []).length,
-    "Influencer Vertical": (profileDropdownOptions["Influencer Vertical"] || []).length,
-    "Country/Region": (profileDropdownOptions["Country/Region"] || []).length,
-    "Language": (profileDropdownOptions["Language"] || []).length
-  }));
-  if (insight) {
-    Logger.log("Resolved channel name: " + (insight.channelName || "(blank)"));
-    Logger.log("Resolved handle: " + (insight.handle || "(blank)"));
-    Logger.log("Resolved canonical URL: " + (insight.canonicalUrl || "(blank)"));
-    Logger.log("Median video views: " + String(insight.medianVideoViews || ""));
-    Logger.log("Median shorts views: " + String(insight.medianShortsViews || ""));
-    Logger.log("Median engagement rate: " + String(insight.medianVideoEngagementRate || ""));
-  }
-  if (aiDraft) {
-    Logger.log("AI dry-run result: " + JSON.stringify(aiDraft));
-  } else {
-    Logger.log("AI dry-run result: (none)");
-  }
-  if (LAST_OPENAI_DIAGNOSTIC_) {
-    Logger.log("Last OpenAI diagnostic: " + LAST_OPENAI_DIAGNOSTIC_);
-  }
-  if (LAST_OPENAI_RAW_RESPONSE_) {
-    Logger.log("Last OpenAI raw response: " + LAST_OPENAI_RAW_RESPONSE_);
-  }
-}
-
 function runCreatorListEnrichment_(sheet, rowItems, header) {
   const dropdownValuesByHeader = getDropdownValuesByHeader_(sheet.getParent(), "Dropdown Values");
   const defaultClientName = getDefaultClientName_(dropdownValuesByHeader);
@@ -661,6 +348,7 @@ function canAttemptCreatorListEnrichment_(row, header) {
     "Channel Name",
     "Channel URL",
     "Campaign Name",
+    "Deal name",
     "YouTube URL",
     "YouTube Handle"
   ];
@@ -732,6 +420,107 @@ function enrichAndImportToHubSpot() {
   importCreatorListToHubSpotOnly();
 }
 
+function updateCreatorListStatusesFromHubSpot() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) return Logger.log("❌ 'Creator List' sheet not found.");
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) return Logger.log("ℹ️ Creator List has no data.");
+
+  const data = context.data;
+  const header = context.header;
+  const statusCol = findHeaderIndex_(header, "Status");
+  const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
+  if (recordIdCol === -1) return Logger.log("❌ Creator List missing 'HubSpot Record ID' column.");
+
+  const token = getHubSpotApiToken_();
+  if (!token) return Logger.log("ℹ️ HubSpot token not set in this project. Skipping Creator List status refresh.");
+
+  const rowItems = [];
+  for (let r = context.headerRow0 + 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const recordId = String(row[recordIdCol] || "").trim();
+    if (!recordId) continue;
+
+    rowItems.push({
+      row1: r + 1,
+      recordId: recordId,
+      values: row.slice()
+    });
+  }
+
+  if (rowItems.length === 0) {
+    return Logger.log("ℹ️ No Creator List rows with HubSpot Record ID found.");
+  }
+
+  let stageLabelsByDealId;
+  try {
+    stageLabelsByDealId = fetchHubSpotDealStageLabelsByIds_(
+      token,
+      rowItems.map(function (item) { return item.recordId; })
+    );
+  } catch (e) {
+    return Logger.log("⚠️ Creator List status refresh failed: " + (e && e.stack ? e.stack : e));
+  }
+
+  const updates = [];
+  let skippedUnmatchedStage = 0;
+  let skippedNoChange = 0;
+  const unmatchedStages = {};
+  rowItems.forEach(function (item) {
+    const stageLabel = stageLabelsByDealId[item.recordId] || "";
+    const nextStatus = getCreatorListStatusForHubSpotDealStage_(stageLabel);
+    if (!nextStatus) {
+      skippedUnmatchedStage++;
+      const stageKey = stageLabel || "(blank)";
+      unmatchedStages[stageKey] = (unmatchedStages[stageKey] || 0) + 1;
+      return;
+    }
+
+    const currentStatus = item.values[statusCol];
+    if (String(currentStatus || "").trim() === nextStatus) {
+      skippedNoChange++;
+      return;
+    }
+
+    updates.push({
+      rowItem: item,
+      row1: item.row1,
+      colIndex: statusCol,
+      oldValue: currentStatus,
+      newValue: nextStatus
+    });
+  });
+
+  const writeResult = writeSparseCellUpdates_(
+    sheet,
+    header,
+    updates,
+    "Creator List HubSpot status refresh"
+  );
+
+  Logger.log(
+    `✅ Creator List status refresh done. Updated ${writeResult.writtenRowCount} row(s). ` +
+    `Rows with HubSpot ID: ${rowItems.length}. No change: ${skippedNoChange}. ` +
+    `Ignored non-Contacted/Responded stages: ${skippedUnmatchedStage}. ` +
+    `Skipped cells: ${writeResult.skippedCellCount}.`
+  );
+
+  if (skippedUnmatchedStage > 0) {
+    Logger.log(
+      "ℹ️ Unmatched HubSpot stage values: " +
+      Object.keys(unmatchedStages)
+        .slice(0, 10)
+        .map(function (stage) { return stage + " (" + unmatchedStages[stage] + ")"; })
+        .join(", ")
+    );
+  }
+}
+
 
 /**
  * Enriches a single Creator List row with derived fields.
@@ -746,7 +535,8 @@ function enrichCreatorRow_(row, header, defaultClientName) {
 
   const channelName = get("Channel Name");
   const campaignName = get("Campaign Name");
-  if (!channelName && !campaignName) return [];
+  const existingDealName = get("Deal name");
+  if (!channelName && !campaignName && !existingDealName) return [];
 
   // Contact Type: always Influencer
   set("Contact Type", "Influencer");
@@ -759,8 +549,10 @@ function enrichCreatorRow_(row, header, defaultClientName) {
   setIfEmpty("Client name", defaultClientName);
 
   // Deal name: Channel Name - Campaign Name
+  let dealName = existingDealName;
   if (channelName && campaignName) {
-    set("Deal name", channelName + " - " + campaignName);
+    dealName = channelName + " - " + campaignName;
+    set("Deal name", dealName);
   }
 
   // Pipeline: always Sales Pipeline
@@ -871,8 +663,10 @@ function enrichSingleYouTubeRow_(item, header, apiKey) {
 
   const finalChannelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
   const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
+  let dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
   if (finalChannelName && campaignName) {
-    setTrackedValueByHeader_(row, header, "Deal name", finalChannelName + " - " + campaignName, changeMap);
+    dealName = finalChannelName + " - " + campaignName;
+    setTrackedValueByHeader_(row, header, "Deal name", dealName, changeMap);
   }
 
   return {
@@ -2337,9 +2131,7 @@ function isReasonablePersonName_(value) {
 }
 
 function getOpenAiApiKey_() {
-  return String(
-    PropertiesService.getScriptProperties().getProperty(OPENAI_API_KEY_PROP_) || ""
-  ).trim();
+  return String(OPENAI_API_KEY_ || "").trim();
 }
 
 function getOpenAiModel_() {
@@ -2383,7 +2175,7 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
   const activeColIndexes = [];
   header.forEach((h, idx) => {
     if (!h) return;
-    if (HUBSPOT_IMPORT_EXCLUDED_COLS_.has(h)) return;
+    if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
     activeColIndexes.push(idx);
   });
 
@@ -2462,6 +2254,15 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
   );
 }
 
+function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName) {
+  const text = String(headerName || "").trim();
+  if (!text) return true;
+  if (HUBSPOT_IMPORT_EXCLUDED_COLS_.has(text)) return true;
+
+  const normalized = normalizeHeaderName_(text);
+  return normalized === "activationtype" || normalized === "activationname";
+}
+
 
 function saveImportedHubSpotRecordIds_(sheet, header, dealRecordIds) {
   const recordIdCol = header.indexOf("HubSpot Record ID");
@@ -2499,6 +2300,187 @@ function buildImportSuccessMessage_(rowCount, importId, state, savedRecordIds) {
     "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
     suffix
   );
+}
+
+function fetchHubSpotDealStageLabelsByIds_(token, recordIds) {
+  const ids = uniqueNonEmptyStrings_(recordIds);
+  if (ids.length === 0) return {};
+
+  let propertyName = "dealstage";
+  try {
+    propertyName =
+      resolveHubSpotDealPropertyName_(token, HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_) ||
+      propertyName;
+  } catch (e) {
+    Logger.log("⚠️ Could not resolve HubSpot Deal Stage property. Using 'dealstage'. " + e);
+  }
+
+  let optionLabelByValue = {};
+  try {
+    optionLabelByValue = fetchHubSpotPropertyOptionLabelMap_(
+      HUBSPOT_DEALS_OBJECT_TYPE_ID_,
+      propertyName,
+      token
+    );
+  } catch (e) {
+    Logger.log("⚠️ Could not load HubSpot Deal Stage options. Raw stage values will be used. " + e);
+  }
+
+  let pipelineStageLabelMaps = { byPipelineStage: {}, byStage: {} };
+  try {
+    pipelineStageLabelMaps = fetchHubSpotDealPipelineStageLabelMaps_(token);
+  } catch (e) {
+    Logger.log("⚠️ Could not load HubSpot deal pipeline stages. Raw stage values will be used. " + e);
+  }
+
+  const out = {};
+  const chunks = chunkArray_(ids, HUBSPOT_BATCH_UPDATE_SIZE_);
+
+  chunks.forEach(function (chunk) {
+    try {
+      const data = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ + "/crm/v3/objects/deals/batch/read",
+        token,
+        {
+          method: "post",
+          payload: JSON.stringify({
+            properties: [propertyName, "pipeline"],
+            inputs: chunk.map(function (id) { return { id: id }; })
+          })
+        }
+      );
+      const results = Array.isArray(data && data.results) ? data.results : [];
+      results.forEach(function (item) {
+        const id = String(item && item.id || "").trim();
+        if (!id) return;
+        out[id] = getHubSpotDealStageLabelFromObject_(
+          item,
+          propertyName,
+          optionLabelByValue,
+          pipelineStageLabelMaps
+        );
+      });
+    } catch (batchError) {
+      Logger.log("⚠️ HubSpot Deal Stage batch read failed. Retrying per deal. " + batchError);
+      chunk.forEach(function (id) {
+        try {
+          out[id] = fetchHubSpotDealStageLabelById_(
+            token,
+            id,
+            propertyName,
+            optionLabelByValue,
+            pipelineStageLabelMaps
+          );
+        } catch (singleError) {
+          Logger.log(`⚠️ HubSpot Deal Stage read failed for deal ${id}: ${singleError}`);
+        }
+      });
+    }
+  });
+
+  return out;
+}
+
+function fetchHubSpotDealStageLabelById_(
+  token,
+  recordId,
+  propertyName,
+  optionLabelByValue,
+  pipelineStageLabelMaps
+) {
+  const data = hubspotRequestJson_(
+    HUBSPOT_API_BASE_ +
+      "/crm/v3/objects/deals/" +
+      encodeURIComponent(recordId) +
+      "?properties=" +
+      encodeURIComponent(propertyName) +
+      "&properties=pipeline",
+    token
+  );
+  return getHubSpotDealStageLabelFromObject_(
+    data,
+    propertyName,
+    optionLabelByValue,
+    pipelineStageLabelMaps
+  );
+}
+
+function getHubSpotDealStageLabelFromObject_(
+  item,
+  propertyName,
+  optionLabelByValue,
+  pipelineStageLabelMaps
+) {
+  const properties = item && item.properties ? item.properties : {};
+  const rawStage = String(properties[propertyName] || "").trim();
+  const pipelineId = String(properties.pipeline || "").trim();
+  const byPipelineStage = pipelineStageLabelMaps && pipelineStageLabelMaps.byPipelineStage
+    ? pipelineStageLabelMaps.byPipelineStage
+    : {};
+  const byStage = pipelineStageLabelMaps && pipelineStageLabelMaps.byStage
+    ? pipelineStageLabelMaps.byStage
+    : {};
+
+  if (pipelineId && rawStage && byPipelineStage[pipelineId + "||" + rawStage]) {
+    return byPipelineStage[pipelineId + "||" + rawStage];
+  }
+  if (rawStage && byStage[rawStage]) return byStage[rawStage];
+  return (optionLabelByValue && optionLabelByValue[rawStage]) || rawStage;
+}
+
+function fetchHubSpotDealPipelineStageLabelMaps_(token) {
+  const data = hubspotRequestJson_(
+    HUBSPOT_API_BASE_ +
+      "/crm/v3/pipelines/" +
+      encodeURIComponent(HUBSPOT_DEALS_OBJECT_API_NAME_),
+    token
+  );
+  const pipelines = Array.isArray(data && data.results) ? data.results : [];
+  const out = {
+    byPipelineStage: {},
+    byStage: {}
+  };
+
+  pipelines.forEach(function (pipeline) {
+    const pipelineId = String(pipeline && pipeline.id || "").trim();
+    const stages = Array.isArray(pipeline && pipeline.stages) ? pipeline.stages : [];
+    stages.forEach(function (stage) {
+      const stageId = String(stage && stage.id || "").trim();
+      const stageLabel = String(stage && stage.label || "").trim();
+      if (!stageId || !stageLabel) return;
+
+      if (pipelineId) out.byPipelineStage[pipelineId + "||" + stageId] = stageLabel;
+      if (!out.byStage[stageId]) out.byStage[stageId] = stageLabel;
+    });
+  });
+
+  return out;
+}
+
+function fetchHubSpotPropertyOptionLabelMap_(objectType, propertyName, token) {
+  const data = hubspotRequestJson_(
+    HUBSPOT_API_BASE_ +
+      "/crm/v3/properties/" +
+      encodeURIComponent(objectType) +
+      "/" +
+      encodeURIComponent(propertyName),
+    token
+  );
+  const options = Array.isArray(data && data.options) ? data.options : [];
+  const out = {};
+
+  options.forEach(function (option) {
+    const value = String(option && option.value || "").trim();
+    if (!value) return;
+    out[value] = String(option.label || value).trim();
+  });
+
+  return out;
+}
+
+function getCreatorListStatusForHubSpotDealStage_(stageValueOrLabel) {
+  const normalized = normalizeHeaderName_(stageValueOrLabel);
+  return CREATOR_LIST_HUBSPOT_STAGE_TO_STATUS_[normalized] || "";
 }
 
 function syncPitchingStatusesToHubSpot_(items) {
@@ -2612,12 +2594,7 @@ function prepareHubSpotPitchingStatusUpdates_(items) {
 }
 
 function getHubSpotApiToken_() {
-  const props = PropertiesService.getScriptProperties();
-  for (let i = 0; i < HUBSPOT_API_TOKEN_PROPS_.length; i++) {
-    const value = String(props.getProperty(HUBSPOT_API_TOKEN_PROPS_[i]) || "").trim();
-    if (value) return value;
-  }
-  return "";
+  return String(HUBSPOT_API_KEY_ || "").trim();
 }
 
 function resolveHubSpotDealPropertyName_(token, propertyLabelOrName) {
@@ -4856,7 +4833,7 @@ function computeMedianViewsForChannel_(channelUrl) {
 
   const apiKey = getYouTubeApiKey_();
   if (!apiKey) {
-    Logger.log("❌ Missing YouTube API key. Set Script Property: YOUTUBE_API_KEY");
+    Logger.log("❌ Missing YouTube API key. Set YOUTUBE_API_KEY_");
     return null;
   }
   if (!validateYouTubeApiKey_(apiKey)) return null;
@@ -4889,8 +4866,7 @@ function normalizeChannelUrl_(url) {
 }
 
 function getYouTubeApiKey_() {
-  const value = PropertiesService.getScriptProperties().getProperty(YT_KEY_PROP_);
-  return String(value || "").trim();
+  return String(YOUTUBE_API_KEY_ || "").trim();
 }
 
 function validateYouTubeApiKey_(apiKey) {
@@ -5151,7 +5127,7 @@ function isInvalidApiKeyResponse_(text) {
 function markApiKeyInvalid_() {
   YT_API_KEY_INVALID_ = true;
   if (!YT_API_KEY_INVALID_LOGGED_) {
-    Logger.log("❌ YouTube API key invalid. Update Script Property YOUTUBE_API_KEY and rerun.");
+    Logger.log("❌ YouTube API key invalid. Update YOUTUBE_API_KEY_ and rerun.");
     YT_API_KEY_INVALID_LOGGED_ = true;
   }
 }
