@@ -84,10 +84,55 @@ const INT_HUBSPOT_MENU_ = (function () {
     "YouTube Engagement Rate",
     "YouTube Followers"
   ];
+  const CREATOR_PLATFORM_SPECS_ = [
+    {
+      key: "youtube",
+      label: "YouTube",
+      handleHeader: "YouTube Handle",
+      urlHeader: "YouTube URL",
+      handlePrefix: "@"
+    },
+    {
+      key: "instagram",
+      label: "Instagram",
+      handleHeader: "Instagram Handle",
+      urlHeader: "Instagram URL",
+      handlePrefix: "@"
+    },
+    {
+      key: "tiktok",
+      label: "TikTok",
+      handleHeader: "TikTok Handle",
+      urlHeader: "TikTok URL",
+      handlePrefix: "@"
+    },
+    {
+      key: "twitch",
+      label: "Twitch",
+      handleHeader: "Twitch Handle",
+      urlHeader: "Twitch URL",
+      handlePrefix: "@"
+    },
+    {
+      key: "kick",
+      label: "Kick",
+      handleHeader: "Kick Handle",
+      urlHeader: "Kick URL",
+      handlePrefix: "@"
+    },
+    {
+      key: "x",
+      label: "X",
+      handleHeader: "X Handle",
+      urlHeader: "X URL",
+      handlePrefix: "@"
+    }
+  ];
   const PROFILE_LLM_FIELDS_ = [
     "First Name",
     "Last Name",
     "Email",
+    "Phone Number",
     "Influencer Type",
     "Influencer Vertical",
     "Country/Region",
@@ -109,6 +154,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     "Channel URL",
     "Campaign Name",
     "Email",
+    "Phone Number",
     "YouTube Handle",
     "YouTube URL",
     "YouTube Average Views",
@@ -203,19 +249,14 @@ const INT_HUBSPOT_MENU_ = (function () {
     const startRow1 = Math.max(context.headerRow1 + 1, 3);
     const stopRow0 = archivedStart0 === -1 ? data.length : archivedStart0;
 
-    const emailCol = findHeaderIndex_(header, "Email");
-    if (emailCol === -1) return ui.alert("❌ 'Email' column not found.");
-
     const rowItems = [];
     for (let r = startRow1 - 1; r < stopRow0; r++) {
       const row = data[r];
       if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-      const email = String(row[emailCol] || "").trim();
-      if (!email) continue;
       rowItems.push({ row1: r + 1, values: row.slice() });
     }
 
-    if (rowItems.length === 0) return ui.alert("ℹ️ No rows with emails from row " + startRow1 + " onward.");
+    if (rowItems.length === 0) return ui.alert("ℹ️ No importable rows from row " + startRow1 + " onward.");
 
     importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui);
   }
@@ -254,12 +295,18 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function canAttemptCreatorListEnrichment_(row, header) {
+    const platformFields = [];
+    CREATOR_PLATFORM_SPECS_.forEach(function (spec) {
+      platformFields.push(spec.handleHeader);
+      platformFields.push(spec.urlHeader);
+    });
+
     const candidateFields = [
       "Channel URL",
       "Campaign Name",
       "YouTube URL",
       "YouTube Handle"
-    ];
+    ].concat(platformFields);
 
     return candidateFields.some(field => String(getValueByHeader_(row, header, field) || "").trim());
   }
@@ -292,9 +339,9 @@ const INT_HUBSPOT_MENU_ = (function () {
     const setIfEmpty = (name, value) => setIfEmpty_(row, header, name, value, changeMap);
 
     const channelName = get("Channel Name");
-    const youtubeHandle = get("YouTube Handle");
     const campaignName = get("Campaign Name");
-    if (!channelName && !youtubeHandle && !campaignName) return [];
+    const platformIdentity = applyCreatorPlatformIdentityFields_(row, header, changeMap);
+    if (!channelName && !platformIdentity && !campaignName) return [];
 
     // Contact Type: always Influencer
     set("Contact Type", "Influencer");
@@ -306,11 +353,8 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
     setIfEmpty("Client name", defaultClientName);
 
-    // Deal name: best creator label - Campaign Name
-    const creatorLabel = channelName || youtubeHandle;
-    if (creatorLabel && campaignName) {
-      set("Deal name", creatorLabel + " - " + campaignName);
-    }
+    const creatorLabel = getPreferredCreatorLabelForRow_(row, header, platformIdentity);
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
 
     // Pipeline: always Sales Pipeline
     set("Pipeline", "Sales Pipeline");
@@ -335,6 +379,309 @@ const INT_HUBSPOT_MENU_ = (function () {
       month: MONTH_NAMES_[monthNum - 1],
       year: match[3]
     };
+  }
+
+  function applyCreatorPlatformIdentityFields_(row, header, changeMap) {
+    const identities = collectCreatorPlatformIdentitiesFromRow_(row, header);
+    const identityByKey = {};
+
+    identities.forEach(function (identity) {
+      if (!identity || !identity.key || identityByKey[identity.key]) return;
+      identityByKey[identity.key] = identity;
+    });
+
+    CREATOR_PLATFORM_SPECS_.forEach(function (spec) {
+      const identity = identityByKey[spec.key];
+      if (!identity) return;
+
+      if (identity.handle) {
+        setIfEmpty_(row, header, spec.handleHeader, identity.handle, changeMap);
+      }
+      if (identity.canonicalUrl && (identity.handle || identity.key === "youtube")) {
+        setIfEmpty_(row, header, spec.urlHeader, identity.canonicalUrl, changeMap);
+      }
+    });
+
+    return identities.length > 0 ? identities[0] : null;
+  }
+
+  function collectCreatorPlatformIdentitiesFromRow_(row, header) {
+    const identities = [];
+    const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
+    if (channelUrlIdentity) identities.push(channelUrlIdentity);
+
+    CREATOR_PLATFORM_SPECS_.forEach(function (spec) {
+      const urlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, spec.urlHeader));
+      if (urlIdentity && urlIdentity.key === spec.key) {
+        identities.push(urlIdentity);
+      }
+
+      const handle = normalizeCreatorPlatformHandle_(spec.key, getValueByHeader_(row, header, spec.handleHeader));
+      if (handle) {
+        identities.push({
+          key: spec.key,
+          spec: spec,
+          handle: handle,
+          canonicalUrl: buildCreatorPlatformCanonicalUrl_(spec.key, handle)
+        });
+      }
+    });
+
+    return identities;
+  }
+
+  function getPreferredCreatorLabelForRow_(row, header, preferredIdentity) {
+    const primaryIdentity = preferredIdentity || parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
+    if (primaryIdentity) {
+      const primarySpec = getCreatorPlatformSpec_(primaryIdentity.key);
+      const primaryHandle = primarySpec
+        ? normalizeCreatorPlatformHandle_(primarySpec.key, getValueByHeader_(row, header, primarySpec.handleHeader))
+        : "";
+      if (primaryHandle) return primaryHandle;
+      if (primaryIdentity.handle) return primaryIdentity.handle;
+      if (primaryIdentity.key !== "youtube") {
+        return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+      }
+    }
+
+    const identities = collectCreatorPlatformIdentitiesFromRow_(row, header);
+    for (let i = 0; i < identities.length; i++) {
+      if (identities[i].handle) return identities[i].handle;
+    }
+
+    return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+  }
+
+  function applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap) {
+    const label = String(creatorLabel || "").trim();
+    const campaign = String(campaignName || "").trim();
+    if (!label || !campaign) return false;
+
+    const name = label + " - " + campaign;
+    let changed = false;
+    changed = setTrackedValueByHeader_(row, header, "Deal name", name, changeMap) || changed;
+    changed = setTrackedValueByHeader_(row, header, "Activation name", name, changeMap) || changed;
+    return changed;
+  }
+
+  function parseCreatorPlatformUrl_(value) {
+    const parsed = parseBasicUrl_(value);
+    if (!parsed) return null;
+
+    const host = parsed.host;
+    const pathParts = parsed.pathParts;
+    let key = "";
+    let handle = "";
+
+    if (isYouTubeHost_(host)) {
+      key = "youtube";
+      handle = parseYouTubeHandleFromPathParts_(pathParts);
+    } else if (isInstagramHost_(host)) {
+      key = "instagram";
+      handle = parseInstagramHandleFromPathParts_(pathParts);
+    } else if (isTikTokHost_(host)) {
+      key = "tiktok";
+      handle = parseTikTokHandleFromPathParts_(pathParts);
+    } else if (isTwitchHost_(host)) {
+      key = "twitch";
+      handle = parseFirstPathHandle_(pathParts, [
+        "activate", "bits", "broadcast", "collections", "directory", "downloads",
+        "drops", "event", "friends", "jobs", "login", "logout", "moderator",
+        "p", "popout", "prime", "products", "settings", "store", "subscriptions",
+        "teams", "turbo", "videos", "wallet"
+      ]);
+    } else if (isKickHost_(host)) {
+      key = "kick";
+      handle = parseFirstPathHandle_(pathParts, [
+        "about", "auth", "browse", "categories", "category", "community-guidelines",
+        "dashboard", "dmca", "following", "jobs", "login", "privacy", "search",
+        "signup", "terms", "video", "videos"
+      ]);
+    } else if (isXHost_(host)) {
+      key = "x";
+      handle = parseFirstPathHandle_(pathParts, [
+        "about", "compose", "download", "explore", "hashtag", "home", "i",
+        "intent", "jobs", "login", "messages", "notifications", "privacy",
+        "search", "settings", "share", "tos"
+      ]);
+    }
+
+    if (!key) return null;
+
+    const spec = getCreatorPlatformSpec_(key);
+    const normalizedHandle = normalizeCreatorPlatformHandle_(key, handle);
+    return {
+      key: key,
+      spec: spec,
+      handle: normalizedHandle,
+      canonicalUrl: normalizedHandle ? buildCreatorPlatformCanonicalUrl_(key, normalizedHandle) : normalizeChannelUrl_(parsed.url)
+    };
+  }
+
+  function parseBasicUrl_(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+
+    const normalized = /^https?:\/\//i.test(raw) ? raw : ("https://" + raw);
+    const match = normalized.match(/^https?:\/\/([^\/?#]+)(\/[^?#]*)?/i);
+    if (!match) return null;
+
+    const host = String(match[1] || "").toLowerCase().replace(/^www\./, "");
+    const path = String(match[2] || "");
+    const pathParts = path
+      .split("/")
+      .filter(Boolean)
+      .map(function (part) {
+        try { return decodeURIComponent(part); } catch (e) { return part; }
+      });
+
+    return {
+      url: normalized,
+      host: host,
+      pathParts: pathParts
+    };
+  }
+
+  function parseYouTubeHandleFromPathParts_(pathParts) {
+    if (!pathParts || pathParts.length === 0) return "";
+    const first = String(pathParts[0] || "").trim();
+    if (first.charAt(0) === "@") return first;
+    return "";
+  }
+
+  function parseInstagramHandleFromPathParts_(pathParts) {
+    if (!pathParts || pathParts.length === 0) return "";
+    const first = String(pathParts[0] || "").trim();
+    const second = String(pathParts[1] || "").trim();
+    if (first.toLowerCase() === "stories" && second) return second;
+    return parseFirstPathHandle_(pathParts, [
+      "about", "accounts", "api", "challenge", "developer", "direct", "explore",
+      "legal", "oauth", "p", "privacy", "reel", "reels", "stories", "terms", "tv"
+    ]);
+  }
+
+  function parseTikTokHandleFromPathParts_(pathParts) {
+    if (!pathParts || pathParts.length === 0) return "";
+
+    for (let i = 0; i < pathParts.length; i++) {
+      const part = String(pathParts[i] || "").trim();
+      if (part.charAt(0) === "@") return part;
+    }
+
+    return "";
+  }
+
+  function parseFirstPathHandle_(pathParts, reservedWords) {
+    if (!pathParts || pathParts.length === 0) return "";
+    const first = String(pathParts[0] || "").trim();
+    if (!first) return "";
+
+    const normalizedFirst = first.toLowerCase();
+    const reserved = reservedWords || [];
+    if (reserved.indexOf(normalizedFirst) !== -1) return "";
+    return first;
+  }
+
+  function normalizeCreatorPlatformHandle_(platformKey, value) {
+    const spec = getCreatorPlatformSpec_(platformKey);
+    let text = String(value || "").trim();
+    if (!spec || !text) return "";
+
+    text = text
+      .replace(/^[<("'`\[]+/, "")
+      .replace(/[>"')\],;:!?]+$/, "")
+      .replace(/^https?:\/\//i, "")
+      .trim();
+
+    const parsed = parseCreatorPlatformUrl_(text);
+    if (parsed && parsed.key === platformKey && parsed.handle) return parsed.handle;
+
+    text = text.replace(/^@+/, "").replace(/^\/+|\/+$/g, "").trim();
+    if (!text) return "";
+
+    if (platformKey === "youtube") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9._-]{2,100}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    if (platformKey === "instagram") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9._]{1,30}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    if (platformKey === "tiktok") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9._]{1,32}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    if (platformKey === "twitch") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9_]{1,25}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    if (platformKey === "kick") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9_.-]{1,40}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    if (platformKey === "x") {
+      const firstPart = text.split(/[/?#]/)[0];
+      if (!/^[A-Za-z0-9_]{1,15}$/.test(firstPart)) return "";
+      return "@" + firstPart;
+    }
+
+    return "";
+  }
+
+  function buildCreatorPlatformCanonicalUrl_(platformKey, handle) {
+    const normalizedHandle = normalizeCreatorPlatformHandle_(platformKey, handle);
+    if (!normalizedHandle) return "";
+
+    const pathHandle = normalizedHandle.replace(/^@/, "");
+    if (platformKey === "youtube") return "https://www.youtube.com/@" + pathHandle;
+    if (platformKey === "instagram") return "https://www.instagram.com/" + pathHandle + "/";
+    if (platformKey === "tiktok") return "https://www.tiktok.com/@" + pathHandle;
+    if (platformKey === "twitch") return "https://www.twitch.tv/" + pathHandle;
+    if (platformKey === "kick") return "https://kick.com/" + pathHandle;
+    if (platformKey === "x") return "https://x.com/" + pathHandle;
+    return "";
+  }
+
+  function getCreatorPlatformSpec_(platformKey) {
+    const key = String(platformKey || "").trim();
+    for (let i = 0; i < CREATOR_PLATFORM_SPECS_.length; i++) {
+      if (CREATOR_PLATFORM_SPECS_[i].key === key) return CREATOR_PLATFORM_SPECS_[i];
+    }
+    return null;
+  }
+
+  function isYouTubeHost_(host) {
+    return /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(String(host || ""));
+  }
+
+  function isInstagramHost_(host) {
+    return /(^|\.)instagram\.com$/i.test(String(host || ""));
+  }
+
+  function isTikTokHost_(host) {
+    return /(^|\.)tiktok\.com$/i.test(String(host || ""));
+  }
+
+  function isTwitchHost_(host) {
+    return /(^|\.)twitch\.tv$/i.test(String(host || ""));
+  }
+
+  function isKickHost_(host) {
+    return /(^|\.)kick\.com$/i.test(String(host || ""));
+  }
+
+  function isXHost_(host) {
+    return /(^|\.)x\.com$|(^|\.)twitter\.com$/i.test(String(host || ""));
   }
 
   function enrichYouTubeDataForRows_(sheet, rowItems, header) {
@@ -363,6 +710,14 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function shouldRunYouTubeEnrichmentForRow_(row, header) {
+    const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
+    const hasExplicitYouTubeInput = hasExplicitYouTubeInputForRow_(row, header);
+    const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+    if (channelUrlIdentity && channelUrlIdentity.key !== "youtube" && !hasExplicitYouTubeInput) {
+      return false;
+    }
+    if (!hasExplicitYouTubeInput && !channelName) return false;
+
     const needsYoutubeFields = YOUTUBE_ENRICH_FIELDS_.some(field => {
       const fieldIdx = findHeaderIndex_(header, field);
       return fieldIdx !== -1 && !String(row[fieldIdx] || "").trim();
@@ -370,15 +725,24 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (needsYoutubeFields) return true;
 
     const youtubeHandle = String(getValueByHeader_(row, header, "YouTube Handle") || "").trim();
-    const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
     if (youtubeHandle && channelName && youtubeHandle !== channelName) return true;
 
     const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
     const dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
-    const creatorLabel = channelName || youtubeHandle;
+    const creatorLabel = getPreferredCreatorLabelForRow_(row, header, channelUrlIdentity);
     if (creatorLabel && campaignName && dealName !== (creatorLabel + " - " + campaignName)) return true;
 
     return false;
+  }
+
+  function hasExplicitYouTubeInputForRow_(row, header) {
+    const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
+    if (channelUrlIdentity && channelUrlIdentity.key === "youtube") return true;
+
+    const youtubeUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "YouTube URL"));
+    if (youtubeUrlIdentity && youtubeUrlIdentity.key === "youtube") return true;
+
+    return !!normalizeCreatorPlatformHandle_("youtube", getValueByHeader_(row, header, "YouTube Handle"));
   }
 
   function enrichSingleYouTubeRow_(item, header, apiKey) {
@@ -412,13 +776,9 @@ const INT_HUBSPOT_MENU_ = (function () {
       setIfEmpty_(row, header, "YouTube Engagement Rate", insight.medianVideoEngagementRate, changeMap);
     }
 
-    const finalChannelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
-    const finalYouTubeHandle = String(getValueByHeader_(row, header, "YouTube Handle") || "").trim();
     const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
-    const creatorLabel = finalChannelName || finalYouTubeHandle || String(insight.handle || "").trim();
-    if (creatorLabel && campaignName) {
-      setTrackedValueByHeader_(row, header, "Deal name", creatorLabel + " - " + campaignName, changeMap);
-    }
+    const creatorLabel = getPreferredCreatorLabelForRow_(row, header, null) || String(insight.handle || "").trim();
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
 
     return {
       insight: insight,
@@ -646,6 +1006,18 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
+  function extractPreferredCreatorPhoneFromContext_(row, header, youtubeInsight) {
+    const description = youtubeInsight && youtubeInsight.description
+      ? String(youtubeInsight.description || "")
+      : "";
+    const phones = extractExplicitPhoneNumbersFromText_(description);
+
+    return {
+      phoneNumber: phones.length > 0 ? phones[0] : "",
+      source: phones.length > 0 ? "channel bio" : ""
+    };
+  }
+
   function getYouTubeChannelPageEmailSignal_(canonicalUrl) {
     const normalizedUrl = String(canonicalUrl || "").trim().replace(/\/+$/, "");
     if (!normalizedUrl) {
@@ -746,7 +1118,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     const seen = {};
 
     function collectFromText(text) {
-      const pattern = /(?:mailto:)?([A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,63})/ig;
+      const pattern = /(?:mailto:)?([A-Z0-9.!#$%&'*+=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,63})/ig;
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const email = normalizeExtractedEmailCandidate_(match[1] || match[0]);
@@ -1021,7 +1393,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     const apiKey = getOpenAiApiKey_();
     const model = apiKey ? getOpenAiModel_() : "";
     if (!apiKey) {
-      Logger.log("ℹ️ OpenAI API key not set. AI enrichment will be skipped, but explicit email extraction will still run.");
+      Logger.log("ℹ️ OpenAI API key not set. AI enrichment will be skipped, but explicit email and phone extraction will still run.");
     }
     const profileDropdownOptions = getProfileDropdownOptionsByHeader_(sheet, header, dropdownValuesByHeader);
     const youtubeApiKey = getYouTubeApiKey_();
@@ -1046,12 +1418,13 @@ const INT_HUBSPOT_MENU_ = (function () {
       try {
         const changeMap = {};
         const needsEmail = emptyFields.indexOf("Email") !== -1;
+        const needsPhone = emptyFields.indexOf("Phone Number") !== -1;
         let youtubeInsight = item.youtubeInsight || null;
 
         if (youtubeInsight) {
           youtubeInsight = decorateCreatorInsightWithEmailSignals_(youtubeInsight, needsEmail);
           item.youtubeInsight = youtubeInsight;
-        } else if ((apiKey || needsEmail) && validatedYouTubeApiKey) {
+        } else if ((apiKey || needsEmail || needsPhone) && validatedYouTubeApiKey) {
           youtubeInsight = getCreatorProfileInsightForLlm_(
             item.values,
             header,
@@ -1079,7 +1452,26 @@ const INT_HUBSPOT_MENU_ = (function () {
           });
         }
 
-        if (emptyFields.length === 0) {
+        if (needsPhone) {
+          const preferredPhoneSignal = extractPreferredCreatorPhoneFromContext_(item.values, header, youtubeInsight);
+          if (preferredPhoneSignal.phoneNumber) {
+            applySanitizedProfileFields_(
+              item.values,
+              header,
+              ["Phone Number"],
+              { "Phone Number": preferredPhoneSignal.phoneNumber },
+              changeMap
+            );
+          }
+
+          emptyFields = PROFILE_LLM_FIELDS_.filter(f => {
+            const i = findHeaderIndex_(header, f);
+            return i !== -1 && !String(item.values[i] || "").trim();
+          });
+        }
+
+        const llmFields = emptyFields.filter(f => f !== "Phone Number");
+        if (llmFields.length === 0) {
           directUpdates.push.apply(
             directUpdates,
             trackedRowChangesToSheetUpdates_(item, trackedChangeMapToRowChanges_(changeMap))
@@ -1102,7 +1494,7 @@ const INT_HUBSPOT_MENU_ = (function () {
           channelName: channelName,
           channelUrl: channelUrl,
           campaignName: campaignName,
-          requestedFields: emptyFields.slice(),
+          requestedFields: llmFields.slice(),
           contextText: contextText,
           changeMap: changeMap
         });
@@ -1222,6 +1614,9 @@ const INT_HUBSPOT_MENU_ = (function () {
       "Only include Email when an explicit email address appears in the provided evidence.",
       "If multiple explicit emails appear, prefer the one from the channel bio, then the channel page/about text, then video descriptions.",
       "Return Email as a plain email address only.",
+      "Only include Phone Number when an explicit phone number appears in the provided evidence.",
+      "Return Phone Number as a plain phone number only. Preserve a leading + and normal separators when present.",
+      "Do not use follower counts, view counts, dates, IDs, or social handles as phone numbers.",
       "For Influencer Type, Country/Region, and Language, use only exact values from the allowed lists below.",
       "For Influencer Vertical, return an array of exact allowed values.",
       "Use 1 Influencer Vertical whenever a single best fit exists.",
@@ -1520,6 +1915,7 @@ const INT_HUBSPOT_MENU_ = (function () {
         "First Name": { type: "string" },
         "Last Name": { type: "string" },
         "Email": { type: "string" },
+        "Phone Number": { type: "string" },
         "Influencer Type": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Type"]),
         "Influencer Vertical": buildCreatorProfileVerticalSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Influencer Vertical"]),
         "Country/Region": buildCreatorProfileScalarEnumSchema_(dropdownValuesByHeader && dropdownValuesByHeader["Country/Region"]),
@@ -1572,6 +1968,9 @@ const INT_HUBSPOT_MENU_ = (function () {
     const email = coerceExplicitEmailValue_(result["Email"]);
     if (email) out["Email"] = email;
 
+    const phoneNumber = coerceExplicitPhoneNumberValue_(result["Phone Number"]);
+    if (phoneNumber) out["Phone Number"] = phoneNumber;
+
     const influencerType = coerceDropdownValue_(dropdownValuesByHeader["Influencer Type"] || [], result["Influencer Type"]);
     if (influencerType) out["Influencer Type"] = influencerType;
 
@@ -1592,7 +1991,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
   function applySanitizedProfileFields_(row, header, fields, sanitized, changeMap) {
     fields.forEach(field => {
-      const value = sanitized[field];
+      const value = sanitizeProfileFieldValueForWrite_(field, sanitized[field]);
       if (value == null || String(value).trim() === "") return;
 
       const i = findHeaderIndex_(header, field);
@@ -1600,6 +1999,16 @@ const INT_HUBSPOT_MENU_ = (function () {
 
       setTrackedValue_(row, i, value, changeMap);
     });
+  }
+
+  function sanitizeProfileFieldValueForWrite_(field, value) {
+    if (normalizeHeaderName_(field) === normalizeHeaderName_("Email")) {
+      return coerceExplicitEmailValue_(value);
+    }
+    if (normalizeHeaderName_(field) === normalizeHeaderName_("Phone Number")) {
+      return coerceExplicitPhoneNumberValue_(value);
+    }
+    return value;
   }
 
   function buildCreatorProfileContext_(row, header, youtubeInsight) {
@@ -1718,6 +2127,68 @@ const INT_HUBSPOT_MENU_ = (function () {
     return getHubSpotImportEmailValidationIssue_(rawValue) ? "" : rawValue;
   }
 
+  function coerceExplicitPhoneNumberValue_(value) {
+    const matches = extractExplicitPhoneNumbersFromText_(value);
+    return matches.length > 0 ? matches[0] : "";
+  }
+
+  function extractExplicitPhoneNumbersFromText_(value) {
+    const raw = String(value || "");
+    if (!raw) return [];
+
+    const normalizedText = raw
+      .replace(/&plus;|&#43;|&#x2b;/ig, "+")
+      .replace(/\btel:\s*/ig, "");
+    const results = [];
+    const seen = {};
+    const pattern = /(?:\+|00)?\d[\d\s().-]{5,}\d(?:\s*(?:ext\.?|extension|x)\s*\d{1,6})?/ig;
+    let match;
+
+    while ((match = pattern.exec(normalizedText)) !== null) {
+      const phoneNumber = normalizeExtractedPhoneNumberCandidate_(match[0]);
+      if (!phoneNumber) continue;
+
+      const key = phoneNumber.replace(/\D/g, "");
+      if (seen[key]) continue;
+      seen[key] = true;
+      results.push(phoneNumber);
+    }
+
+    return results;
+  }
+
+  function normalizeExtractedPhoneNumberCandidate_(value) {
+    let text = String(value || "")
+      .replace(/^[<("'`\[]+/, "")
+      .replace(/[>"')\],;:!?]+$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!text) return "";
+
+    const extensionMatch = text.match(/\b(?:ext\.?|extension|x)\s*(\d{1,6})\b/i);
+    const extension = extensionMatch ? extensionMatch[1] : "";
+    if (extensionMatch) text = text.slice(0, extensionMatch.index).trim();
+
+    text = text
+      .replace(/[^\d+().\-\s]/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/\(\s+/g, "(")
+      .replace(/\s+\)/g, ")")
+      .trim();
+
+    if (!text) return "";
+    if ((text.match(/\+/g) || []).length > 1) return "";
+    if (text.indexOf("+") > 0) return "";
+
+    const digitCount = (text.match(/\d/g) || []).length;
+    if (digitCount < 7 || digitCount > 20) return "";
+    if (!/^\+?[\d\s().-]+$/.test(text)) return "";
+    if (/^\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}$/.test(text)) return "";
+
+    return extension ? text + " ext " + extension : text;
+  }
+
   function getDropdownMatchVariants_(value) {
     const variants = new Set();
     const normalized = normalizeDropdownMatchText_(value);
@@ -1772,6 +2243,9 @@ const INT_HUBSPOT_MENU_ = (function () {
   function getCreatorProfileInsightForLlm_(row, header, apiKey, options) {
     if (!apiKey) return null;
     const channelUrl = resolveCreatorYouTubeInputFromRow_(row, header);
+    const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
+    if (!channelUrl && channelUrlIdentity && channelUrlIdentity.key !== "youtube") return null;
+
     const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
     if (!channelUrl && !channelName) return null;
 
@@ -1779,11 +2253,12 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
-    const emailCol = header.indexOf("Email");
+    const emailCol = findHeaderIndex_(header, "Email");
 
     // Validate emails
     const emailIssues = [];
     rowItems.forEach(item => {
+      if (emailCol === -1) return;
       const email = String(item.values[emailCol] || "").trim();
       if (!email) return;
       const issue = getHubSpotImportEmailValidationIssue_(email);
@@ -1797,39 +2272,19 @@ const INT_HUBSPOT_MENU_ = (function () {
       return;
     }
 
-    const activeColIndexes = [];
-    header.forEach((h, idx) => {
-      if (!h) return;
-      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
-      activeColIndexes.push(idx);
-    });
-
-    const activeHeaders = activeColIndexes.map(i => header[i]);
-    const activeRows = rowItems.map(item =>
-      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
-    );
-
-    const payload = {
-      sheetName: "Creator List",
-      spreadsheetName: ss.getName().replace(/[\\/:*?"<>|]+/g, "-"),
-      spreadsheetLocale: ss.getSpreadsheetLocale(),
-      headers: activeHeaders,
-      rows: activeRows,
-      sourceRowNumbers: rowItems.map(item => item.row1),
-      rowCount: activeRows.length,
-      columnCount: activeHeaders.length
-    };
+    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol);
+    if (payloads.length === 0) {
+      ui.alert("❌ No importable HubSpot columns found.");
+      return;
+    }
 
     // Try shared library
     if (hasHubSpotSharedImporterLibrary_()) {
       try {
-        const result = HubSpotSharedImporter.startImport(payload);
-        if (result && result.ok) {
-          const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-          ui.alert(buildImportSuccessMessage_(payload.rowCount, result.importId, result.state, savedRecordIds));
-          return;
-        }
-        throw new Error(result && result.error ? result.error : "Library import failed.");
+        const result = runHubSpotSharedLibraryImports_(payloads);
+        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
+        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
+        return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
         return;
@@ -1840,30 +2295,9 @@ const INT_HUBSPOT_MENU_ = (function () {
     const webAppUrl = String(HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ || "").trim();
     if (webAppUrl) {
       try {
-        const response = UrlFetchApp.fetch(webAppUrl, {
-          method: "post",
-          muteHttpExceptions: true,
-          followRedirects: false,
-          contentType: "application/json",
-          headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-          payload: JSON.stringify(Object.assign({ action: HUBSPOT_SHARED_IMPORT_ACTION_ }, payload))
-        });
-
-        const code = response.getResponseCode();
-        const text = String(response.getContentText() || "");
-
-        if (code === 302 || code === 401 || code === 403) {
-          throw new Error("Shared HubSpot importer web app denied access.");
-        }
-        if (code >= 400) throw new Error("Web app error " + code + ": " + text.slice(0, 500));
-
-        const parsed = JSON.parse(text);
-        if (!parsed || parsed.ok !== true) {
-          throw new Error(parsed && parsed.error ? parsed.error : "Web app import failed.");
-        }
-
-        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, parsed.dealRecordIds);
-        ui.alert(buildImportSuccessMessage_(payload.rowCount, parsed.importId, parsed.state, savedRecordIds));
+        const result = runHubSpotSharedWebAppImports_(payloads, webAppUrl);
+        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
+        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
         return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
@@ -1877,6 +2311,149 @@ const INT_HUBSPOT_MENU_ = (function () {
       HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ +
       ", or set HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ in this file."
     );
+  }
+
+  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol) {
+    if (emailCol === -1) {
+      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "");
+      return payload ? [payload] : [];
+    }
+
+    const rowsWithEmail = [];
+    const rowsWithoutEmail = [];
+    rowItems.forEach(item => {
+      const email = String(item.values[emailCol] || "").trim();
+      (email ? rowsWithEmail : rowsWithoutEmail).push(item);
+    });
+
+    const payloads = [];
+    const shouldLabelPayloads = rowsWithEmail.length > 0 && rowsWithoutEmail.length > 0;
+    if (rowsWithEmail.length > 0) {
+      const payload = buildHubSpotImportPayload_(
+        ss,
+        header,
+        rowsWithEmail,
+        null,
+        shouldLabelPayloads ? "with email" : ""
+      );
+      if (payload) payloads.push(payload);
+    }
+
+    if (rowsWithoutEmail.length > 0) {
+      const payload = buildHubSpotImportPayload_(
+        ss,
+        header,
+        rowsWithoutEmail,
+        new Set([emailCol]),
+        shouldLabelPayloads ? "without email" : ""
+      );
+      if (payload) payloads.push(payload);
+    }
+
+    return payloads;
+  }
+
+  function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel) {
+    const activeColIndexes = [];
+    header.forEach((h, idx) => {
+      if (!h) return;
+      if (excludedColIndexes && excludedColIndexes.has(idx)) return;
+      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
+      activeColIndexes.push(idx);
+    });
+
+    if (activeColIndexes.length === 0 || rowItems.length === 0) return null;
+
+    const activeHeaders = activeColIndexes.map(i => header[i]);
+    const activeRows = rowItems.map(item =>
+      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
+    );
+    const safeSpreadsheetName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
+    const label = String(importLabel || "").trim();
+
+    return {
+      sheetName: "Creator List",
+      spreadsheetName: label ? safeSpreadsheetName + " - " + label : safeSpreadsheetName,
+      spreadsheetLocale: ss.getSpreadsheetLocale(),
+      headers: activeHeaders,
+      rows: activeRows,
+      sourceRowNumbers: rowItems.map(item => item.row1),
+      rowCount: activeRows.length,
+      columnCount: activeHeaders.length,
+      importLabel: label
+    };
+  }
+
+  function runHubSpotSharedLibraryImports_(payloads) {
+    const importResults = [];
+    const dealRecordIds = [];
+
+    payloads.forEach(payload => {
+      const result = HubSpotSharedImporter.startImport(payload);
+      if (result && result.ok) {
+        importResults.push(normalizeHubSpotImportResult_(payload, result));
+        appendHubSpotDealRecordIds_(dealRecordIds, result.dealRecordIds);
+        return;
+      }
+
+      throw new Error(result && result.error ? result.error : "Library import failed.");
+    });
+
+    return {
+      importResults: importResults,
+      dealRecordIds: dealRecordIds
+    };
+  }
+
+  function runHubSpotSharedWebAppImports_(payloads, webAppUrl) {
+    const importResults = [];
+    const dealRecordIds = [];
+
+    payloads.forEach(payload => {
+      const response = UrlFetchApp.fetch(webAppUrl, {
+        method: "post",
+        muteHttpExceptions: true,
+        followRedirects: false,
+        contentType: "application/json",
+        headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+        payload: JSON.stringify(Object.assign({ action: HUBSPOT_SHARED_IMPORT_ACTION_ }, payload))
+      });
+
+      const code = response.getResponseCode();
+      const text = String(response.getContentText() || "");
+
+      if (code === 302 || code === 401 || code === 403) {
+        throw new Error("Shared HubSpot importer web app denied access.");
+      }
+      if (code >= 400) throw new Error("Web app error " + code + ": " + text.slice(0, 500));
+
+      const parsed = JSON.parse(text);
+      if (!parsed || parsed.ok !== true) {
+        throw new Error(parsed && parsed.error ? parsed.error : "Web app import failed.");
+      }
+
+      importResults.push(normalizeHubSpotImportResult_(payload, parsed));
+      appendHubSpotDealRecordIds_(dealRecordIds, parsed.dealRecordIds);
+    });
+
+    return {
+      importResults: importResults,
+      dealRecordIds: dealRecordIds
+    };
+  }
+
+  function normalizeHubSpotImportResult_(payload, result) {
+    return {
+      label: String(payload.importLabel || "").trim(),
+      rowCount: Number(payload.rowCount || 0),
+      importId: result && result.importId,
+      state: result && result.state
+    };
+  }
+
+  function appendHubSpotDealRecordIds_(out, dealRecordIds) {
+    if (!Array.isArray(out) || !Array.isArray(dealRecordIds)) return;
+    dealRecordIds.forEach(item => out.push(item));
   }
 
   function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName) {
@@ -1935,17 +2512,29 @@ const INT_HUBSPOT_MENU_ = (function () {
     return values.join(HUBSPOT_MULTISELECT_IMPORT_DELIMITER_);
   }
 
-  function buildImportSuccessMessage_(rowCount, importId, state, savedRecordIds) {
-    const importState = String(state || "STARTED").trim() || "STARTED";
-    const suffix = importState === "DONE"
+  function buildImportSuccessMessage_(importResults, savedRecordIds) {
+    const results = Array.isArray(importResults) ? importResults : [];
+    const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
+    const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
+    const suffix = allDone
       ? "HubSpot finished the import and the returned deal IDs were saved."
       : "HubSpot continues processing the import in the background.";
+    const importLines = results.map(result => {
+      const label = String(result.label || "").trim();
+      const prefix = label ? label + ": " : "";
+      const importState = String(result.state || "STARTED").trim() || "STARTED";
+      return (
+        "- " + prefix +
+        "Rows " + Number(result.rowCount || 0) +
+        ", Import ID " + (result.importId || "N/A") +
+        ", State " + importState
+      );
+    });
 
     return (
       "✅ HubSpot import submitted.\n\n" +
       "Rows: " + rowCount + "\n" +
-      "Import ID: " + (importId || "N/A") + "\n" +
-      "State: " + importState + "\n" +
+      "Imports:\n" + importLines.join("\n") + "\n" +
       "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
       suffix
     );
@@ -2276,16 +2865,18 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function resolveCreatorYouTubeInputFromRow_(row, header) {
-    const candidateFields = ["Channel URL", "YouTube URL", "YouTube Handle", "Channel Name"];
+    const channelUrl = String(getValueByHeader_(row, header, "Channel URL") || "").trim();
+    if (looksLikeYouTubeUrl_(channelUrl)) return channelUrl;
 
-    for (let i = 0; i < candidateFields.length; i++) {
-      const value = String(getValueByHeader_(row, header, candidateFields[i]) || "").trim();
-      if (!looksLikeYouTubeInput_(value)) continue;
+    const youtubeUrl = String(getValueByHeader_(row, header, "YouTube URL") || "").trim();
+    if (looksLikeYouTubeInput_(youtubeUrl)) {
+      if (youtubeUrl.charAt(0) === "@") return "https://www.youtube.com/" + youtubeUrl;
+      return youtubeUrl;
+    }
 
-      if (value.charAt(0) === "@") {
-        return "https://www.youtube.com/" + value;
-      }
-      return value;
+    const youtubeHandle = normalizeCreatorPlatformHandle_("youtube", getValueByHeader_(row, header, "YouTube Handle"));
+    if (youtubeHandle) {
+      return "https://www.youtube.com/" + youtubeHandle;
     }
 
     return "";
@@ -2295,6 +2886,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     const text = String(value || "").trim().toLowerCase();
     if (!text) return false;
     if (text.charAt(0) === "@") return true;
+    return looksLikeYouTubeUrl_(text);
+  }
+
+  function looksLikeYouTubeUrl_(value) {
+    const text = String(value || "").trim().toLowerCase();
+    if (!text) return false;
     return /youtube\.com|youtu\.be/.test(text);
   }
 
@@ -2708,7 +3305,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (local.length > 64) return "has more than 64 characters before @.";
     if (local.startsWith(".") || local.endsWith(".")) return "has a dot at the start or end before @.";
     if (local.indexOf("..") !== -1) return "has consecutive dots before @.";
-    if (!/^[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+$/.test(local)) {
+    if (!/^[A-Za-z0-9!#$%&'*+=?^_`{|}~.-]+$/.test(local)) {
       return "contains unsupported characters before @.";
     }
 
