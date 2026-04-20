@@ -23,7 +23,8 @@ const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
 const HUBSPOT_SHARED_IMPORT_ACTION_ = "startImport";
 const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
-const HUBSPOT_API_KEY_ = "api key here";
+const HUBSPOT_API_KEY_ = "key here";
+const HUBSPOT_API_KEY_PROP_ = "HUBSPOT_API_KEY";
 const HUBSPOT_DEALS_OBJECT_TYPE_ID_ = "0-3";
 const HUBSPOT_DEALS_OBJECT_API_NAME_ = "deals";
 const HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_ = "Deal Stage";
@@ -100,7 +101,8 @@ const HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_ = [
   }
 ];
 
-const OPENAI_API_KEY_ = "api key here";
+const OPENAI_API_KEY_ = "key here";
+const OPENAI_API_KEY_PROP_ = "OPENAI_API_KEY";
 const OPENAI_MODEL_PROP_ = "OPENAI_MODEL";
 const OPENAI_DEFAULT_MODEL_ = "gpt-5-nano";
 const OPENAI_CREATOR_PROFILE_BATCH_SIZE_ = 5;
@@ -116,7 +118,8 @@ const CREATOR_YOUTUBE_DESCRIPTION_SAMPLE_SIZE_ = 6;
 const SHEETS_MULTISELECT_DELIMITER_ = ", ";
 
 // YouTube API
-const YOUTUBE_API_KEY_ = "api key here";
+const YOUTUBE_API_KEY_ = "key here";
+const YOUTUBE_API_KEY_PROP_ = "YOUTUBE_API_KEY";
 const YT_AVG_CACHE_PREFIX_ = "AVG_VIEWS::";
 const YT_KEY_VALID_CACHE_PREFIX_ = "YT_API_KEY_VALID::";
 const YT_CACHE_TTL_SECONDS_ = 21600;
@@ -156,11 +159,17 @@ const INT_PITCHING_FORMULA_COLS_ = new Set(["INT CPM", "EXT CPM"]);
 const INT_PERFORMANCE_FORMULA_COLS_ = new Set(["CPM"]);
 const PITCHING_NEGOTIATION_BLOCK_WIDTH_ = 5;
 const CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_ = new Set(["Status"]);
+const CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ = "Timestamp Imported";
+const CREATOR_LIST_ARCHIVE_SHEET_NAME_ = "Archive";
+const CREATOR_LIST_STALE_ARCHIVE_DAYS_ = 30;
+const CREATOR_LIST_ARCHIVE_FIRST_DATA_ROW_ = 3;
+const CREATOR_LIST_ACTIVE_STATUSES_ = new Set(["contacted", "responded"]);
 const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set([
   "Channel Name",
   "HubSpot Record ID",
   "Channel URL",
   "Status",
+  CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
   "Activation Type",
   "Activation name",
   "Activation Name"
@@ -290,19 +299,21 @@ function isKnownSectionLabel_(value) {
 
 function onOpen() {
   SpreadsheetApp.getUi()
-    .createMenu("🧰 Scripts")
+    .createMenu("📜 Scripts")
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
-    .addSeparator()
     .addItem("Creator List → HubSpot", "importCreatorListToHubSpotOnly")
-    .addItem("Update Creator statuses from HubSpot", "updateCreatorListStatusesFromHubSpot")
-    .addSeparator()
-    .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
     .addSeparator()
     .addItem("Push to EXT Pitching", "pushReadyForPitchingToExt")
+    .addToUi();
+
+  SpreadsheetApp.getUi()
+    .createMenu("⏰ Triggers")
+    .addItem("Update Creator statuses from HubSpot", "updateCreatorListStatusesFromHubSpot")
+    .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
+    .addItem("Archive Creator List", "archiveCreatorList")
+    .addSeparator()
     .addItem("Update Pitching from EXT", "updatePitchingFromExt")
-    .addSeparator()
     .addItem("Update Campaigns from EXT", "updateCampaignsFromExt")
-    .addSeparator()
     .addItem("Update Performance from EXT", "updatePerformanceFromExt")
     .addToUi();
 }
@@ -446,13 +457,13 @@ function importCreatorListToHubSpotOnly() {
   const header = context.header;
 
   const contactingStart0 = findSectionRowByLabel_(data, "Contacting");
-  const archivedStart0 = findSectionRowByLabel_(data, "Archived");
   if (contactingStart0 === -1) return ui.alert("❌ 'Contacting' section not found.");
-  if (archivedStart0 === -1) return ui.alert("❌ 'Archived' section not found.");
+  const contactingEnd0 = findNextSectionStart0_(data, contactingStart0);
+  const endRow0 = contactingEnd0 === -1 ? data.length : contactingEnd0;
 
   // Collect importable rows in Contacting section.
   const rowItems = [];
-  for (let r = contactingStart0 + 1; r < archivedStart0; r++) {
+  for (let r = contactingStart0 + 1; r < endRow0; r++) {
     const row = data[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     rowItems.push({ row1: r + 1, values: row.slice() });
@@ -566,6 +577,133 @@ function updateCreatorListStatusesFromHubSpot() {
         .join(", ")
     );
   }
+}
+
+function archiveCreatorList() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const creatorSheet = ss.getSheetByName("Creator List");
+  const archiveSheet = ss.getSheetByName(CREATOR_LIST_ARCHIVE_SHEET_NAME_);
+  if (!creatorSheet || !archiveSheet) {
+    const missing = [];
+    if (!creatorSheet) missing.push("'Creator List'");
+    if (!archiveSheet) missing.push("'" + CREATOR_LIST_ARCHIVE_SHEET_NAME_ + "'");
+    const message = "❌ Missing sheet(s): " + missing.join(", ") + ".";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const creatorContext = getCreatorListSheetContext_(creatorSheet);
+  if (!creatorContext) {
+    const message = "ℹ️ Creator List has no data.";
+    showSpreadsheetToast_(message);
+    return Logger.log(message);
+  }
+
+  const creatorData = creatorContext.data;
+  const creatorHeader = creatorContext.header;
+  const statusCol = findHeaderIndex_(creatorHeader, "Status");
+  const timestampCol = findHeaderIndex_(creatorHeader, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+  if (statusCol === -1) {
+    const message = "❌ Creator List missing 'Status' column.";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+  if (timestampCol === -1) {
+    const message = "❌ Creator List missing '" + CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + "' column.";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const cutoffMs = Date.now() - CREATOR_LIST_STALE_ARCHIVE_DAYS_ * 24 * 60 * 60 * 1000;
+  const staleRows = [];
+  let skippedActiveStatus = 0;
+  let skippedMissingTimestamp = 0;
+  let skippedFreshTimestamp = 0;
+
+  for (let r = creatorContext.headerRow0 + 1; r < creatorData.length; r++) {
+    const row = creatorData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const status = String(row[statusCol] || "").trim().toLowerCase();
+    if (CREATOR_LIST_ACTIVE_STATUSES_.has(status)) {
+      skippedActiveStatus++;
+      continue;
+    }
+
+    const importedAt = parseSpreadsheetDateValue_(row[timestampCol]);
+    if (!importedAt) {
+      skippedMissingTimestamp++;
+      continue;
+    }
+
+    if (importedAt.getTime() > cutoffMs) {
+      skippedFreshTimestamp++;
+      continue;
+    }
+
+    staleRows.push({ row1: r + 1, values: row.slice() });
+  }
+
+  if (staleRows.length === 0) {
+    const message = "ℹ️ Archive Creator List: no stale rows to archive.";
+    showSpreadsheetToast_(message);
+    return Logger.log(
+      message +
+      ` Active status: ${skippedActiveStatus}. Missing timestamp: ${skippedMissingTimestamp}. ` +
+      `Younger than ${CREATOR_LIST_STALE_ARCHIVE_DAYS_} days: ${skippedFreshTimestamp}.`
+    );
+  }
+
+  const archiveContext = getArchiveSheetContext_(archiveSheet, creatorHeader);
+  if (!archiveContext) {
+    const message = `❌ Could not resolve a header in '${CREATOR_LIST_ARCHIVE_SHEET_NAME_}' sheet.`;
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const archiveHeader = archiveContext.header;
+  const colMap = buildCrossSheetColumnMap_(creatorHeader, archiveHeader, {}, null);
+  if (colMap.length === 0) {
+    const message = `❌ No overlapping columns between Creator List and ${CREATOR_LIST_ARCHIVE_SHEET_NAME_}.`;
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const rowsToWrite = staleRows.map(function (item) {
+    const out = new Array(archiveHeader.length).fill("");
+    colMap.forEach(function (mapping) {
+      out[mapping.targetIdx] = item.values[mapping.sourceIdx];
+    });
+    return out;
+  });
+
+  const archiveDataStartRow1 = Math.max(
+    Number(CREATOR_LIST_ARCHIVE_FIRST_DATA_ROW_) || 3,
+    archiveContext.headerRow1 + 2
+  );
+  const insertAt1 = findFirstFreeRowFrom1_(
+    archiveSheet,
+    archiveDataStartRow1,
+    archiveHeader.length
+  );
+  archiveSheet
+    .getRange(insertAt1, 1, rowsToWrite.length, archiveHeader.length)
+    .setValues(rowsToWrite);
+
+  staleRows
+    .slice()
+    .sort(function (a, b) { return b.row1 - a.row1; })
+    .forEach(function (item) {
+      creatorSheet.deleteRow(item.row1);
+    });
+
+  const message = `✅ Archived ${staleRows.length} row(s) from Creator List to '${CREATOR_LIST_ARCHIVE_SHEET_NAME_}'.`;
+  showSpreadsheetToast_(message);
+  Logger.log(
+    message +
+    ` Kept by status: ${skippedActiveStatus}. Missing timestamp: ${skippedMissingTimestamp}. ` +
+    `Younger than ${CREATOR_LIST_STALE_ARCHIVE_DAYS_} days: ${skippedFreshTimestamp}.`
+  );
 }
 
 
@@ -2617,7 +2755,10 @@ function isReasonablePersonName_(value) {
 }
 
 function getOpenAiApiKey_() {
-  return String(OPENAI_API_KEY_ || "").trim();
+  const configured = String(
+    PropertiesService.getScriptProperties().getProperty(OPENAI_API_KEY_PROP_) || ""
+  ).trim();
+  return configured || String(OPENAI_API_KEY_ || "").trim();
 }
 
 function getOpenAiModel_() {
@@ -2673,7 +2814,13 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
     try {
       const result = runHubSpotSharedLibraryImports_(payloads);
       const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-      ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
+      const savedTimestamps = saveImportedCreatorListTimestamps_(
+        sheet,
+        header,
+        rowItems,
+        result.dealRecordIds
+      );
+      ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
       return;
     } catch (e) {
       ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2687,7 +2834,13 @@ function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
     try {
       const result = runHubSpotSharedWebAppImports_(payloads, webAppUrl);
       const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-      ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
+      const savedTimestamps = saveImportedCreatorListTimestamps_(
+        sheet,
+        header,
+        rowItems,
+        result.dealRecordIds
+      );
+      ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
       return;
     } catch (e) {
       ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2878,7 +3031,48 @@ function saveImportedHubSpotRecordIds_(sheet, header, dealRecordIds) {
   return saved;
 }
 
-function buildImportSuccessMessage_(importResults, savedRecordIds) {
+function saveImportedCreatorListTimestamps_(sheet, header, rowItems, dealRecordIds) {
+  const timestampCol = findHeaderIndex_(header, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+  if (timestampCol === -1) return 0;
+
+  const targetRows = new Set();
+  if (Array.isArray(dealRecordIds)) {
+    dealRecordIds.forEach(function (item) {
+      const row1 = Number(item && item.sourceRowNumber);
+      const recordId = String(item && item.recordId || "").trim();
+      if (!isFinite(row1) || row1 < 2 || !recordId) return;
+      targetRows.add(row1);
+    });
+  }
+
+  if (targetRows.size === 0 && Array.isArray(rowItems)) {
+    rowItems.forEach(function (item) {
+      const row1 = Number(item && item.row1);
+      if (!isFinite(row1) || row1 < 2) return;
+      targetRows.add(row1);
+    });
+  }
+
+  if (targetRows.size === 0) return 0;
+
+  const now = new Date();
+  let saved = 0;
+  Array.from(targetRows)
+    .sort(function (a, b) { return a - b; })
+    .forEach(function (row1) {
+      const cell = sheet.getRange(row1, timestampCol + 1);
+      const currentValue = cell.getValue();
+      if (parseSpreadsheetDateValue_(currentValue)) return;
+      if (String(currentValue == null ? "" : currentValue).trim() !== "") return;
+
+      cell.setValue(now);
+      saved++;
+    });
+
+  return saved;
+}
+
+function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps) {
   const results = Array.isArray(importResults) ? importResults : [];
   const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
   const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
@@ -2902,6 +3096,7 @@ function buildImportSuccessMessage_(importResults, savedRecordIds) {
     "Rows: " + rowCount + "\n" +
     "Imports:\n" + importLines.join("\n") + "\n" +
     "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
+    CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
     suffix
   );
 }
@@ -3198,7 +3393,10 @@ function prepareHubSpotPitchingStatusUpdates_(items) {
 }
 
 function getHubSpotApiToken_() {
-  return String(HUBSPOT_API_KEY_ || "").trim();
+  const configured = String(
+    PropertiesService.getScriptProperties().getProperty(HUBSPOT_API_KEY_PROP_) || ""
+  ).trim();
+  return configured || String(HUBSPOT_API_KEY_ || "").trim();
 }
 
 function resolveHubSpotDealPropertyName_(token, propertyLabelOrName) {
@@ -4118,16 +4316,16 @@ function pushRespondedToNegotiation() {
   if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
 
   const contactingStart0 = findSectionRowByLabel_(creatorData, "Contacting");
-  const creatorArchived0 = findSectionRowByLabel_(creatorData, "Archived");
   if (contactingStart0 === -1) return Logger.log("❌ 'Contacting' section not found in Creator List.");
-  if (creatorArchived0 === -1) return Logger.log("❌ 'Archived' section not found in Creator List.");
+  const contactingEnd0 = findNextSectionStart0_(creatorData, contactingStart0);
+  const creatorEnd0 = contactingEnd0 === -1 ? creatorData.length : contactingEnd0;
 
   const negotiationStart0 = findSectionRowByLabel_(pitchingData, "Negotiation");
   if (negotiationStart0 === -1) return Logger.log("❌ 'Negotiation' section not found in Pitching.");
 
   // Find responded rows
   const respondedRows = [];
-  for (let r = contactingStart0 + 1; r < creatorArchived0; r++) {
+  for (let r = contactingStart0 + 1; r < creatorEnd0; r++) {
     const row = creatorData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     if (String(row[statusCol] || "").trim() !== "Responded") continue;
@@ -5283,6 +5481,56 @@ function getCreatorListSheetContext_(sheet) {
   };
 }
 
+function getArchiveSheetContext_(sheet, fallbackHeader) {
+  if (!sheet) return null;
+
+  let data = sheet.getDataRange().getValues();
+  let headerRow0 = detectHeaderRow0ForColumns_(
+    data,
+    ["Status", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_],
+    10
+  );
+
+  if (headerRow0 === -1) {
+    const header = Array.isArray(fallbackHeader) && fallbackHeader.length > 0
+      ? fallbackHeader.slice()
+      : ["Status", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_];
+
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+    data = sheet.getDataRange().getValues();
+    headerRow0 = 0;
+  }
+
+  const resolvedHeader = (data[headerRow0] || []).map(function (value) {
+    return String(value || "").trim();
+  });
+
+  return {
+    data: data,
+    header: resolvedHeader,
+    headerRow0: headerRow0,
+    headerRow1: headerRow0 + 1
+  };
+}
+
+function parseSpreadsheetDateValue_(value) {
+  if (Object.prototype.toString.call(value) === "[object Date]") {
+    return isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === "number" && isFinite(value)) {
+    const millis = Math.round((value - 25569) * 24 * 60 * 60 * 1000);
+    const numericDate = new Date(millis);
+    return isNaN(numericDate.getTime()) ? null : numericDate;
+  }
+
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return null;
+
+  const parsed = new Date(text);
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
 function detectHeaderRow0ForColumns_(data, expectedColumns, maxScanRows) {
   const scanRows = Math.min(Number(maxScanRows) || 10, data.length);
   let bestRow0 = -1;
@@ -5478,7 +5726,10 @@ function normalizeChannelUrl_(url) {
 }
 
 function getYouTubeApiKey_() {
-  return String(YOUTUBE_API_KEY_ || "").trim();
+  const configured = String(
+    PropertiesService.getScriptProperties().getProperty(YOUTUBE_API_KEY_PROP_) || ""
+  ).trim();
+  return configured || String(YOUTUBE_API_KEY_ || "").trim();
 }
 
 function validateYouTubeApiKey_(apiKey) {
