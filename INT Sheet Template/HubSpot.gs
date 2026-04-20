@@ -7,6 +7,7 @@ function onOpen() {
     .createMenu("🧰 Scripts")
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
     .addItem("Import to HubSpot", "importCreatorListToHubSpotOnly")
+    .addItem("Woodpecker Export", "downloadCreatorListWoodpeckerCsv")
     .addToUi();
 }
 
@@ -16,6 +17,10 @@ function enrichCreatorListRowsInBatches() {
 
 function importCreatorListToHubSpotOnly() {
   return INT_HUBSPOT_MENU_.importCreatorListToHubSpotOnly();
+}
+
+function downloadCreatorListWoodpeckerCsv() {
+  return INT_HUBSPOT_MENU_.downloadCreatorListWoodpeckerCsv();
 }
 
 const INT_HUBSPOT_MENU_ = (function () {
@@ -64,11 +69,14 @@ const INT_HUBSPOT_MENU_ = (function () {
   var LAST_OPENAI_DIAGNOSTIC_ = "";
   var LAST_OPENAI_RAW_RESPONSE_ = "";
 
+  const CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ = "Timestamp Imported";
+  const WOODPECKER_EXPORT_HEADERS_ = ["Email", "Channel Name", "First Name", "Last Name"];
   const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set([
     "Channel Name",
     "HubSpot Record ID",
     "Channel URL",
     "Status",
+    CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
     "Activation Type",
     "Activation name",
     "Activation Name"
@@ -261,6 +269,39 @@ const INT_HUBSPOT_MENU_ = (function () {
     importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui);
   }
 
+  function downloadCreatorListWoodpeckerCsv() {
+    const ui = SpreadsheetApp.getUi();
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName("Creator List");
+    if (!sheet) return ui.alert("❌ 'Creator List' sheet not found.");
+
+    const context = getCreatorListSheetContext_(sheet);
+    if (!context) return ui.alert("ℹ️ Creator List has no data.");
+
+    const header = context.header;
+    const missingColumns = WOODPECKER_EXPORT_HEADERS_.filter(function (columnName) {
+      return findHeaderIndex_(header, columnName) === -1;
+    });
+    if (missingColumns.length > 0) {
+      return ui.alert(
+        "❌ Creator List is missing required column(s):\n\n" +
+        missingColumns.join("\n")
+      );
+    }
+
+    const exportRows = buildCreatorListWoodpeckerExportRows_(context.data, header, context.headerRow1);
+    if (exportRows.length === 0) {
+      return ui.alert("ℹ️ No creator rows found to export.");
+    }
+
+    const filename = buildWoodpeckerExportFilename_(ss.getName());
+    showCsvDownloadDialog_(
+      filename,
+      toCsvBytes_([WOODPECKER_EXPORT_HEADERS_].concat(exportRows)),
+      "Woodpecker Import"
+    );
+  }
+
   function isKnownSectionLabel_(value) {
     const text = String(value || "").trim();
     if (!text) return false;
@@ -402,6 +443,11 @@ const INT_HUBSPOT_MENU_ = (function () {
       }
     });
 
+    const preferredHandle = getPreferredCreatorHandleForRow_(row, header, identities.length > 0 ? identities[0] : null);
+    if (preferredHandle) {
+      setIfEmpty_(row, header, "Channel Name", preferredHandle, changeMap);
+    }
+
     return identities.length > 0 ? identities[0] : null;
   }
 
@@ -430,7 +476,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return identities;
   }
 
-  function getPreferredCreatorLabelForRow_(row, header, preferredIdentity) {
+  function getPreferredCreatorHandleForRow_(row, header, preferredIdentity) {
     const primaryIdentity = preferredIdentity || parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
     if (primaryIdentity) {
       const primarySpec = getCreatorPlatformSpec_(primaryIdentity.key);
@@ -439,9 +485,6 @@ const INT_HUBSPOT_MENU_ = (function () {
         : "";
       if (primaryHandle) return primaryHandle;
       if (primaryIdentity.handle) return primaryIdentity.handle;
-      if (primaryIdentity.key !== "youtube") {
-        return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
-      }
     }
 
     const identities = collectCreatorPlatformIdentitiesFromRow_(row, header);
@@ -449,6 +492,12 @@ const INT_HUBSPOT_MENU_ = (function () {
       if (identities[i].handle) return identities[i].handle;
     }
 
+    return "";
+  }
+
+  function getPreferredCreatorLabelForRow_(row, header, preferredIdentity) {
+    const preferredHandle = getPreferredCreatorHandleForRow_(row, header, preferredIdentity);
+    if (preferredHandle) return preferredHandle;
     return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
   }
 
@@ -764,6 +813,10 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
     if (insight.handle) setIfEmpty_(row, header, "YouTube Handle", insight.handle, changeMap);
     if (insight.canonicalUrl) setIfEmpty_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+    const preferredHandle = getPreferredCreatorHandleForRow_(row, header, null) || String(insight.handle || "").trim();
+    if (preferredHandle) {
+      setIfEmpty_(row, header, "Channel Name", preferredHandle, changeMap);
+    }
 
     if (insight.medianVideoViews != null) {
       setIfEmpty_(row, header, "YouTube Video Median Views", insight.medianVideoViews, changeMap);
@@ -2283,7 +2336,13 @@ const INT_HUBSPOT_MENU_ = (function () {
       try {
         const result = runHubSpotSharedLibraryImports_(payloads);
         const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
+        const savedTimestamps = saveImportedCreatorListTimestamps_(
+          sheet,
+          header,
+          rowItems,
+          result.dealRecordIds
+        );
+        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
         return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2297,7 +2356,13 @@ const INT_HUBSPOT_MENU_ = (function () {
       try {
         const result = runHubSpotSharedWebAppImports_(payloads, webAppUrl);
         const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds));
+        const savedTimestamps = saveImportedCreatorListTimestamps_(
+          sheet,
+          header,
+          rowItems,
+          result.dealRecordIds
+        );
+        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
         return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2351,6 +2416,67 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
 
     return payloads;
+  }
+
+  function buildCreatorListWoodpeckerExportRows_(data, header, headerRow1) {
+    const out = [];
+    const startRow0 = Math.max(Number(headerRow1) || 1, 1);
+
+    for (let r = startRow0; r < data.length; r++) {
+      const row = data[r];
+      if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+      const exportRow = WOODPECKER_EXPORT_HEADERS_.map(function (columnName) {
+        const value = getValueByHeader_(row, header, columnName);
+        return String(value == null ? "" : value);
+      });
+      if (exportRow.join("").trim() === "") continue;
+      out.push(exportRow);
+    }
+
+    return out;
+  }
+
+  function buildWoodpeckerExportFilename_(spreadsheetName) {
+    const safeSpreadsheetName = String(spreadsheetName || "Creator List")
+      .replace(/[\\/:*?"<>|]+/g, "-")
+      .trim();
+    const timestamp = Utilities.formatDate(
+      new Date(),
+      Session.getScriptTimeZone(),
+      "yyyy-MM-dd_HH-mm-ss"
+    );
+    return safeSpreadsheetName + " - Woodpecker Import - " + timestamp + ".csv";
+  }
+
+  function showCsvDownloadDialog_(filename, csvBytes, title) {
+    const safeFilename = String(filename || "export.csv").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const base64 = Utilities.base64Encode(csvBytes || []);
+    const html = HtmlService.createHtmlOutput(
+      '<!DOCTYPE html>' +
+      '<html><head><base target="_top"><meta charset="utf-8"></head>' +
+      '<body style="font-family:Arial,sans-serif;padding:16px;">' +
+      '<p style="margin:0 0 12px;">Your CSV download should start automatically.</p>' +
+      '<a id="download-link" download="' + safeFilename + '">Download CSV</a>' +
+      '<script>' +
+      '(function(){' +
+      'var base64="' + base64 + '";' +
+      'var binary=atob(base64);' +
+      'var bytes=new Uint8Array(binary.length);' +
+      'for(var i=0;i<binary.length;i++){bytes[i]=binary.charCodeAt(i);}' +
+      'var blob=new Blob([bytes],{type:"text/csv;charset=utf-8"});' +
+      'var url=URL.createObjectURL(blob);' +
+      'var link=document.getElementById("download-link");' +
+      'link.href=url;' +
+      'setTimeout(function(){link.click();},0);' +
+      'setTimeout(function(){URL.revokeObjectURL(url);if(typeof google!=="undefined"&&google.script&&google.script.host){google.script.host.close();}},1500);' +
+      '})();' +
+      '</script></body></html>'
+    )
+      .setWidth(320)
+      .setHeight(120);
+
+    SpreadsheetApp.getUi().showModalDialog(html, String(title || "CSV Download"));
   }
 
   function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel) {
@@ -2487,6 +2613,47 @@ const INT_HUBSPOT_MENU_ = (function () {
     return saved;
   }
 
+  function saveImportedCreatorListTimestamps_(sheet, header, rowItems, dealRecordIds) {
+    const timestampCol = findHeaderIndex_(header, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+    if (timestampCol === -1) return 0;
+
+    const targetRows = new Set();
+    if (Array.isArray(dealRecordIds)) {
+      dealRecordIds.forEach(function (item) {
+        const row1 = Number(item && item.sourceRowNumber);
+        const recordId = String(item && item.recordId || "").trim();
+        if (!isFinite(row1) || row1 < 2 || !recordId) return;
+        targetRows.add(row1);
+      });
+    }
+
+    if (targetRows.size === 0 && Array.isArray(rowItems)) {
+      rowItems.forEach(function (item) {
+        const row1 = Number(item && item.row1);
+        if (!isFinite(row1) || row1 < 2) return;
+        targetRows.add(row1);
+      });
+    }
+
+    if (targetRows.size === 0) return 0;
+
+    const now = new Date();
+    let saved = 0;
+    Array.from(targetRows)
+      .sort(function (a, b) { return a - b; })
+      .forEach(function (row1) {
+        const cell = sheet.getRange(row1, timestampCol + 1);
+        const currentValue = cell.getValue();
+        if (parseSpreadsheetDateValue_(currentValue)) return;
+        if (String(currentValue == null ? "" : currentValue).trim() !== "") return;
+
+        cell.setValue(now);
+        saved++;
+      });
+
+    return saved;
+  }
+
   function formatHubSpotImportCellValue_(headerName, value) {
     const text = String(value == null ? "" : value).trim();
     if (!text) return "";
@@ -2512,7 +2679,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return values.join(HUBSPOT_MULTISELECT_IMPORT_DELIMITER_);
   }
 
-  function buildImportSuccessMessage_(importResults, savedRecordIds) {
+  function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps) {
     const results = Array.isArray(importResults) ? importResults : [];
     const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
     const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
@@ -2536,6 +2703,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       "Rows: " + rowCount + "\n" +
       "Imports:\n" + importLines.join("\n") + "\n" +
       "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
+      CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
       suffix
     );
   }
@@ -3287,6 +3455,28 @@ const INT_HUBSPOT_MENU_ = (function () {
     return out;
   }
 
+  /**
+   * Returns UTF-8 CSV bytes with BOM.
+   */
+  function toCsvBytes_(grid) {
+    const csv = (grid || [])
+      .map(function (row) {
+        return (row || [])
+          .map(function (cell) {
+            if (cell === null || cell === undefined) return "";
+            let text = String(cell);
+            text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+            const needsQuotes = /[",\n]/.test(text);
+            text = text.replace(/"/g, '""');
+            return needsQuotes ? ('"' + text + '"') : text;
+          })
+          .join(",");
+      })
+      .join("\r\n");
+
+    return Utilities.newBlob("\uFEFF" + csv, "text/csv;charset=utf-8").getBytes();
+  }
+
   function getHubSpotImportEmailValidationIssue_(value) {
     if (!value) return "is blank.";
     if (value.length > 254) return "is longer than 254 characters.";
@@ -3334,6 +3524,24 @@ const INT_HUBSPOT_MENU_ = (function () {
     return "";
   }
 
+  function parseSpreadsheetDateValue_(value) {
+    if (Object.prototype.toString.call(value) === "[object Date]") {
+      return isNaN(value.getTime()) ? null : value;
+    }
+
+    if (typeof value === "number" && isFinite(value)) {
+      const millis = Math.round((value - 25569) * 24 * 60 * 60 * 1000);
+      const numericDate = new Date(millis);
+      return isNaN(numericDate.getTime()) ? null : numericDate;
+    }
+
+    const text = String(value == null ? "" : value).trim();
+    if (!text) return null;
+
+    const parsed = new Date(text);
+    return isNaN(parsed.getTime()) ? null : parsed;
+  }
+
   function extractOpenAiTextFromResponses_(data) {
     if (data && data.output_text) return String(data.output_text || "");
 
@@ -3374,6 +3582,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
   return {
     enrichCreatorListRowsInBatches: enrichCreatorListRowsInBatches,
-    importCreatorListToHubSpotOnly: importCreatorListToHubSpotOnly
+    importCreatorListToHubSpotOnly: importCreatorListToHubSpotOnly,
+    downloadCreatorListWoodpeckerCsv: downloadCreatorListWoodpeckerCsv
   };
 })();

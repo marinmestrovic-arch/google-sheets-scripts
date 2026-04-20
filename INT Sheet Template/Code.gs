@@ -160,6 +160,7 @@ const INT_PERFORMANCE_FORMULA_COLS_ = new Set(["CPM"]);
 const PITCHING_NEGOTIATION_BLOCK_WIDTH_ = 5;
 const CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_ = new Set(["Status"]);
 const CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ = "Timestamp Imported";
+const WOODPECKER_EXPORT_HEADERS_ = ["Email", "Channel Name", "First Name", "Last Name"];
 const CREATOR_LIST_ARCHIVE_SHEET_NAME_ = "Archive";
 const CREATOR_LIST_STALE_ARCHIVE_DAYS_ = 30;
 const CREATOR_LIST_ARCHIVE_FIRST_DATA_ROW_ = 3;
@@ -302,6 +303,7 @@ function onOpen() {
     .createMenu("📜 Scripts")
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
     .addItem("Creator List → HubSpot", "importCreatorListToHubSpotOnly")
+    .addItem("Woodpecker Export", "downloadCreatorListWoodpeckerCsv")
     .addSeparator()
     .addItem("Push to EXT Pitching", "pushReadyForPitchingToExt")
     .addToUi();
@@ -476,6 +478,39 @@ function importCreatorListToHubSpotOnly() {
 
 function enrichAndImportToHubSpot() {
   importCreatorListToHubSpotOnly();
+}
+
+function downloadCreatorListWoodpeckerCsv() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Creator List");
+  if (!sheet) return ui.alert("❌ 'Creator List' sheet not found.");
+
+  const context = getCreatorListSheetContext_(sheet);
+  if (!context) return ui.alert("ℹ️ Creator List has no data.");
+
+  const header = context.header;
+  const missingColumns = WOODPECKER_EXPORT_HEADERS_.filter(function (columnName) {
+    return findHeaderIndex_(header, columnName) === -1;
+  });
+  if (missingColumns.length > 0) {
+    return ui.alert(
+      "❌ Creator List is missing required column(s):\n\n" +
+      missingColumns.join("\n")
+    );
+  }
+
+  const exportRows = buildCreatorListWoodpeckerExportRows_(context.data, header, context.headerRow1);
+  if (exportRows.length === 0) {
+    return ui.alert("ℹ️ No creator rows found to export.");
+  }
+
+  const filename = buildWoodpeckerExportFilename_(ss.getName());
+  showCsvDownloadDialog_(
+    filename,
+    toCsvBytes_([WOODPECKER_EXPORT_HEADERS_].concat(exportRows)),
+    "Woodpecker Import"
+  );
 }
 
 function updateCreatorListStatusesFromHubSpot() {
@@ -3099,6 +3134,67 @@ function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestam
     CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
     suffix
   );
+}
+
+function buildCreatorListWoodpeckerExportRows_(data, header, headerRow1) {
+  const out = [];
+  const startRow0 = Math.max(Number(headerRow1) || 1, 1);
+
+  for (let r = startRow0; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const exportRow = WOODPECKER_EXPORT_HEADERS_.map(function (columnName) {
+      const value = getValueByHeader_(row, header, columnName);
+      return String(value == null ? "" : value);
+    });
+    if (exportRow.join("").trim() === "") continue;
+    out.push(exportRow);
+  }
+
+  return out;
+}
+
+function buildWoodpeckerExportFilename_(spreadsheetName) {
+  const safeSpreadsheetName = String(spreadsheetName || "Creator List")
+    .replace(/[\\/:*?"<>|]+/g, "-")
+    .trim();
+  const timestamp = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    "yyyy-MM-dd_HH-mm-ss"
+  );
+  return safeSpreadsheetName + " - Woodpecker Import - " + timestamp + ".csv";
+}
+
+function showCsvDownloadDialog_(filename, csvBytes, title) {
+  const safeFilename = String(filename || "export.csv").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const base64 = Utilities.base64Encode(csvBytes || []);
+  const html = HtmlService.createHtmlOutput(
+    '<!DOCTYPE html>' +
+    '<html><head><base target="_top"><meta charset="utf-8"></head>' +
+    '<body style="font-family:Arial,sans-serif;padding:16px;">' +
+    '<p style="margin:0 0 12px;">Your CSV download should start automatically.</p>' +
+    '<a id="download-link" download="' + safeFilename + '">Download CSV</a>' +
+    '<script>' +
+    '(function(){' +
+    'var base64="' + base64 + '";' +
+    'var binary=atob(base64);' +
+    'var bytes=new Uint8Array(binary.length);' +
+    'for(var i=0;i<binary.length;i++){bytes[i]=binary.charCodeAt(i);}' +
+    'var blob=new Blob([bytes],{type:"text/csv;charset=utf-8"});' +
+    'var url=URL.createObjectURL(blob);' +
+    'var link=document.getElementById("download-link");' +
+    'link.href=url;' +
+    'setTimeout(function(){link.click();},0);' +
+    'setTimeout(function(){URL.revokeObjectURL(url);if(typeof google!=="undefined"&&google.script&&google.script.host){google.script.host.close();}},1500);' +
+    '})();' +
+    '</script></body></html>'
+  )
+    .setWidth(320)
+    .setHeight(120);
+
+  SpreadsheetApp.getUi().showModalDialog(html, String(title || "CSV Download"));
 }
 
 function fetchHubSpotDealStageLabelsByIds_(token, recordIds) {
@@ -6106,6 +6202,28 @@ function uniqueNonEmptyStrings_(values) {
   });
 
   return out;
+}
+
+/**
+ * Returns UTF-8 CSV bytes with BOM.
+ */
+function toCsvBytes_(grid) {
+  const csv = (grid || [])
+    .map(function (row) {
+      return (row || [])
+        .map(function (cell) {
+          if (cell === null || cell === undefined) return "";
+          let text = String(cell);
+          text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          const needsQuotes = /[",\n]/.test(text);
+          text = text.replace(/"/g, '""');
+          return needsQuotes ? ('"' + text + '"') : text;
+        })
+        .join(",");
+    })
+    .join("\r\n");
+
+  return Utilities.newBlob("\uFEFF" + csv, "text/csv;charset=utf-8").getBytes();
 }
 
 
