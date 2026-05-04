@@ -351,20 +351,38 @@ const INT_HUBSPOT_MENU_ = (function () {
     const data = context.data;
     const header = context.header;
 
+    const missingColumns = getMissingCreatorListHubSpotImportColumns_(header);
+    if (missingColumns.length > 0) {
+      return ui.alert(
+        "❌ Creator List is missing required column(s):\n\n" +
+        missingColumns.join("\n")
+      );
+    }
+
     const archivedStart0 = findSectionRowByLabel_(data, "Archived");
     const startRow1 = Math.max(context.headerRow1 + 1, 3);
     const stopRow0 = archivedStart0 === -1 ? data.length : archivedStart0;
 
-    const rowItems = [];
+    const candidateRowItems = [];
     for (let r = startRow1 - 1; r < stopRow0; r++) {
       const row = data[r];
       if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-      rowItems.push({ row1: r + 1, values: row.slice() });
+      candidateRowItems.push({ row1: r + 1, values: row.slice() });
     }
 
-    if (rowItems.length === 0) return ui.alert("ℹ️ No importable rows from row " + startRow1 + " onward.");
+    if (candidateRowItems.length === 0) {
+      return ui.alert("ℹ️ No importable rows from row " + startRow1 + " onward.");
+    }
 
-    importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui);
+    const preparedRows = prepareCreatorListHubSpotImportRows_(header, candidateRowItems);
+    if (preparedRows.rowItems.length === 0) {
+      return ui.alert(
+        "ℹ️ No new unique deals to import.\n\n" +
+        "Rows with a filled HubSpot Record ID and duplicate Deal Name values were skipped."
+      );
+    }
+
+    importCreatorListToHubSpot_(ss, sheet, header, preparedRows.rowItems, ui, preparedRows);
   }
 
   function downloadCreatorListWoodpeckerCsv() {
@@ -2405,23 +2423,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     return getCreatorYouTubeInsight_(channelUrl, channelName, apiKey, options);
   }
 
-  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui) {
+  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui, importSummary) {
     const emailCol = findHeaderIndex_(header, "Email");
 
-    // Validate emails
-    const emailIssues = [];
-    rowItems.forEach(item => {
-      if (emailCol === -1) return;
-      const email = String(item.values[emailCol] || "").trim();
-      if (!email) return;
-      const issue = getHubSpotImportEmailValidationIssue_(email);
-      if (issue) {
-        emailIssues.push(`Row ${item.row1}: "${email}" ${issue}`);
-      }
-    });
-
-    if (emailIssues.length > 0) {
-      ui.alert("❌ Email validation failed:\n\n" + emailIssues.slice(0, 15).join("\n"));
+    const validationIssues = collectCreatorListHubSpotImportValidationIssues_(header, rowItems, emailCol);
+    if (validationIssues.length > 0) {
+      ui.alert("❌ HubSpot import validation failed:\n\n" + validationIssues.join("\n"));
       return;
     }
 
@@ -2431,18 +2438,26 @@ const INT_HUBSPOT_MENU_ = (function () {
       return;
     }
 
+    const payloadValidationError = validateHubSpotImportPayloads_(payloads);
+    if (payloadValidationError) {
+      ui.alert("❌ HubSpot import validation failed:\n\n" + payloadValidationError);
+      return;
+    }
+
+    const saveMarkers = function (dealRecordIds) {
+      return saveImportedCreatorListDealMarkers_(sheet, header, dealRecordIds);
+    };
+
     // Try shared library
     if (hasHubSpotSharedImporterLibrary_()) {
       try {
-        const result = runHubSpotSharedLibraryImports_(payloads);
-        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-        const savedTimestamps = saveImportedCreatorListTimestamps_(
-          sheet,
-          header,
-          rowItems,
-          result.dealRecordIds
-        );
-        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
+        const result = runHubSpotSharedLibraryImports_(payloads, saveMarkers);
+        ui.alert(buildImportSuccessMessage_(
+          result.importResults,
+          result.savedRecordIds,
+          result.savedTimestamps,
+          importSummary
+        ));
         return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2454,15 +2469,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     const webAppUrl = String(HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ || "").trim();
     if (webAppUrl) {
       try {
-        const result = runHubSpotSharedWebAppImports_(payloads, webAppUrl);
-        const savedRecordIds = saveImportedHubSpotRecordIds_(sheet, header, result.dealRecordIds);
-        const savedTimestamps = saveImportedCreatorListTimestamps_(
-          sheet,
-          header,
-          rowItems,
-          result.dealRecordIds
-        );
-        ui.alert(buildImportSuccessMessage_(result.importResults, savedRecordIds, savedTimestamps));
+        const result = runHubSpotSharedWebAppImports_(payloads, webAppUrl, saveMarkers);
+        ui.alert(buildImportSuccessMessage_(
+          result.importResults,
+          result.savedRecordIds,
+          result.savedTimestamps,
+          importSummary
+        ));
         return;
       } catch (e) {
         ui.alert("❌ HubSpot import failed: " + e.message);
@@ -2476,6 +2489,110 @@ const INT_HUBSPOT_MENU_ = (function () {
       HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ +
       ", or set HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ in this file."
     );
+  }
+
+  function getMissingCreatorListHubSpotImportColumns_(header) {
+    return ["Deal Name", "HubSpot Record ID", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_]
+      .filter(function (columnName) {
+        return findHeaderIndex_(header, columnName) === -1;
+      });
+  }
+
+  function prepareCreatorListHubSpotImportRows_(header, candidateRowItems) {
+    const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+    const dealNameCol = findHeaderIndex_(header, "Deal Name");
+    const importedDealNames = {};
+
+    candidateRowItems.forEach(function (item) {
+      const recordId = String(item.values[recordIdCol] || "").trim();
+      const dealName = String(item.values[dealNameCol] || "").trim();
+      if (recordId && dealName) importedDealNames[dealName] = true;
+    });
+
+    const seenDealNames = {};
+    const rowItems = [];
+    let skippedWithRecordId = 0;
+    let skippedDuplicateDealName = 0;
+
+    candidateRowItems.forEach(function (item) {
+      const recordId = String(item.values[recordIdCol] || "").trim();
+      const dealName = String(item.values[dealNameCol] || "").trim();
+
+      if (recordId) {
+        skippedWithRecordId++;
+        return;
+      }
+
+      if (dealName && importedDealNames[dealName]) {
+        skippedDuplicateDealName++;
+        return;
+      }
+
+      if (dealName && seenDealNames[dealName]) {
+        skippedDuplicateDealName++;
+        return;
+      }
+
+      if (dealName) seenDealNames[dealName] = true;
+      rowItems.push(item);
+    });
+
+    return {
+      rowItems: rowItems,
+      skippedWithRecordId: skippedWithRecordId,
+      skippedDuplicateDealName: skippedDuplicateDealName
+    };
+  }
+
+  function collectCreatorListHubSpotImportValidationIssues_(header, rowItems, emailCol) {
+    const issues = [];
+    const dealNameCol = findHeaderIndex_(header, "Deal Name");
+
+    rowItems.forEach(item => {
+      const dealName = String(item.values[dealNameCol] || "").trim();
+      if (!dealName) {
+        issues.push(`Row ${item.row1}, column "Deal Name": is blank.`);
+      }
+
+      if (emailCol === -1) return;
+      const email = String(item.values[emailCol] || "").trim();
+      if (!email) return;
+
+      const emailIssue = getHubSpotImportEmailValidationIssue_(email);
+      if (emailIssue) {
+        issues.push(`Row ${item.row1}, column "Email": "${email}" ${emailIssue}`);
+      }
+    });
+
+    if (issues.length > 15) {
+      issues.splice(15, issues.length - 15, `${issues.length - 15} more validation issue(s) not shown.`);
+    }
+
+    return issues;
+  }
+
+  function validateHubSpotImportPayloads_(payloads) {
+    if (
+      typeof HubSpotSharedImporter === "undefined" ||
+      !HubSpotSharedImporter ||
+      typeof HubSpotSharedImporter.validateImport !== "function"
+    ) {
+      return "";
+    }
+
+    const errors = [];
+    payloads.forEach(function (payload) {
+      const result = HubSpotSharedImporter.validateImport(payload);
+      if (!result || result.ok !== true) {
+        const label = String(payload.importLabel || "").trim();
+        errors.push(
+          (label ? label + ": " : "") +
+          (result && result.error ? result.error : "Shared HubSpot importer validation failed.")
+        );
+      }
+    });
+
+    return errors.join("\n\n");
   }
 
   function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol) {
@@ -2656,9 +2773,11 @@ const INT_HUBSPOT_MENU_ = (function () {
     return base ? base + " " + suffix : suffix;
   }
 
-  function runHubSpotSharedLibraryImports_(payloads) {
+  function runHubSpotSharedLibraryImports_(payloads, onPayloadImported) {
     const importResults = [];
     const dealRecordIds = [];
+    let savedRecordIds = 0;
+    let savedTimestamps = 0;
 
     payloads.forEach((payload, index) => {
       if (index > 0) Utilities.sleep(HUBSPOT_IMPORT_DELAY_MS_);
@@ -2667,6 +2786,11 @@ const INT_HUBSPOT_MENU_ = (function () {
       if (result && result.ok) {
         importResults.push(normalizeHubSpotImportResult_(payload, result));
         appendHubSpotDealRecordIds_(dealRecordIds, result.dealRecordIds);
+        if (typeof onPayloadImported === "function") {
+          const markerResult = onPayloadImported(result.dealRecordIds);
+          savedRecordIds += Number(markerResult && markerResult.recordIds || 0);
+          savedTimestamps += Number(markerResult && markerResult.timestamps || 0);
+        }
         return;
       }
 
@@ -2675,7 +2799,9 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     return {
       importResults: importResults,
-      dealRecordIds: dealRecordIds
+      dealRecordIds: dealRecordIds,
+      savedRecordIds: savedRecordIds,
+      savedTimestamps: savedTimestamps
     };
   }
 
@@ -2700,9 +2826,11 @@ const INT_HUBSPOT_MENU_ = (function () {
     throw lastError || new Error("Library import failed.");
   }
 
-  function runHubSpotSharedWebAppImports_(payloads, webAppUrl) {
+  function runHubSpotSharedWebAppImports_(payloads, webAppUrl, onPayloadImported) {
     const importResults = [];
     const dealRecordIds = [];
+    let savedRecordIds = 0;
+    let savedTimestamps = 0;
 
     payloads.forEach((payload, index) => {
       if (index > 0) Utilities.sleep(HUBSPOT_IMPORT_DELAY_MS_);
@@ -2710,11 +2838,18 @@ const INT_HUBSPOT_MENU_ = (function () {
       const parsed = runHubSpotSharedWebAppImportWithRetry_(payload, webAppUrl);
       importResults.push(normalizeHubSpotImportResult_(payload, parsed));
       appendHubSpotDealRecordIds_(dealRecordIds, parsed.dealRecordIds);
+      if (typeof onPayloadImported === "function") {
+        const markerResult = onPayloadImported(parsed.dealRecordIds);
+        savedRecordIds += Number(markerResult && markerResult.recordIds || 0);
+        savedTimestamps += Number(markerResult && markerResult.timestamps || 0);
+      }
     });
 
     return {
       importResults: importResults,
-      dealRecordIds: dealRecordIds
+      dealRecordIds: dealRecordIds,
+      savedRecordIds: savedRecordIds,
+      savedTimestamps: savedTimestamps
     };
   }
 
@@ -2792,67 +2927,48 @@ const INT_HUBSPOT_MENU_ = (function () {
     return normalized === "activationtype" || normalized === "activationname";
   }
 
-  function saveImportedHubSpotRecordIds_(sheet, header, dealRecordIds) {
-    const recordIdCol = header.indexOf("HubSpot Record ID");
-    if (recordIdCol === -1 || !Array.isArray(dealRecordIds) || dealRecordIds.length === 0) {
-      return 0;
+  function saveImportedCreatorListDealMarkers_(sheet, header, dealRecordIds) {
+    const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+    const timestampCol = findHeaderIndex_(header, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+    if (
+      recordIdCol === -1 ||
+      timestampCol === -1 ||
+      !Array.isArray(dealRecordIds) ||
+      dealRecordIds.length === 0
+    ) {
+      return { recordIds: 0, timestamps: 0 };
     }
 
-    let saved = 0;
-    dealRecordIds.forEach(item => {
+    const now = new Date();
+    let savedRecordIds = 0;
+    let savedTimestamps = 0;
+
+    dealRecordIds.forEach(function (item) {
       const row1 = Number(item && item.sourceRowNumber);
       const recordId = String(item && item.recordId || "").trim();
       if (!isFinite(row1) || row1 < 2 || !recordId) return;
 
-      const cell = sheet.getRange(row1, recordIdCol + 1);
-      if (String(cell.getValue() || "").trim() === recordId) return;
+      const recordIdCell = sheet.getRange(row1, recordIdCol + 1);
+      if (String(recordIdCell.getValue() || "").trim() !== recordId) {
+        recordIdCell.setValue(recordId);
+        savedRecordIds++;
+      }
 
-      cell.setValue(recordId);
-      saved++;
+      const timestampCell = sheet.getRange(row1, timestampCol + 1);
+      const timestampValue = timestampCell.getValue();
+      if (
+        !parseSpreadsheetDateValue_(timestampValue) &&
+        String(timestampValue == null ? "" : timestampValue).trim() === ""
+      ) {
+        timestampCell.setValue(now);
+        savedTimestamps++;
+      }
     });
 
-    return saved;
-  }
-
-  function saveImportedCreatorListTimestamps_(sheet, header, rowItems, dealRecordIds) {
-    const timestampCol = findHeaderIndex_(header, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
-    if (timestampCol === -1) return 0;
-
-    const targetRows = new Set();
-    if (Array.isArray(dealRecordIds)) {
-      dealRecordIds.forEach(function (item) {
-        const row1 = Number(item && item.sourceRowNumber);
-        const recordId = String(item && item.recordId || "").trim();
-        if (!isFinite(row1) || row1 < 2 || !recordId) return;
-        targetRows.add(row1);
-      });
-    }
-
-    if (targetRows.size === 0 && Array.isArray(rowItems)) {
-      rowItems.forEach(function (item) {
-        const row1 = Number(item && item.row1);
-        if (!isFinite(row1) || row1 < 2) return;
-        targetRows.add(row1);
-      });
-    }
-
-    if (targetRows.size === 0) return 0;
-
-    const now = new Date();
-    let saved = 0;
-    Array.from(targetRows)
-      .sort(function (a, b) { return a - b; })
-      .forEach(function (row1) {
-        const cell = sheet.getRange(row1, timestampCol + 1);
-        const currentValue = cell.getValue();
-        if (parseSpreadsheetDateValue_(currentValue)) return;
-        if (String(currentValue == null ? "" : currentValue).trim() !== "") return;
-
-        cell.setValue(now);
-        saved++;
-      });
-
-    return saved;
+    return {
+      recordIds: savedRecordIds,
+      timestamps: savedTimestamps
+    };
   }
 
   function formatHubSpotImportCellValue_(headerName, value) {
@@ -2880,7 +2996,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return values.join(HUBSPOT_MULTISELECT_IMPORT_DELIMITER_);
   }
 
-  function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps) {
+  function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps, importSummary) {
     const results = Array.isArray(importResults) ? importResults : [];
     const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
     const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
@@ -2893,18 +3009,22 @@ const INT_HUBSPOT_MENU_ = (function () {
       const importState = String(result.state || "STARTED").trim() || "STARTED";
       return (
         "- " + prefix +
-        "Rows " + Number(result.rowCount || 0) +
+        "Unique deals " + Number(result.rowCount || 0) +
         ", Import ID " + (result.importId || "N/A") +
         ", State " + importState
       );
     });
+    const skippedWithRecordId = Number(importSummary && importSummary.skippedWithRecordId || 0);
+    const skippedDuplicateDealName = Number(importSummary && importSummary.skippedDuplicateDealName || 0);
 
     return (
       "✅ HubSpot import submitted.\n\n" +
-      "Rows: " + rowCount + "\n" +
+      "Unique deals imported: " + rowCount + "\n" +
       "Imports:\n" + importLines.join("\n") + "\n" +
       "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n\n" +
       CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
+      "Skipped rows with HubSpot Record ID: " + skippedWithRecordId + "\n" +
+      "Skipped duplicate Deal Name rows: " + skippedDuplicateDealName + "\n\n" +
       suffix
     );
   }
