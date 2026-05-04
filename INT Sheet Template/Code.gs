@@ -22,6 +22,10 @@ const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
   "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
 const HUBSPOT_SHARED_IMPORT_ACTION_ = "startImport";
 const HUBSPOT_SHARED_LIBRARY_IDENTIFIER_ = "HubSpotSharedImporter";
+const HUBSPOT_IMPORT_MAX_ROWS_PER_PAYLOAD_ = 500;
+const HUBSPOT_IMPORT_DELAY_MS_ = 1500;
+const HUBSPOT_IMPORT_RETRY_COUNT_ = 4;
+const HUBSPOT_IMPORT_RETRY_BASE_MS_ = 5000;
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
 const HUBSPOT_API_KEY_ = "key here";
 const HUBSPOT_API_KEY_PROP_ = "HUBSPOT_API_KEY";
@@ -30,6 +34,12 @@ const HUBSPOT_DEALS_OBJECT_API_NAME_ = "deals";
 const HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_ = "Deal Stage";
 const HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_ = "Pitching Status";
 const HUBSPOT_BATCH_UPDATE_SIZE_ = 100;
+const HUBSPOT_REQUEST_MIN_INTERVAL_MS_ = 250;
+const HUBSPOT_REQUEST_RETRY_COUNT_ = 5;
+const HUBSPOT_REQUEST_RETRY_BASE_MS_ = 2000;
+const HUBSPOT_PROPERTY_CACHE_TTL_SECONDS_ = 21600;
+const HUBSPOT_PROPERTY_CACHE_MAX_CHARS_ = 90000;
+const HUBSPOT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_LAST_REQUEST_MS";
 const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
 const HUBSPOT_CAMPAIGN_SYNC_STAGE_DELAY_MS_ = 30000;
 const HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_ = [
@@ -175,6 +185,8 @@ const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set([
   "Activation name",
   "Activation Name"
 ]);
+const HUBSPOT_IMPORT_MULTISELECT_COLS_ = new Set(["influencervertical"]);
+const HUBSPOT_MULTISELECT_IMPORT_DELIMITER_ = ";";
 const CREATOR_LIST_HUBSPOT_STAGE_TO_STATUS_ = {
   contacted: "Contacted",
   responded: "Responded"
@@ -381,11 +393,11 @@ function enrichCreatorListRowsInBatches() {
 
 function runCreatorListEnrichment_(sheet, rowItems, header) {
   const dropdownValuesByHeader = getDropdownValuesByHeader_(sheet.getParent(), "Dropdown Values");
-  const defaultClientName = getDefaultClientName_(dropdownValuesByHeader);
+  const clientNameByCampaignName = getClientNameByCampaignName_(sheet.getParent(), "Dropdown Values");
 
   const staticUpdates = [];
   for (const item of rowItems) {
-    const rowChanges = enrichCreatorRow_(item.values, header, defaultClientName);
+    const rowChanges = enrichCreatorRow_(item.values, header, clientNameByCampaignName);
     if (rowChanges.length === 0) continue;
     staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
   }
@@ -746,7 +758,7 @@ function archiveCreatorList() {
  * Enriches a single Creator List row with derived fields.
  * Modifies the row array in place.
  */
-function enrichCreatorRow_(row, header, defaultClientName) {
+function enrichCreatorRow_(row, header, clientNameByCampaignName) {
   const idx = name => findHeaderIndex_(header, name);
   const get = name => { const i = idx(name); return i === -1 ? "" : String(row[i] || "").trim(); };
   const changeMap = {};
@@ -766,7 +778,9 @@ function enrichCreatorRow_(row, header, defaultClientName) {
     setIfEmpty("Month", campaignParts.month);
     setIfEmpty("Year", campaignParts.year);
   }
-  setIfEmpty("Client name", defaultClientName);
+
+  const clientName = getClientNameForCampaign_(campaignName, clientNameByCampaignName);
+  setIfEmpty(idx("Client name") !== -1 ? "Client name" : "Client", clientName);
 
   const creatorLabel = getPreferredCreatorLabelForRow_(row, header, platformIdentity);
   applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
@@ -2928,7 +2942,7 @@ function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol) {
     if (payload) payloads.push(payload);
   }
 
-  return payloads;
+  return splitHubSpotImportPayloadsByRows_(payloads);
 }
 
 function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel) {
@@ -2937,6 +2951,10 @@ function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, im
     if (!h) return;
     if (excludedColIndexes && excludedColIndexes.has(idx)) return;
     if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
+    const hasValue = rowItems.some(item =>
+      String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
+    );
+    if (!hasValue) return;
     activeColIndexes.push(idx);
   });
 
@@ -2944,7 +2962,7 @@ function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, im
 
   const activeHeaders = activeColIndexes.map(i => header[i]);
   const activeRows = rowItems.map(item =>
-    activeColIndexes.map(i => String(item.values[i] != null ? item.values[i] : ""))
+    activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
   );
   const safeSpreadsheetName = ss.getName().replace(/[\\/:*?"<>|]+/g, "-");
   const label = String(importLabel || "").trim();
@@ -2962,12 +2980,56 @@ function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, im
   };
 }
 
+function splitHubSpotImportPayloadsByRows_(payloads) {
+  const out = [];
+  (payloads || []).forEach(function (payload) {
+    splitHubSpotImportPayloadByRows_(payload).forEach(function (chunk) {
+      out.push(chunk);
+    });
+  });
+  return out;
+}
+
+function splitHubSpotImportPayloadByRows_(payload) {
+  const maxRows = Math.max(1, Number(HUBSPOT_IMPORT_MAX_ROWS_PER_PAYLOAD_) || 500);
+  const rows = Array.isArray(payload && payload.rows) ? payload.rows : [];
+  if (!payload || rows.length <= maxRows) return payload ? [payload] : [];
+
+  const sourceRowNumbers = Array.isArray(payload.sourceRowNumbers) ? payload.sourceRowNumbers : [];
+  const chunks = [];
+  const totalChunks = Math.ceil(rows.length / maxRows);
+
+  for (let start = 0; start < rows.length; start += maxRows) {
+    const chunkIndex = chunks.length + 1;
+    const chunkLabel = buildHubSpotImportChunkLabel_(payload.importLabel, chunkIndex, totalChunks);
+    chunks.push(Object.assign({}, payload, {
+      spreadsheetName:
+        String(payload.spreadsheetName || "HubSpot Import") +
+        " - part " + chunkIndex + " of " + totalChunks,
+      rows: rows.slice(start, start + maxRows),
+      sourceRowNumbers: sourceRowNumbers.slice(start, start + maxRows),
+      rowCount: Math.min(maxRows, rows.length - start),
+      importLabel: chunkLabel
+    }));
+  }
+
+  return chunks;
+}
+
+function buildHubSpotImportChunkLabel_(label, chunkIndex, totalChunks) {
+  const base = String(label || "").trim();
+  const suffix = "part " + chunkIndex + "/" + totalChunks;
+  return base ? base + " " + suffix : suffix;
+}
+
 function runHubSpotSharedLibraryImports_(payloads) {
   const importResults = [];
   const dealRecordIds = [];
 
-  payloads.forEach(payload => {
-    const result = HubSpotSharedImporter.startImport(payload);
+  payloads.forEach((payload, index) => {
+    if (index > 0) Utilities.sleep(HUBSPOT_IMPORT_DELAY_MS_);
+
+    const result = runHubSpotSharedLibraryImportWithRetry_(payload);
     if (result && result.ok) {
       importResults.push(normalizeHubSpotImportResult_(payload, result));
       appendHubSpotDealRecordIds_(dealRecordIds, result.dealRecordIds);
@@ -2983,33 +3045,35 @@ function runHubSpotSharedLibraryImports_(payloads) {
   };
 }
 
+function runHubSpotSharedLibraryImportWithRetry_(payload) {
+  let lastError = null;
+  const maxRetries = Math.max(0, Number(HUBSPOT_IMPORT_RETRY_COUNT_) || 0);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const result = HubSpotSharedImporter.startImport(payload);
+      if (result && result.ok) return result;
+
+      throw new Error(result && result.error ? result.error : "Library import failed.");
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableHubSpotImportError_(e) || attempt >= maxRetries) throw e;
+
+      sleepBeforeHubSpotImportRetry_(attempt);
+    }
+  }
+
+  throw lastError || new Error("Library import failed.");
+}
+
 function runHubSpotSharedWebAppImports_(payloads, webAppUrl) {
   const importResults = [];
   const dealRecordIds = [];
 
-  payloads.forEach(payload => {
-    const response = UrlFetchApp.fetch(webAppUrl, {
-      method: "post",
-      muteHttpExceptions: true,
-      followRedirects: false,
-      contentType: "application/json",
-      headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
-      payload: JSON.stringify(Object.assign({ action: HUBSPOT_SHARED_IMPORT_ACTION_ }, payload))
-    });
+  payloads.forEach((payload, index) => {
+    if (index > 0) Utilities.sleep(HUBSPOT_IMPORT_DELAY_MS_);
 
-    const code = response.getResponseCode();
-    const text = String(response.getContentText() || "");
-
-    if (code === 302 || code === 401 || code === 403) {
-      throw new Error("Shared HubSpot importer web app denied access.");
-    }
-    if (code >= 400) throw new Error("Web app error " + code + ": " + text.slice(0, 500));
-
-    const parsed = JSON.parse(text);
-    if (!parsed || parsed.ok !== true) {
-      throw new Error(parsed && parsed.error ? parsed.error : "Web app import failed.");
-    }
-
+    const parsed = runHubSpotSharedWebAppImportWithRetry_(payload, webAppUrl);
     importResults.push(normalizeHubSpotImportResult_(payload, parsed));
     appendHubSpotDealRecordIds_(dealRecordIds, parsed.dealRecordIds);
   });
@@ -3018,6 +3082,57 @@ function runHubSpotSharedWebAppImports_(payloads, webAppUrl) {
     importResults: importResults,
     dealRecordIds: dealRecordIds
   };
+}
+
+function runHubSpotSharedWebAppImportWithRetry_(payload, webAppUrl) {
+  let lastError = null;
+  const maxRetries = Math.max(0, Number(HUBSPOT_IMPORT_RETRY_COUNT_) || 0);
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(webAppUrl, {
+        method: "post",
+        muteHttpExceptions: true,
+        followRedirects: false,
+        contentType: "application/json",
+        headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+        payload: JSON.stringify(Object.assign({ action: HUBSPOT_SHARED_IMPORT_ACTION_ }, payload))
+      });
+
+      const code = response.getResponseCode();
+      const text = String(response.getContentText() || "");
+
+      if (code === 302 || code === 401 || code === 403) {
+        throw new Error("Shared HubSpot importer web app denied access.");
+      }
+      if (code >= 400) throw new Error("Web app error " + code + ": " + text.slice(0, 500));
+
+      const parsed = JSON.parse(text);
+      if (!parsed || parsed.ok !== true) {
+        throw new Error(parsed && parsed.error ? parsed.error : "Web app import failed.");
+      }
+
+      return parsed;
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableHubSpotImportError_(e) || attempt >= maxRetries) throw e;
+
+      sleepBeforeHubSpotImportRetry_(attempt);
+    }
+  }
+
+  throw lastError || new Error("Web app import failed.");
+}
+
+function isRetryableHubSpotImportError_(error) {
+  const message = String(error && error.message ? error.message : error || "");
+  return /Bandwidth quota exceeded|Service invoked too many times|Try Utilities\.sleep|rate limit|RATE_LIMIT|TEN_SECONDLY_ROLLING|429|temporarily|timeout|timed out|Address unavailable|Socket|Connection/i.test(message);
+}
+
+function sleepBeforeHubSpotImportRetry_(attempt) {
+  const base = Math.max(500, Number(HUBSPOT_IMPORT_RETRY_BASE_MS_) || 5000);
+  const delay = Math.min(60000, base * Math.pow(2, Math.max(0, Number(attempt) || 0)));
+  Utilities.sleep(delay);
 }
 
 function normalizeHubSpotImportResult_(payload, result) {
@@ -3105,6 +3220,31 @@ function saveImportedCreatorListTimestamps_(sheet, header, rowItems, dealRecordI
     });
 
   return saved;
+}
+
+function formatHubSpotImportCellValue_(headerName, value) {
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return "";
+
+  if (!HUBSPOT_IMPORT_MULTISELECT_COLS_.has(normalizeHeaderName_(headerName))) {
+    return text;
+  }
+
+  return normalizeHubSpotMultiselectImportValue_(text);
+}
+
+function normalizeHubSpotMultiselectImportValue_(value) {
+  const seen = {};
+  const values = String(value || "")
+    .split(/[;,]/)
+    .map(function (part) { return part.trim(); })
+    .filter(function (part) {
+      if (!part || seen[part]) return false;
+      seen[part] = true;
+      return true;
+    });
+
+  return values.join(HUBSPOT_MULTISELECT_IMPORT_DELIMITER_);
 }
 
 function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps) {
@@ -3499,11 +3639,7 @@ function resolveHubSpotDealPropertyName_(token, propertyLabelOrName) {
   const target = normalizeHeaderName_(propertyLabelOrName);
   if (!target) return "";
 
-  const data = hubspotRequestJson_(
-    HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(HUBSPOT_DEALS_OBJECT_TYPE_ID_),
-    token
-  );
-  const properties = Array.isArray(data && data.results) ? data.results : [];
+  const properties = fetchHubSpotPropertiesForObject_(HUBSPOT_DEALS_OBJECT_TYPE_ID_, token);
 
   for (let i = 0; i < properties.length; i++) {
     const property = properties[i] || {};
@@ -3512,6 +3648,83 @@ function resolveHubSpotDealPropertyName_(token, propertyLabelOrName) {
   }
 
   return "";
+}
+
+function fetchHubSpotPropertiesForObject_(objectType, token) {
+  const normalizedObjectType = String(objectType || "").trim();
+  if (!normalizedObjectType) return [];
+
+  const cacheKey = getHubSpotPropertiesCacheKey_(token, normalizedObjectType);
+  if (cacheKey) {
+    try {
+      const cached = CacheService.getScriptCache().get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch (e) {
+      // Property cache is best-effort; fall back to HubSpot if it is unavailable.
+    }
+  }
+
+  const data = hubspotRequestJson_(
+    HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(normalizedObjectType),
+    token
+  );
+  const properties = Array.isArray(data && data.results)
+    ? data.results.map(compactHubSpotPropertyInfo_)
+    : [];
+
+  if (cacheKey) {
+    try {
+      const serialized = JSON.stringify(properties);
+      if (serialized.length <= HUBSPOT_PROPERTY_CACHE_MAX_CHARS_) {
+        CacheService.getScriptCache().put(
+          cacheKey,
+          serialized,
+          HUBSPOT_PROPERTY_CACHE_TTL_SECONDS_
+        );
+      }
+    } catch (e) {
+      // Cache writes are best-effort; imports/syncs should continue.
+    }
+  }
+
+  return properties;
+}
+
+function compactHubSpotPropertyInfo_(property) {
+  return {
+    name: String(property && property.name || "").trim(),
+    label: String(property && property.label || property && property.name || "").trim(),
+    type: String(property && property.type || "").trim(),
+    fieldType: String(property && property.fieldType || "").trim()
+  };
+}
+
+function getHubSpotPropertiesCacheKey_(token, objectType) {
+  const type = String(objectType || "").trim();
+  if (!type) return "";
+  return "HS_PROPERTIES::" + getHubSpotTokenFingerprint_(token) + "::" + type;
+}
+
+function getHubSpotTokenFingerprint_(token) {
+  try {
+    const digest = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(token || ""),
+      Utilities.Charset.UTF_8
+    );
+    return digest
+      .map(function (byte) {
+        const value = (byte + 256) % 256;
+        return ("0" + value.toString(16)).slice(-2);
+      })
+      .join("")
+      .slice(0, 12);
+  } catch (e) {
+    return "default";
+  }
 }
 
 function updateHubSpotDealPropertyBatch_(token, propertyName, items) {
@@ -4073,13 +4286,7 @@ function loadHubSpotCustomObjectInfo_(spec, token) {
 }
 
 function resolveHubSpotPropertyInfosByLabel_(objectType, propertyLabels, token) {
-  const propertiesResponse = hubspotRequestJson_(
-    HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(objectType),
-    token
-  );
-  const properties = Array.isArray(propertiesResponse && propertiesResponse.results)
-    ? propertiesResponse.results
-    : [];
+  const properties = fetchHubSpotPropertiesForObject_(objectType, token);
 
   const lookup = {};
   properties.forEach(function (property) {
@@ -4357,20 +4564,18 @@ function serializeHubSpotPropertyValue_(value, propertyInfo, spreadsheetTimeZone
 }
 
 function hubspotRequestJson_(url, token, options) {
-  const response = UrlFetchApp.fetch(
-    String(url || ""),
-    Object.assign(
-      {
-        method: "get",
-        muteHttpExceptions: true,
-        headers: {
-          Authorization: "Bearer " + String(token || ""),
-          "Content-Type": "application/json"
-        }
-      },
-      options || {}
-    )
+  const requestOptions = Object.assign(
+    {
+      method: "get",
+      muteHttpExceptions: true,
+      headers: {
+        Authorization: "Bearer " + String(token || ""),
+        "Content-Type": "application/json"
+      }
+    },
+    options || {}
   );
+  const response = hubspotFetchWithRetry_(String(url || ""), requestOptions);
 
   const code = response.getResponseCode();
   const text = String(response.getContentText() || "");
@@ -4383,6 +4588,99 @@ function hubspotRequestJson_(url, token, options) {
     return JSON.parse(text);
   } catch (e) {
     throw new Error("HubSpot API parse error: " + e);
+  }
+}
+
+function hubspotFetchWithRetry_(url, options) {
+  const requestOptions = options || {};
+  const maxRetries = Math.max(0, Number(HUBSPOT_REQUEST_RETRY_COUNT_) || 0);
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    waitForHubSpotRequestSlot_();
+
+    try {
+      const response = UrlFetchApp.fetch(url, requestOptions);
+      const code = response.getResponseCode();
+      const text = String(response.getContentText() || "");
+      if (!shouldRetryHubSpotResponse_(code, text) || attempt >= maxRetries) {
+        return response;
+      }
+
+      Utilities.sleep(getHubSpotRetryDelayMs_(response, attempt));
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableHubSpotFetchException_(e) || attempt >= maxRetries) throw e;
+
+      Utilities.sleep(getHubSpotRetryDelayMs_(null, attempt));
+    }
+  }
+
+  throw lastError || new Error("HubSpot request failed.");
+}
+
+function shouldRetryHubSpotResponse_(code, text) {
+  if (code === 429 || code >= 500) return true;
+  return /TEN_SECONDLY_ROLLING|RATE_LIMIT|temporarily unavailable/i.test(String(text || ""));
+}
+
+function isRetryableHubSpotFetchException_(error) {
+  const message = String(error && error.message ? error.message : error || "");
+  return /Bandwidth quota exceeded|Service invoked too many times|Address unavailable|timed out|timeout|DNS|Socket|Connection/i.test(message);
+}
+
+function getHubSpotRetryDelayMs_(response, attempt) {
+  const retryAfterMs = getHubSpotRetryAfterMs_(response);
+  if (retryAfterMs > 0) return retryAfterMs;
+
+  const base = Math.max(500, Number(HUBSPOT_REQUEST_RETRY_BASE_MS_) || 2000);
+  const exponential = base * Math.pow(2, Math.max(0, Number(attempt) || 0));
+  return Math.min(60000, exponential);
+}
+
+function getHubSpotRetryAfterMs_(response) {
+  if (!response || typeof response.getAllHeaders !== "function") return 0;
+
+  try {
+    const headers = response.getAllHeaders() || {};
+    const retryAfter = headers["Retry-After"] || headers["retry-after"];
+    if (!retryAfter) return 0;
+
+    const seconds = Number(retryAfter);
+    if (isFinite(seconds) && seconds > 0) return Math.min(60000, seconds * 1000);
+  } catch (e) {
+    return 0;
+  }
+
+  return 0;
+}
+
+function waitForHubSpotRequestSlot_() {
+  const lock = LockService.getScriptLock();
+  let hasLock = false;
+
+  try {
+    lock.waitLock(10000);
+    hasLock = true;
+
+    const props = PropertiesService.getScriptProperties();
+    const lastAt = Number(props.getProperty(HUBSPOT_LAST_REQUEST_MS_PROP_) || 0);
+    let now = Date.now();
+    const waitMs = lastAt + HUBSPOT_REQUEST_MIN_INTERVAL_MS_ - now;
+    if (waitMs > 0) {
+      Utilities.sleep(waitMs);
+      now = Date.now();
+    }
+
+    props.setProperty(HUBSPOT_LAST_REQUEST_MS_PROP_, String(now));
+  } catch (e) {
+    if (!hasLock) return;
+  } finally {
+    if (hasLock) {
+      try {
+        lock.releaseLock();
+      } catch (ignore) {}
+    }
   }
 }
 
@@ -5370,9 +5668,41 @@ function trackedRowChangesToSheetUpdates_(item, rowChanges) {
   });
 }
 
-function getDefaultClientName_(dropdownValuesByHeader) {
-  const clientValues = dropdownValuesByHeader["Client"] || dropdownValuesByHeader["Client name"] || [];
-  return clientValues.length > 0 ? String(clientValues[0] || "").trim() : "";
+function getClientNameByCampaignName_(ss, sheetName) {
+  const dropdownSheet = ss.getSheetByName(sheetName || "Dropdown Values");
+  if (!dropdownSheet) return {};
+
+  const data = dropdownSheet.getDataRange().getDisplayValues();
+  if (data.length < 2) return {};
+
+  const header = (data[0] || []).map(value => String(value || "").trim());
+  const campaignCol = findHeaderIndex_(header, "Campaign Name");
+  let clientCol = findHeaderIndex_(header, "Client");
+  if (clientCol === -1) clientCol = findHeaderIndex_(header, "Client name");
+  if (campaignCol === -1 || clientCol === -1) return {};
+
+  const out = {};
+  for (let r = 1; r < data.length; r++) {
+    const campaignName = String((data[r] && data[r][campaignCol]) || "").trim();
+    const clientName = String((data[r] && data[r][clientCol]) || "").trim();
+    const key = normalizeDropdownLookupValue_(campaignName);
+    if (!key || !clientName || Object.prototype.hasOwnProperty.call(out, key)) continue;
+    out[key] = clientName;
+  }
+
+  return out;
+}
+
+function getClientNameForCampaign_(campaignName, clientNameByCampaignName) {
+  const key = normalizeDropdownLookupValue_(campaignName);
+  return key && clientNameByCampaignName ? String(clientNameByCampaignName[key] || "").trim() : "";
+}
+
+function normalizeDropdownLookupValue_(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
 }
 
 function getDropdownValuesByHeader_(ss, sheetName) {

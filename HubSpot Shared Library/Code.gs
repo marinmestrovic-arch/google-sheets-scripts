@@ -8,6 +8,13 @@ var HUBSPOT_IMPORT_STATUS_POLL_MS_ = 2000;
 var HUBSPOT_IMPORT_STATUS_MAX_WAIT_MS_ = 90000;
 var HUBSPOT_DEAL_LOOKUP_RETRY_COUNT_ = 3;
 var HUBSPOT_DEAL_LOOKUP_RETRY_MS_ = 1500;
+var HUBSPOT_IMPORT_REQUEST_MIN_INTERVAL_MS_ = 250;
+var HUBSPOT_IMPORT_REQUEST_RETRY_COUNT_ = 5;
+var HUBSPOT_IMPORT_REQUEST_RETRY_BASE_MS_ = 2000;
+var HUBSPOT_IMPORT_OBJECT_CACHE_TTL_SECONDS_ = 21600;
+var HUBSPOT_IMPORT_OBJECT_CACHE_MAX_CHARS_ = 90000;
+var HUBSPOT_IMPORT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_IMPORT_LAST_REQUEST_MS";
+var HUBSPOT_IMPORT_DEFAULT_OBJECT_KEYS_ = ["contacts", "deals", "clientCampaigns", "clients"];
 
 var HUBSPOT_IMPORT_OBJECT_SPECS_ = [
   {
@@ -232,7 +239,7 @@ function prepareHubSpotImportFromPayload_(payload, token, options) {
     throw new Error("No rows provided for import.");
   }
 
-  var objectCatalog = loadHubSpotImportObjectCatalog_(token);
+  var objectCatalog = loadHubSpotImportObjectCatalog_(token, payload.headers);
   var resolvedColumns = resolveHubSpotImportColumns_(payload.headers, objectCatalog);
 
   if (resolvedColumns.errors.length) {
@@ -724,7 +731,8 @@ function buildHubSpotImportOperations_(columnMappings) {
   return operations;
 }
 
-function loadHubSpotImportObjectCatalog_(token) {
+function loadHubSpotImportObjectCatalog_(token, headers) {
+  var objectSpecs = inferHubSpotImportObjectSpecsForHeaders_(headers);
   var schemasResponse = hubspotFetchJson_(
     HUBSPOT_API_BASE_ + "/crm-object-schemas/v3/schemas",
     token
@@ -733,40 +741,26 @@ function loadHubSpotImportObjectCatalog_(token) {
     ? schemasResponse.results
     : [];
 
-  var list = HUBSPOT_IMPORT_OBJECT_SPECS_.map(function(spec) {
+  var list = objectSpecs.map(function(spec) {
     var schema = resolveHubSpotObjectSchema_(spec, schemas);
+    var cachedObjectInfo = getCachedHubSpotImportObjectInfo_(token, spec, schema);
+    if (cachedObjectInfo) return cachedObjectInfo;
+
     var propertiesResponse = hubspotFetchJson_(
       HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(schema.objectTypeId),
       token
     );
     var properties = Array.isArray(propertiesResponse && propertiesResponse.results)
-      ? propertiesResponse.results
+      ? propertiesResponse.results.map(compactHubSpotImportProperty_)
       : [];
 
     if (!properties.length) {
       throw new Error("No HubSpot properties returned for " + spec.label + ".");
     }
 
-    var propertyLookup = { label: {}, name: {} };
-    properties.forEach(function(property) {
-      addPropertyLookupEntry_(propertyLookup.label, property.label, property);
-      addPropertyLookupEntry_(propertyLookup.name, property.name, property);
-    });
-
-    var aliasSet = {};
-    spec.aliases.forEach(function(alias) {
-      var key = normalizeHubSpotLookupKey_(alias);
-      if (key) aliasSet[key] = true;
-    });
-
     var singular = schema.labels && schema.labels.singular ? schema.labels.singular : "";
     var plural = schema.labels && schema.labels.plural ? schema.labels.plural : "";
     var schemaName = schema.name || "";
-
-    [singular, plural, schemaName, spec.label].forEach(function(alias) {
-      var key = normalizeHubSpotLookupKey_(alias);
-      if (key) aliasSet[key] = true;
-    });
 
     var primaryDisplayProperty = null;
     for (var i = 0; i < properties.length; i++) {
@@ -776,14 +770,18 @@ function loadHubSpotImportObjectCatalog_(token) {
       }
     }
 
-    return {
+    var objectInfo = {
       key: spec.key,
       label: plural || singular || spec.label,
       objectTypeId: schema.objectTypeId,
-      propertyLookup: propertyLookup,
-      aliases: Object.keys(aliasSet),
+      properties: properties,
+      propertyLookup: buildHubSpotImportPropertyLookup_(properties),
+      aliases: buildHubSpotImportAliasList_(spec, schema),
       primaryDisplayProperty: primaryDisplayProperty
     };
+
+    cacheHubSpotImportObjectInfo_(token, objectInfo);
+    return objectInfo;
   });
 
   var byKey = {};
@@ -792,6 +790,175 @@ function loadHubSpotImportObjectCatalog_(token) {
   });
 
   return { list: list, byKey: byKey };
+}
+
+function inferHubSpotImportObjectSpecsForHeaders_(headers) {
+  var keys = {};
+
+  (headers || []).forEach(function(header) {
+    var key = normalizeHubSpotLookupKey_(header);
+    if (!key) return;
+
+    if (key.indexOf("association label") !== -1) {
+      HUBSPOT_IMPORT_OBJECT_SPECS_.forEach(function(spec) {
+        keys[spec.key] = true;
+      });
+      return;
+    }
+
+    var matched = false;
+    var override = HUBSPOT_IMPORT_HEADER_OVERRIDES_[key];
+    if (override && override.objectKey) {
+      keys[override.objectKey] = true;
+      matched = true;
+    }
+
+    var hintedObjectKey = HUBSPOT_IMPORT_HEADER_OBJECT_HINTS_[key];
+    if (hintedObjectKey) {
+      keys[hintedObjectKey] = true;
+      matched = true;
+    }
+
+    HUBSPOT_IMPORT_OBJECT_SPECS_.forEach(function(spec) {
+      if (doesHubSpotHeaderMentionObjectSpec_(key, spec)) {
+        keys[spec.key] = true;
+        matched = true;
+      }
+    });
+
+    if (!matched) {
+      HUBSPOT_IMPORT_DEFAULT_OBJECT_KEYS_.forEach(function(objectKey) {
+        keys[objectKey] = true;
+      });
+    }
+  });
+
+  if (!Object.keys(keys).length) {
+    HUBSPOT_IMPORT_DEFAULT_OBJECT_KEYS_.forEach(function(objectKey) {
+      keys[objectKey] = true;
+    });
+  }
+
+  return HUBSPOT_IMPORT_OBJECT_SPECS_.filter(function(spec) {
+    return !!keys[spec.key];
+  });
+}
+
+function doesHubSpotHeaderMentionObjectSpec_(normalizedHeader, spec) {
+  var aliases = (spec && spec.aliases ? spec.aliases : [])
+    .concat([spec && spec.key, spec && spec.label])
+    .map(function(alias) { return normalizeHubSpotLookupKey_(alias); })
+    .filter(Boolean);
+
+  return aliases.some(function(alias) {
+    return (
+      normalizedHeader === alias ||
+      normalizedHeader.indexOf(alias + " ") === 0 ||
+      normalizedHeader.slice(-alias.length - 1) === " " + alias
+    );
+  });
+}
+
+function compactHubSpotImportProperty_(property) {
+  return {
+    name: String(property && property.name || "").trim(),
+    label: String(property && property.label || property && property.name || "").trim(),
+    hasUniqueValue: !!(property && property.hasUniqueValue)
+  };
+}
+
+function buildHubSpotImportPropertyLookup_(properties) {
+  var propertyLookup = { label: {}, name: {} };
+  (properties || []).forEach(function(property) {
+    addPropertyLookupEntry_(propertyLookup.label, property.label, property);
+    addPropertyLookupEntry_(propertyLookup.name, property.name, property);
+  });
+  return propertyLookup;
+}
+
+function buildHubSpotImportAliasList_(spec, schema) {
+  var aliasSet = {};
+  var singular = schema && schema.labels && schema.labels.singular ? schema.labels.singular : "";
+  var plural = schema && schema.labels && schema.labels.plural ? schema.labels.plural : "";
+  var schemaName = schema && schema.name ? schema.name : "";
+
+  (spec && spec.aliases ? spec.aliases : [])
+    .concat([singular, plural, schemaName, spec && spec.label])
+    .forEach(function(alias) {
+      var key = normalizeHubSpotLookupKey_(alias);
+      if (key) aliasSet[key] = true;
+    });
+
+  return Object.keys(aliasSet);
+}
+
+function getCachedHubSpotImportObjectInfo_(token, spec, schema) {
+  var cacheKey = getHubSpotImportObjectInfoCacheKey_(token, schema && schema.objectTypeId);
+  if (!cacheKey) return null;
+
+  try {
+    var cached = CacheService.getScriptCache().get(cacheKey);
+    if (!cached) return null;
+
+    var objectInfo = JSON.parse(cached);
+    if (!objectInfo || !objectInfo.objectTypeId) return null;
+    if (spec && spec.key && objectInfo.key !== spec.key) return null;
+    if (!objectInfo.propertyLookup) {
+      objectInfo.propertyLookup = buildHubSpotImportPropertyLookup_(objectInfo.properties || []);
+    }
+    return objectInfo;
+  } catch (e) {
+    return null;
+  }
+}
+
+function cacheHubSpotImportObjectInfo_(token, objectInfo) {
+  var cacheKey = getHubSpotImportObjectInfoCacheKey_(token, objectInfo && objectInfo.objectTypeId);
+  if (!cacheKey) return;
+
+  try {
+    var serialized = JSON.stringify({
+      key: objectInfo.key,
+      label: objectInfo.label,
+      objectTypeId: objectInfo.objectTypeId,
+      properties: objectInfo.properties || [],
+      aliases: objectInfo.aliases || [],
+      primaryDisplayProperty: objectInfo.primaryDisplayProperty || null
+    });
+    if (serialized.length > HUBSPOT_IMPORT_OBJECT_CACHE_MAX_CHARS_) return;
+    CacheService.getScriptCache().put(
+      cacheKey,
+      serialized,
+      HUBSPOT_IMPORT_OBJECT_CACHE_TTL_SECONDS_
+    );
+  } catch (e) {
+    // Cache writes are best-effort; imports should continue if the cache is unavailable.
+  }
+}
+
+function getHubSpotImportObjectInfoCacheKey_(token, objectTypeId) {
+  var id = String(objectTypeId || "").trim();
+  if (!id) return "";
+  return "HS_IMPORT_OBJECT::" + getHubSpotImportTokenFingerprint_(token) + "::" + id;
+}
+
+function getHubSpotImportTokenFingerprint_(token) {
+  try {
+    var digest = Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      String(token || ""),
+      Utilities.Charset.UTF_8
+    );
+    return digest
+      .map(function(byte) {
+        var value = (byte + 256) % 256;
+        return ("0" + value.toString(16)).slice(-2);
+      })
+      .join("")
+      .slice(0, 12);
+  } catch (e) {
+    return "default";
+  }
 }
 
 function resolveHubSpotObjectSchema_(spec, schemas) {
@@ -1193,17 +1360,21 @@ function getHubSpotImportToken_() {
 }
 
 function startHubSpotImport_(token, fileBlob, importRequest) {
-  var response = UrlFetchApp.fetch(HUBSPOT_API_BASE_ + "/crm/v3/imports", {
-    method: "post",
-    muteHttpExceptions: true,
-    headers: {
-      Authorization: "Bearer " + token
+  var response = hubspotFetchWithRetry_(
+    HUBSPOT_API_BASE_ + "/crm/v3/imports",
+    {
+      method: "post",
+      muteHttpExceptions: true,
+      headers: {
+        Authorization: "Bearer " + token
+      },
+      payload: {
+        importRequest: JSON.stringify(importRequest),
+        files: fileBlob.setName(importRequest.files[0].fileName)
+      }
     },
-    payload: {
-      importRequest: JSON.stringify(importRequest),
-      files: fileBlob.setName(importRequest.files[0].fileName)
-    }
-  });
+    { retryPost429: true }
+  );
 
   var code = response.getResponseCode();
   var text = String(response.getContentText() || "");
@@ -1220,20 +1391,18 @@ function startHubSpotImport_(token, fileBlob, importRequest) {
 }
 
 function hubspotFetchJson_(url, token, options) {
-  var response = UrlFetchApp.fetch(
-    url,
-    Object.assign(
-      {
-        method: "get",
-        muteHttpExceptions: true,
-        headers: {
-          Authorization: "Bearer " + token,
-          "Content-Type": "application/json"
-        }
-      },
-      options || {}
-    )
+  var requestOptions = Object.assign(
+    {
+      method: "get",
+      muteHttpExceptions: true,
+      headers: {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json"
+      }
+    },
+    options || {}
   );
+  var response = hubspotFetchWithRetry_(url, requestOptions, {});
 
   var code = response.getResponseCode();
   var text = String(response.getContentText() || "");
@@ -1246,6 +1415,104 @@ function hubspotFetchJson_(url, token, options) {
     return JSON.parse(text);
   } catch (error) {
     throw new Error("HubSpot API parse error: " + error);
+  }
+}
+
+function hubspotFetchWithRetry_(url, options, retryOptions) {
+  var requestOptions = options || {};
+  var maxRetries = Math.max(0, Number(HUBSPOT_IMPORT_REQUEST_RETRY_COUNT_) || 0);
+  var lastError = null;
+
+  for (var attempt = 0; attempt <= maxRetries; attempt++) {
+    waitForHubSpotImportRequestSlot_();
+
+    try {
+      var response = UrlFetchApp.fetch(url, requestOptions);
+      var code = response.getResponseCode();
+      var text = String(response.getContentText() || "");
+      if (!shouldRetryHubSpotResponse_(code, text, requestOptions, retryOptions) || attempt >= maxRetries) {
+        return response;
+      }
+
+      Utilities.sleep(getHubSpotRetryDelayMs_(response, attempt));
+    } catch (e) {
+      lastError = e;
+      if (!isRetryableHubSpotFetchException_(e) || attempt >= maxRetries) {
+        throw e;
+      }
+
+      Utilities.sleep(getHubSpotRetryDelayMs_(null, attempt));
+    }
+  }
+
+  throw lastError || new Error("HubSpot request failed.");
+}
+
+function shouldRetryHubSpotResponse_(code, text, requestOptions, retryOptions) {
+  var method = String(requestOptions && requestOptions.method || "get").toLowerCase();
+  if (code === 429) return method !== "post" || !!(retryOptions && retryOptions.retryPost429);
+  if (method !== "post" && code >= 500) return true;
+
+  return /TEN_SECONDLY_ROLLING|RATE_LIMIT|temporarily unavailable/i.test(String(text || ""));
+}
+
+function isRetryableHubSpotFetchException_(error) {
+  var message = String(error && error.message ? error.message : error || "");
+  return /Bandwidth quota exceeded|Service invoked too many times|Address unavailable|timed out|timeout|DNS|Socket|Connection/i.test(message);
+}
+
+function getHubSpotRetryDelayMs_(response, attempt) {
+  var retryAfterMs = getHubSpotRetryAfterMs_(response);
+  if (retryAfterMs > 0) return retryAfterMs;
+
+  var base = Math.max(500, Number(HUBSPOT_IMPORT_REQUEST_RETRY_BASE_MS_) || 2000);
+  var exponential = base * Math.pow(2, Math.max(0, Number(attempt) || 0));
+  return Math.min(60000, exponential);
+}
+
+function getHubSpotRetryAfterMs_(response) {
+  if (!response || typeof response.getAllHeaders !== "function") return 0;
+
+  try {
+    var headers = response.getAllHeaders() || {};
+    var retryAfter = headers["Retry-After"] || headers["retry-after"];
+    if (!retryAfter) return 0;
+
+    var seconds = Number(retryAfter);
+    if (isFinite(seconds) && seconds > 0) return Math.min(60000, seconds * 1000);
+  } catch (e) {
+    return 0;
+  }
+
+  return 0;
+}
+
+function waitForHubSpotImportRequestSlot_() {
+  var lock = LockService.getScriptLock();
+  var hasLock = false;
+
+  try {
+    lock.waitLock(10000);
+    hasLock = true;
+
+    var props = PropertiesService.getScriptProperties();
+    var lastAt = Number(props.getProperty(HUBSPOT_IMPORT_LAST_REQUEST_MS_PROP_) || 0);
+    var now = Date.now();
+    var waitMs = lastAt + HUBSPOT_IMPORT_REQUEST_MIN_INTERVAL_MS_ - now;
+    if (waitMs > 0) {
+      Utilities.sleep(waitMs);
+      now = Date.now();
+    }
+
+    props.setProperty(HUBSPOT_IMPORT_LAST_REQUEST_MS_PROP_, String(now));
+  } catch (e) {
+    if (!hasLock) return;
+  } finally {
+    if (hasLock) {
+      try {
+        lock.releaseLock();
+      } catch (ignore) {}
+    }
   }
 }
 
