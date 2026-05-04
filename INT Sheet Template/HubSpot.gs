@@ -9,6 +9,11 @@ function onOpen() {
     .addItem("Import to HubSpot", "importCreatorListToHubSpotOnly")
     .addItem("Woodpecker Export", "downloadCreatorListWoodpeckerCsv")
     .addToUi();
+
+  SpreadsheetApp.getUi()
+    .createMenu("⏰ Triggers")
+    .addItem("Sync Dropdown Values from HubSpot", "syncDropdownValuesFromHubSpot")
+    .addToUi();
 }
 
 function enrichCreatorListRowsInBatches() {
@@ -23,6 +28,10 @@ function downloadCreatorListWoodpeckerCsv() {
   return INT_HUBSPOT_MENU_.downloadCreatorListWoodpeckerCsv();
 }
 
+function syncDropdownValuesFromHubSpot() {
+  return INT_HUBSPOT_MENU_.syncDropdownValuesFromHubSpot();
+}
+
 const INT_HUBSPOT_MENU_ = (function () {
   const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
     "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
@@ -32,6 +41,91 @@ const INT_HUBSPOT_MENU_ = (function () {
   const HUBSPOT_IMPORT_DELAY_MS_ = 1500;
   const HUBSPOT_IMPORT_RETRY_COUNT_ = 4;
   const HUBSPOT_IMPORT_RETRY_BASE_MS_ = 5000;
+  const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
+  const HUBSPOT_API_KEY_ = "key here";
+  const HUBSPOT_API_KEY_PROP_ = "HUBSPOT_API_KEY";
+  const HUBSPOT_DEALS_OBJECT_API_NAME_ = "deals";
+  const HUBSPOT_CONTACTS_OBJECT_API_NAME_ = "contacts";
+  const HUBSPOT_BATCH_UPDATE_SIZE_ = 100;
+  const HUBSPOT_REQUEST_MIN_INTERVAL_MS_ = 250;
+  const HUBSPOT_REQUEST_RETRY_COUNT_ = 5;
+  const HUBSPOT_REQUEST_RETRY_BASE_MS_ = 2000;
+  const HUBSPOT_PROPERTY_CACHE_TTL_SECONDS_ = 21600;
+  const HUBSPOT_PROPERTY_CACHE_MAX_CHARS_ = 90000;
+  const HUBSPOT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_LAST_REQUEST_MS";
+  const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
+  const HUBSPOT_DROPDOWN_VALUES_COLUMNS_ = {
+    clientName: "Client name",
+    client: "Client",
+    dealOwner: "Deal Owner",
+    campaignName: "Campaign Name",
+    dealType: "Deal Type",
+    activationType: "Activation Type",
+    pipeline: "Pipeline",
+    dealStage: "Deal Stage",
+    currency: "Currency",
+    influencerType: "Influencer Type",
+    influencerVertical: "Influencer Vertical",
+    contactType: "Contact Type",
+    countryRegion: "Country/Region",
+    language: "Language"
+  };
+  const HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_ = {
+    sheetName: "Dropdown Values",
+    columns: HUBSPOT_DROPDOWN_VALUES_COLUMNS_,
+    client: {
+      objectTypeId: "",
+      aliases: ["Client", "Clients"],
+      propertyName: "Client Name"
+    },
+    campaign: {
+      objectTypeId: "",
+      aliases: ["Client Campaign", "Client Campaigns"],
+      propertyName: "Campaign Name",
+      createdWithinMonths: 3
+    },
+    activation: {
+      objectTypeId: "",
+      aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_KEY_]
+    },
+    optionColumns: [
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.dealType,
+        objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
+        propertyName: "Deal Type"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.activationType,
+        objectConfigKey: "activation",
+        propertyName: "Activation Type"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.influencerType,
+        objectTypeId: HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        propertyName: "Influencer Type"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.influencerVertical,
+        objectTypeId: HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        propertyName: "Influencer Vertical"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.contactType,
+        objectTypeId: HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        propertyName: "Contact Type"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.countryRegion,
+        objectTypeId: HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        propertyName: "Country/Region"
+      },
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.language,
+        objectTypeId: HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        propertyName: "Language"
+      }
+    ]
+  };
 
   const OPENAI_API_KEY_ = "api key here";
   const OPENAI_MODEL_PROP_ = "OPENAI_MODEL";
@@ -2911,6 +3005,884 @@ const INT_HUBSPOT_MENU_ = (function () {
     });
   }
 
+  function syncDropdownValuesFromHubSpot() {
+    try {
+      const result = syncHubSpotDropdownValues_(SpreadsheetApp.getActiveSpreadsheet());
+      const message = buildHubSpotDropdownSyncMessage_(result);
+
+      Logger.log(message);
+      showSpreadsheetToast_(
+        "Dropdown Values synced from HubSpot. " +
+        result.updatedColumnCount +
+        " columns updated."
+      );
+      return result;
+    } catch (e) {
+      const message = "HubSpot Dropdown Values sync failed: " + (e && e.message ? e.message : e);
+      Logger.log(message);
+      showSpreadsheetAlert_(message);
+      throw e;
+    }
+  }
+
+  function syncHubSpotDropdownValues_(ss) {
+    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
+    const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
+    if (!spreadsheet) throw new Error("No active spreadsheet found.");
+
+    const sheet = spreadsheet.getSheetByName(config.sheetName);
+    if (!sheet) throw new Error("Sheet not found: " + config.sheetName);
+
+    const token = getHubSpotApiToken_();
+    if (!token) {
+      throw new Error(
+        "HubSpot Private App token is not configured. Set script property " +
+        HUBSPOT_API_KEY_PROP_ + "."
+      );
+    }
+
+    const campaignClientRows = fetchHubSpotDropdownCampaignClientRows_(token);
+    const valuesByColumnName = {};
+    valuesByColumnName[config.columns.clientName] = getDistinctHubSpotDropdownCampaignClientNames_(campaignClientRows);
+    valuesByColumnName[config.columns.client] = campaignClientRows.map(function (row) {
+      return row.clientName;
+    });
+    valuesByColumnName[config.columns.dealOwner] = fetchHubSpotDropdownDealOwnerNames_(token);
+    valuesByColumnName[config.columns.campaignName] = campaignClientRows.map(function (row) {
+      return row.campaignName;
+    });
+    valuesByColumnName[config.columns.pipeline] = fetchHubSpotDropdownDealPipelineNames_(token);
+    valuesByColumnName[config.columns.dealStage] = fetchHubSpotDropdownDealStageNames_(token);
+    valuesByColumnName[config.columns.currency] = fetchHubSpotDropdownCurrencyCodes_(token);
+    (config.optionColumns || []).forEach(function (columnConfig) {
+      valuesByColumnName[columnConfig.columnName] = fetchHubSpotDropdownPropertyOptions_(token, columnConfig);
+    });
+
+    writeHubSpotDropdownValues_(sheet, valuesByColumnName);
+
+    return buildHubSpotDropdownSyncResult_(valuesByColumnName);
+  }
+
+  function getHubSpotApiToken_() {
+    const configured = String(
+      PropertiesService.getScriptProperties().getProperty(HUBSPOT_API_KEY_PROP_) || ""
+    ).trim();
+    return configured || String(HUBSPOT_API_KEY_ || "").trim();
+  }
+
+  function fetchHubSpotDropdownDealOwnerNames_(token) {
+    const names = [];
+    let after = "";
+
+    do {
+      const query = buildHubSpotQueryString_({
+        limit: 500,
+        archived: false,
+        after: after
+      });
+      const data = hubspotRequestJson_(HUBSPOT_API_BASE_ + "/crm/v3/owners/?" + query, token);
+      const owners = Array.isArray(data && data.results) ? data.results : [];
+
+      owners.forEach(function (owner) {
+        if (!owner || owner.archived === true) return;
+
+        const userId = String(owner.userId || "").trim();
+        if (!userId) return;
+
+        const firstName = String(owner.firstName || "").trim();
+        const lastName = String(owner.lastName || "").trim();
+        const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
+        if (fullName) names.push(fullName);
+      });
+
+      after = String(data && data.paging && data.paging.next && data.paging.next.after || "").trim();
+    } while (after);
+
+    return normalizeHubSpotDropdownValues_(names);
+  }
+
+  function fetchHubSpotDropdownCampaignClientRows_(token) {
+    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
+    const campaignConfig = config.campaign;
+    const clientConfig = config.client;
+    const createdAfter = getHubSpotDropdownCampaignCreatedAfter_(campaignConfig);
+    const campaignObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, campaignConfig);
+    const clientObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, clientConfig);
+    const campaignPropertyName = resolveHubSpotDropdownPropertyName_(
+      campaignObjectTypeId,
+      campaignConfig && campaignConfig.propertyName,
+      token
+    );
+    const clientPropertyName = resolveHubSpotDropdownPropertyName_(
+      clientObjectTypeId,
+      clientConfig && clientConfig.propertyName,
+      token
+    );
+    const campaignRecords = fetchHubSpotCrmObjectRecords_(
+      campaignObjectTypeId,
+      [campaignPropertyName],
+      token
+    ).filter(function (record) {
+      return isHubSpotRecordCreatedAtOrAfter_(record, createdAfter);
+    });
+
+    const campaignIds = campaignRecords.map(function (record) {
+      return String(record && record.id || "").trim();
+    });
+    const clientIdsByCampaignId = fetchHubSpotAssociatedObjectIdsByFromId_(
+      campaignObjectTypeId,
+      clientObjectTypeId,
+      campaignIds,
+      token
+    );
+    const clientNameById = fetchHubSpotObjectPropertyValuesByIds_(
+      clientObjectTypeId,
+      flattenHubSpotDropdownIdMapValues_(clientIdsByCampaignId),
+      clientPropertyName,
+      token
+    );
+    const rows = [];
+
+    campaignRecords.forEach(function (record) {
+      const campaignId = String(record && record.id || "").trim();
+      const properties = record && record.properties ? record.properties : {};
+      const campaignName = String(properties[campaignPropertyName] || "").trim();
+      if (!campaignName) return;
+
+      const clientNames = uniqueHubSpotDropdownValues_(
+        (clientIdsByCampaignId[campaignId] || []).map(function (clientId) {
+          return clientNameById[clientId] || "";
+        })
+      );
+
+      rows.push({
+        campaignName: campaignName,
+        clientName: clientNames.join("; "),
+        clientNames: clientNames
+      });
+    });
+
+    rows.sort(function (a, b) {
+      const campaignCompare = normalizeDropdownLookupValue_(a.campaignName)
+        .localeCompare(normalizeDropdownLookupValue_(b.campaignName));
+      if (campaignCompare !== 0) return campaignCompare;
+      return normalizeDropdownLookupValue_(a.clientName)
+        .localeCompare(normalizeDropdownLookupValue_(b.clientName));
+    });
+
+    return rows;
+  }
+
+  function getDistinctHubSpotDropdownCampaignClientNames_(campaignClientRows) {
+    const names = [];
+    (campaignClientRows || []).forEach(function (row) {
+      (row && row.clientNames || []).forEach(function (clientName) {
+        names.push(clientName);
+      });
+    });
+    return normalizeHubSpotDropdownValues_(names);
+  }
+
+  function fetchHubSpotDropdownCurrencyCodes_(token) {
+    const codes = [];
+    const errors = [];
+
+    try {
+      let after = "";
+      do {
+        const query = buildHubSpotQueryString_({
+          limit: 100,
+          after: after
+        });
+        const data = hubspotRequestJson_(
+          HUBSPOT_API_BASE_ + "/settings/v3/currencies/exchange-rates/current?" + query,
+          token
+        );
+        const rates = Array.isArray(data && data.results)
+          ? data.results
+          : (Array.isArray(data) ? data : []);
+
+        rates.forEach(function (rate) {
+          if (rate && rate.visibleInUI === false) return;
+          appendHubSpotCurrencyCode_(codes, rate && rate.fromCurrencyCode);
+          appendHubSpotCurrencyCode_(codes, rate && rate.toCurrencyCode);
+        });
+
+        after = String(data && data.paging && data.paging.next && data.paging.next.after || "").trim();
+      } while (after);
+    } catch (e) {
+      errors.push(e);
+    }
+
+    try {
+      const companyCurrency = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ + "/settings/v3/currencies/company-currency",
+        token
+      );
+      appendHubSpotCurrencyCode_(codes, companyCurrency && companyCurrency.currencyCode);
+    } catch (e) {
+      errors.push(e);
+    }
+
+    const out = normalizeHubSpotCurrencyCodes_(codes);
+    if (out.length > 0) return out;
+
+    const fallback = fetchHubSpotDropdownPropertyOptions_(
+      token,
+      {
+        objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
+        propertyName: "deal_currency_code"
+      }
+    );
+    if (fallback.length > 0) return fallback;
+
+    throw new Error(
+      "HubSpot currency sync returned no currencies. " +
+      "Make sure the Private App token has the multi-currency-read scope. " +
+      errors.map(function (e) { return String(e && e.message ? e.message : e); }).join(" ")
+    );
+  }
+
+  function appendHubSpotCurrencyCode_(out, value) {
+    const code = String(value || "").trim().toUpperCase();
+    if (code) out.push(code);
+  }
+
+  function normalizeHubSpotCurrencyCodes_(codes) {
+    return uniqueHubSpotDropdownValues_(codes).sort();
+  }
+
+  function fetchHubSpotDropdownPropertyOptions_(token, propertyConfig) {
+    const objectConfig = getHubSpotDropdownPropertyObjectConfig_(propertyConfig);
+    const objectType = resolveHubSpotDropdownObjectTypeId_(token, objectConfig);
+    const propertyName = resolveHubSpotDropdownPropertyName_(
+      objectType,
+      propertyConfig && propertyConfig.propertyName,
+      token
+    );
+    const property = fetchHubSpotPropertyDefinition_(objectType, propertyName, token);
+    const options = Array.isArray(property && property.options) ? property.options : [];
+
+    return uniqueHubSpotDropdownValues_(
+      options.map(function (option) {
+        return String(option && (option.label || option.value) || "").trim();
+      })
+    );
+  }
+
+  function getHubSpotDropdownPropertyObjectConfig_(propertyConfig) {
+    const configKey = String(propertyConfig && propertyConfig.objectConfigKey || "").trim();
+    const sharedConfig = configKey
+      ? HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_[configKey]
+      : null;
+
+    return Object.assign({}, sharedConfig || {}, propertyConfig || {});
+  }
+
+  function fetchHubSpotDropdownDealPipelineNames_(token) {
+    return uniqueHubSpotDropdownValues_(
+      fetchHubSpotDealPipelines_(token).map(function (pipeline) {
+        return String(pipeline && pipeline.label || "").trim();
+      })
+    );
+  }
+
+  function fetchHubSpotDropdownDealStageNames_(token) {
+    const stageNames = [];
+    fetchHubSpotDealPipelines_(token).forEach(function (pipeline) {
+      const stages = Array.isArray(pipeline && pipeline.stages) ? pipeline.stages : [];
+      stages.forEach(function (stage) {
+        if (stage && stage.archived === true) return;
+        stageNames.push(String(stage && stage.label || "").trim());
+      });
+    });
+    return uniqueHubSpotDropdownValues_(stageNames);
+  }
+
+  function fetchHubSpotDealPipelines_(token) {
+    const data = hubspotRequestJson_(
+      HUBSPOT_API_BASE_ +
+        "/crm/v3/pipelines/" +
+        encodeURIComponent(HUBSPOT_DEALS_OBJECT_API_NAME_),
+      token
+    );
+    const pipelines = Array.isArray(data && data.results) ? data.results : [];
+    return pipelines.filter(function (pipeline) {
+      return !(pipeline && pipeline.archived === true);
+    });
+  }
+
+  function resolveHubSpotDropdownObjectTypeId_(token, objectConfig) {
+    const configuredObjectTypeId = String(objectConfig && objectConfig.objectTypeId || "").trim();
+    if (configuredObjectTypeId) return configuredObjectTypeId;
+
+    const aliases = uniqueNonEmptyStrings_(objectConfig && objectConfig.aliases || []);
+    const info = loadHubSpotCustomObjectInfo_(
+      {
+        key: aliases[0] || "",
+        aliases: aliases
+      },
+      token
+    );
+    if (!info || !info.objectTypeId) {
+      throw new Error("Could not resolve HubSpot object type ID for " + aliases.join(", ") + ".");
+    }
+    return info.objectTypeId;
+  }
+
+  function resolveHubSpotDropdownPropertyName_(objectTypeId, propertyLabelOrName, token) {
+    const targets = uniqueNonEmptyStrings_(
+      Array.isArray(propertyLabelOrName) ? propertyLabelOrName : [propertyLabelOrName]
+    ).map(function (value) {
+      return normalizeHeaderName_(value);
+    }).filter(Boolean);
+    if (targets.length === 0) throw new Error("HubSpot dropdown property name is not configured.");
+
+    const properties = fetchHubSpotPropertiesForObject_(objectTypeId, token);
+    for (let i = 0; i < properties.length; i++) {
+      const property = properties[i] || {};
+      if (targets.indexOf(normalizeHeaderName_(property.name)) !== -1) return String(property.name || "").trim();
+      if (targets.indexOf(normalizeHeaderName_(property.label)) !== -1) return String(property.name || "").trim();
+    }
+
+    throw new Error(
+      "HubSpot property not found on object " +
+      objectTypeId +
+      ": " +
+      getHubSpotDropdownPropertyConfigLabel_(propertyLabelOrName)
+    );
+  }
+
+  function fetchHubSpotPropertyDefinition_(objectType, propertyName, token) {
+    return hubspotRequestJson_(
+      HUBSPOT_API_BASE_ +
+        "/crm/v3/properties/" +
+        encodeURIComponent(objectType) +
+        "/" +
+        encodeURIComponent(propertyName),
+      token
+    );
+  }
+
+  function fetchHubSpotCrmObjectRecords_(objectTypeId, propertyNames, token) {
+    const records = [];
+    const normalizedObjectTypeId = String(objectTypeId || "").trim();
+    if (!normalizedObjectTypeId) return records;
+
+    const properties = uniqueNonEmptyStrings_(propertyNames || []);
+    let after = "";
+
+    do {
+      const query = buildHubSpotQueryString_({
+        limit: 100,
+        archived: false,
+        properties: properties.join(","),
+        after: after
+      });
+      const data = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(normalizedObjectTypeId) + "?" + query,
+        token
+      );
+      const pageRecords = Array.isArray(data && data.results) ? data.results : [];
+      pageRecords.forEach(function (record) {
+        if (!record || record.archived === true) return;
+        records.push(record);
+      });
+
+      after = String(data && data.paging && data.paging.next && data.paging.next.after || "").trim();
+    } while (after);
+
+    return records;
+  }
+
+  function fetchHubSpotAssociatedObjectIdsByFromId_(fromObjectType, toObjectType, fromIds, token) {
+    const ids = uniqueNonEmptyStrings_(fromIds || []);
+    const out = {};
+    ids.forEach(function (id) {
+      out[id] = [];
+    });
+    if (ids.length === 0) return out;
+
+    chunkArray_(ids, HUBSPOT_BATCH_UPDATE_SIZE_).forEach(function (chunk) {
+      const data = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ +
+          "/crm/v4/associations/" +
+          encodeURIComponent(fromObjectType) +
+          "/" +
+          encodeURIComponent(toObjectType) +
+          "/batch/read",
+        token,
+        {
+          method: "post",
+          payload: JSON.stringify({
+            inputs: chunk.map(function (id) { return { id: id }; })
+          })
+        }
+      );
+      const results = Array.isArray(data && data.results) ? data.results : [];
+      results.forEach(function (result) {
+        const fromId = String(
+          (result && result.from && result.from.id) ||
+          (result && result.fromObjectId) ||
+          ""
+        ).trim();
+        if (!fromId) return;
+
+        const associatedIds = Array.isArray(result && result.to)
+          ? result.to.map(function (item) {
+            return String(
+              (item && item.toObjectId) ||
+              (item && item.id) ||
+              (item && item.to && item.to.id) ||
+              ""
+            ).trim();
+          })
+          : [];
+        out[fromId] = uniqueNonEmptyStrings_((out[fromId] || []).concat(associatedIds));
+      });
+    });
+
+    return out;
+  }
+
+  function fetchHubSpotObjectPropertyValuesByIds_(objectTypeId, ids, propertyName, token) {
+    const objectIds = uniqueNonEmptyStrings_(ids || []);
+    const property = String(propertyName || "").trim();
+    const out = {};
+    if (!objectTypeId || objectIds.length === 0 || !property) return out;
+
+    chunkArray_(objectIds, HUBSPOT_BATCH_UPDATE_SIZE_).forEach(function (chunk) {
+      const data = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ +
+          "/crm/v3/objects/" +
+          encodeURIComponent(objectTypeId) +
+          "/batch/read",
+        token,
+        {
+          method: "post",
+          payload: JSON.stringify({
+            properties: [property],
+            inputs: chunk.map(function (id) { return { id: id }; })
+          })
+        }
+      );
+      const results = Array.isArray(data && data.results) ? data.results : [];
+      results.forEach(function (record) {
+        if (!record || record.archived === true) return;
+
+        const id = String(record.id || "").trim();
+        const properties = record.properties || {};
+        const value = String(properties[property] || "").trim();
+        if (id && value) out[id] = value;
+      });
+    });
+
+    return out;
+  }
+
+  function flattenHubSpotDropdownIdMapValues_(idMap) {
+    const out = [];
+    Object.keys(idMap || {}).forEach(function (key) {
+      (idMap[key] || []).forEach(function (id) {
+        out.push(id);
+      });
+    });
+    return uniqueNonEmptyStrings_(out);
+  }
+
+  function writeHubSpotDropdownValues_(sheet, valuesByColumnName) {
+    const columnNames = Object.keys(valuesByColumnName || {});
+    if (columnNames.length === 0) return;
+
+    const header = sheet
+      .getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1))
+      .getDisplayValues()[0]
+      .map(function (value) { return String(value || "").trim(); });
+
+    const columnIndexesByName = {};
+    const missingColumns = [];
+    columnNames.forEach(function (columnName) {
+      const idx = findHeaderIndex_(header, columnName);
+      if (idx === -1) {
+        missingColumns.push(columnName);
+        return;
+      }
+      columnIndexesByName[columnName] = idx;
+    });
+
+    if (missingColumns.length) {
+      throw new Error(
+        "Dropdown Values sheet is missing required column(s): " + missingColumns.join(", ")
+      );
+    }
+
+    const maxValueCount = columnNames.reduce(function (max, columnName) {
+      const values = valuesByColumnName[columnName] || [];
+      return Math.max(max, values.length);
+    }, 0);
+    ensureHubSpotDropdownRowCapacity_(sheet, maxValueCount + 1);
+
+    const clearRowCount = Math.max(sheet.getMaxRows() - 1, 0);
+    columnNames.forEach(function (columnName) {
+      const col1 = columnIndexesByName[columnName] + 1;
+      const values = valuesByColumnName[columnName] || [];
+
+      if (clearRowCount > 0) {
+        sheet.getRange(2, col1, clearRowCount, 1).clearContent();
+      }
+
+      if (values.length > 0) {
+        sheet.getRange(2, col1, values.length, 1).setValues(
+          values.map(function (value) { return [value]; })
+        );
+      }
+    });
+  }
+
+  function ensureHubSpotDropdownRowCapacity_(sheet, requiredRows) {
+    const rowCount = Math.max(2, Number(requiredRows) || 2);
+    const maxRows = sheet.getMaxRows();
+    if (maxRows >= rowCount) return;
+
+    sheet.insertRowsAfter(maxRows, rowCount - maxRows);
+  }
+
+  function getHubSpotDropdownCampaignCreatedAfter_(campaignConfig) {
+    const months = Math.max(1, Number(campaignConfig && campaignConfig.createdWithinMonths) || 3);
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - months);
+    return cutoff;
+  }
+
+  function isHubSpotRecordCreatedAtOrAfter_(record, cutoff) {
+    const cutoffDate = Object.prototype.toString.call(cutoff) === "[object Date]" ? cutoff : null;
+    if (!cutoffDate || isNaN(cutoffDate.getTime())) return true;
+
+    const properties = record && record.properties ? record.properties : {};
+    const createdValue =
+      record && (record.createdAt || record.createdate) ||
+      properties.createdate ||
+      properties.hs_createdate ||
+      "";
+    const createdAt = parseHubSpotTimestamp_(createdValue);
+    return createdAt && createdAt.getTime() >= cutoffDate.getTime();
+  }
+
+  function parseHubSpotTimestamp_(value) {
+    if (Object.prototype.toString.call(value) === "[object Date]") {
+      return isNaN(value.getTime()) ? null : value;
+    }
+
+    const text = String(value || "").trim();
+    if (!text) return null;
+
+    const timestamp = /^\d+$/.test(text) ? Number(text) : NaN;
+    const date = isNaN(timestamp) ? new Date(text) : new Date(timestamp);
+    return isNaN(date.getTime()) ? null : date;
+  }
+
+  function normalizeHubSpotDropdownValues_(values) {
+    const out = uniqueHubSpotDropdownValues_(values);
+    out.sort(function (a, b) {
+      return normalizeDropdownLookupValue_(a).localeCompare(normalizeDropdownLookupValue_(b));
+    });
+    return out;
+  }
+
+  function uniqueHubSpotDropdownValues_(values) {
+    const out = [];
+    const seen = {};
+
+    (values || []).forEach(function (value) {
+      const text = String(value || "").trim().replace(/\s+/g, " ");
+      const key = normalizeDropdownLookupValue_(text);
+      if (!key || seen[key]) return;
+
+      seen[key] = true;
+      out.push(text);
+    });
+
+    return out;
+  }
+
+  function buildHubSpotDropdownSyncResult_(valuesByColumnName) {
+    const countsByColumnName = {};
+    Object.keys(valuesByColumnName || {}).forEach(function (columnName) {
+      countsByColumnName[columnName] = (valuesByColumnName[columnName] || []).length;
+    });
+
+    return {
+      updatedColumnCount: Object.keys(countsByColumnName).length,
+      countsByColumnName: countsByColumnName
+    };
+  }
+
+  function buildHubSpotDropdownSyncMessage_(result) {
+    const counts = result && result.countsByColumnName ? result.countsByColumnName : {};
+    const parts = Object.keys(counts).map(function (columnName) {
+      return columnName + ": " + counts[columnName];
+    });
+
+    return "Dropdown Values synced from HubSpot. " + parts.join(", ") + ".";
+  }
+
+  function getHubSpotDropdownPropertyConfigLabel_(propertyLabelOrName) {
+    if (Array.isArray(propertyLabelOrName)) {
+      return propertyLabelOrName.join(", ");
+    }
+    return String(propertyLabelOrName || "");
+  }
+
+  function buildHubSpotQueryString_(params) {
+    return Object.keys(params || {})
+      .filter(function (key) {
+        const value = params[key];
+        return value !== null && value !== undefined && String(value) !== "";
+      })
+      .map(function (key) {
+        return encodeURIComponent(key) + "=" + encodeURIComponent(String(params[key]));
+      })
+      .join("&");
+  }
+
+  function loadHubSpotCustomObjectInfo_(spec, token) {
+    const schemasResponse = hubspotRequestJson_(
+      HUBSPOT_API_BASE_ + "/crm-object-schemas/v3/schemas",
+      token
+    );
+    const schemas = Array.isArray(schemasResponse && schemasResponse.results)
+      ? schemasResponse.results
+      : [];
+    const wanted = uniqueNonEmptyStrings_(
+      (spec && spec.aliases ? spec.aliases : [spec && spec.key]).map(function (value) {
+        return normalizeHeaderName_(value);
+      })
+    );
+
+    for (let i = 0; i < schemas.length; i++) {
+      const schema = schemas[i] || {};
+      const candidates = uniqueNonEmptyStrings_([
+        normalizeHeaderName_(schema.name),
+        normalizeHeaderName_(schema.labels && schema.labels.singular),
+        normalizeHeaderName_(schema.labels && schema.labels.plural)
+      ]);
+      const matched = wanted.some(function (alias) {
+        return candidates.indexOf(alias) !== -1;
+      });
+      if (!matched) continue;
+
+      return {
+        objectTypeId: String(schema.objectTypeId || "").trim(),
+        label: String(
+          (schema.labels && (schema.labels.plural || schema.labels.singular)) ||
+          (spec && spec.key) ||
+          ""
+        ).trim(),
+        primaryDisplayProperty: String(schema.primaryDisplayProperty || "").trim()
+      };
+    }
+
+    throw new Error(`Could not find HubSpot custom object schema for "${spec && spec.key}".`);
+  }
+
+  function fetchHubSpotPropertiesForObject_(objectType, token) {
+    const normalizedObjectType = String(objectType || "").trim();
+    if (!normalizedObjectType) return [];
+
+    const cacheKey = getHubSpotPropertiesCacheKey_(token, normalizedObjectType);
+    if (cacheKey) {
+      try {
+        const cached = CacheService.getScriptCache().get(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed)) return parsed;
+        }
+      } catch (e) {
+        // Property cache is best-effort; fall back to HubSpot if it is unavailable.
+      }
+    }
+
+    const data = hubspotRequestJson_(
+      HUBSPOT_API_BASE_ + "/crm/v3/properties/" + encodeURIComponent(normalizedObjectType),
+      token
+    );
+    const properties = Array.isArray(data && data.results)
+      ? data.results.map(compactHubSpotPropertyInfo_)
+      : [];
+
+    if (cacheKey) {
+      try {
+        const serialized = JSON.stringify(properties);
+        if (serialized.length <= HUBSPOT_PROPERTY_CACHE_MAX_CHARS_) {
+          CacheService.getScriptCache().put(
+            cacheKey,
+            serialized,
+            HUBSPOT_PROPERTY_CACHE_TTL_SECONDS_
+          );
+        }
+      } catch (e) {
+        // Cache writes are best-effort; imports/syncs should continue.
+      }
+    }
+
+    return properties;
+  }
+
+  function compactHubSpotPropertyInfo_(property) {
+    return {
+      name: String(property && property.name || "").trim(),
+      label: String(property && property.label || property && property.name || "").trim(),
+      type: String(property && property.type || "").trim(),
+      fieldType: String(property && property.fieldType || "").trim()
+    };
+  }
+
+  function getHubSpotPropertiesCacheKey_(token, objectType) {
+    const type = String(objectType || "").trim();
+    if (!type) return "";
+    return "HS_PROPERTIES::" + getHubSpotTokenFingerprint_(token) + "::" + type;
+  }
+
+  function getHubSpotTokenFingerprint_(token) {
+    try {
+      const digest = Utilities.computeDigest(
+        Utilities.DigestAlgorithm.SHA_256,
+        String(token || ""),
+        Utilities.Charset.UTF_8
+      );
+      return digest
+        .map(function (byte) {
+          const value = (byte + 256) % 256;
+          return ("0" + value.toString(16)).slice(-2);
+        })
+        .join("")
+        .slice(0, 12);
+    } catch (e) {
+      return "default";
+    }
+  }
+
+  function hubspotRequestJson_(url, token, options) {
+    const requestOptions = Object.assign(
+      {
+        method: "get",
+        muteHttpExceptions: true,
+        headers: {
+          Authorization: "Bearer " + String(token || ""),
+          "Content-Type": "application/json"
+        }
+      },
+      options || {}
+    );
+    const response = hubspotFetchWithRetry_(String(url || ""), requestOptions);
+
+    const code = response.getResponseCode();
+    const text = String(response.getContentText() || "");
+    if (code >= 400) {
+      throw new Error("HubSpot API error " + code + ": " + text.slice(0, 1000));
+    }
+    if (!text) return {};
+
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      throw new Error("HubSpot API parse error: " + e);
+    }
+  }
+
+  function hubspotFetchWithRetry_(url, options) {
+    const requestOptions = options || {};
+    const maxRetries = Math.max(0, Number(HUBSPOT_REQUEST_RETRY_COUNT_) || 0);
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      waitForHubSpotRequestSlot_();
+
+      try {
+        const response = UrlFetchApp.fetch(url, requestOptions);
+        const code = response.getResponseCode();
+        const text = String(response.getContentText() || "");
+        if (!shouldRetryHubSpotResponse_(code, text) || attempt >= maxRetries) {
+          return response;
+        }
+
+        Utilities.sleep(getHubSpotRetryDelayMs_(response, attempt));
+      } catch (e) {
+        lastError = e;
+        if (!isRetryableHubSpotFetchException_(e) || attempt >= maxRetries) throw e;
+
+        Utilities.sleep(getHubSpotRetryDelayMs_(null, attempt));
+      }
+    }
+
+    throw lastError || new Error("HubSpot request failed.");
+  }
+
+  function shouldRetryHubSpotResponse_(code, text) {
+    if (code === 429 || code >= 500) return true;
+    return /TEN_SECONDLY_ROLLING|RATE_LIMIT|temporarily unavailable/i.test(String(text || ""));
+  }
+
+  function isRetryableHubSpotFetchException_(error) {
+    const message = String(error && error.message ? error.message : error || "");
+    return /Bandwidth quota exceeded|Service invoked too many times|Address unavailable|timed out|timeout|DNS|Socket|Connection/i.test(message);
+  }
+
+  function getHubSpotRetryDelayMs_(response, attempt) {
+    const retryAfterMs = getHubSpotRetryAfterMs_(response);
+    if (retryAfterMs > 0) return retryAfterMs;
+
+    const base = Math.max(500, Number(HUBSPOT_REQUEST_RETRY_BASE_MS_) || 2000);
+    const exponential = base * Math.pow(2, Math.max(0, Number(attempt) || 0));
+    return Math.min(60000, exponential);
+  }
+
+  function getHubSpotRetryAfterMs_(response) {
+    if (!response || typeof response.getAllHeaders !== "function") return 0;
+
+    try {
+      const headers = response.getAllHeaders() || {};
+      const retryAfter = headers["Retry-After"] || headers["retry-after"];
+      if (!retryAfter) return 0;
+
+      const seconds = Number(retryAfter);
+      if (isFinite(seconds) && seconds > 0) return Math.min(60000, seconds * 1000);
+    } catch (e) {
+      return 0;
+    }
+
+    return 0;
+  }
+
+  function waitForHubSpotRequestSlot_() {
+    const lock = LockService.getScriptLock();
+    let hasLock = false;
+
+    try {
+      lock.waitLock(10000);
+      hasLock = true;
+
+      const props = PropertiesService.getScriptProperties();
+      const lastAt = Number(props.getProperty(HUBSPOT_LAST_REQUEST_MS_PROP_) || 0);
+      let now = Date.now();
+      const waitMs = lastAt + HUBSPOT_REQUEST_MIN_INTERVAL_MS_ - now;
+      if (waitMs > 0) {
+        Utilities.sleep(waitMs);
+        now = Date.now();
+      }
+
+      props.setProperty(HUBSPOT_LAST_REQUEST_MS_PROP_, String(now));
+    } catch (e) {
+      if (!hasLock) return;
+    } finally {
+      if (hasLock) {
+        try {
+          lock.releaseLock();
+        } catch (ignore) {}
+      }
+    }
+  }
+
   function getClientNameByCampaignName_(ss, sheetName) {
     const dropdownSheet = ss.getSheetByName(sheetName || "Dropdown Values");
     if (!dropdownSheet) return {};
@@ -3229,6 +4201,14 @@ const INT_HUBSPOT_MENU_ = (function () {
       if (ss) ss.toast(String(message || ""), "Scripts", 8);
     } catch (e) {
       // Ignore UI/toast errors when run outside the spreadsheet UI.
+    }
+  }
+
+  function showSpreadsheetAlert_(message) {
+    try {
+      SpreadsheetApp.getUi().alert(String(message || ""));
+    } catch (e) {
+      // Ignore UI/alert errors when run outside the spreadsheet UI.
     }
   }
 
@@ -3722,6 +4702,7 @@ const INT_HUBSPOT_MENU_ = (function () {
   return {
     enrichCreatorListRowsInBatches: enrichCreatorListRowsInBatches,
     importCreatorListToHubSpotOnly: importCreatorListToHubSpotOnly,
-    downloadCreatorListWoodpeckerCsv: downloadCreatorListWoodpeckerCsv
+    downloadCreatorListWoodpeckerCsv: downloadCreatorListWoodpeckerCsv,
+    syncDropdownValuesFromHubSpot: syncDropdownValuesFromHubSpot
   };
 })();
