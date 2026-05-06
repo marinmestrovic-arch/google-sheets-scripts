@@ -434,6 +434,7 @@ function enrichCreatorListRowsInBatches() {
   let totalStatic = 0;
   let totalYoutube = 0;
   let totalProfile = 0;
+  let totalImportFallback = 0;
 
   while (nextStartRow1 <= stopRow1) {
     const batch = collectCreatorListEnrichmentBatch_(context.data, header, nextStartRow1, stopRow1);
@@ -446,6 +447,7 @@ function enrichCreatorListRowsInBatches() {
     totalStatic += result.staticEnriched;
     totalYoutube += result.youtubeEnriched;
     totalProfile += result.profileEnriched;
+    totalImportFallback += result.importFallbackEnriched;
     nextStartRow1 = batch.nextStartRow1;
   }
 
@@ -457,11 +459,13 @@ function enrichCreatorListRowsInBatches() {
 
   showSpreadsheetToast_(
     `Enrichment complete. Rows: ${totalRows}. Static: ${totalStatic}. ` +
-    `YouTube: ${totalYoutube}. AI: ${totalProfile}.`
+    `YouTube: ${totalYoutube}. AI: ${totalProfile}. ` +
+    `Import Fallback: ${totalImportFallback}.`
   );
   Logger.log(
     `✅ Creator List enrichment complete. Rows: ${totalRows}. Static: ${totalStatic}, ` +
-    `YouTube: ${totalYoutube}, AI: ${totalProfile}.`
+    `YouTube: ${totalYoutube}, AI: ${totalProfile}, ` +
+    `Import Fallback: ${totalImportFallback}.`
   );
 }
 
@@ -480,12 +484,49 @@ function runCreatorListEnrichment_(sheet, rowItems, header) {
 
   const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header);
   const profileEnriched = enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
+  const importFallbackEnriched = applyCreatorImportFallbackFromChannelName_(sheet, rowItems, header);
 
   return {
     staticEnriched: staticWrite.writtenRowCount,
     youtubeEnriched: youtubeEnriched,
-    profileEnriched: profileEnriched
+    profileEnriched: profileEnriched,
+    importFallbackEnriched: importFallbackEnriched
   };
+}
+
+function applyCreatorImportFallbackFromChannelName_(sheet, rowItems, header) {
+  const firstNameCol = findHeaderIndex_(header, "First Name");
+  const lastNameCol = findHeaderIndex_(header, "Last Name");
+  const emailCol = findHeaderIndex_(header, "Email");
+  const channelNameCol = findHeaderIndex_(header, "Channel Name");
+  if (firstNameCol === -1 || lastNameCol === -1 || emailCol === -1 || channelNameCol === -1) {
+    return 0;
+  }
+
+  const updates = [];
+  rowItems.forEach(function (item) {
+    if (!item || !Array.isArray(item.values)) return;
+
+    const row = item.values;
+    const firstName = String(row[firstNameCol] || "").trim();
+    const lastName = String(row[lastNameCol] || "").trim();
+    const email = String(row[emailCol] || "").trim();
+    if (firstName || lastName || email) return;
+
+    const channelName = String(row[channelNameCol] || "").trim();
+    if (!channelName) return;
+
+    const changeMap = {};
+    setIfEmpty_(row, header, "First Name", channelName, changeMap);
+    updates.push.apply(
+      updates,
+      trackedRowChangesToSheetUpdates_(item, trackedChangeMapToRowChanges_(changeMap))
+    );
+  });
+
+  const writeResult = writeSparseCellUpdates_(sheet, header, updates, "Import fallback enrichment");
+  Logger.log(`✅ Import fallback enrichment: filled ${writeResult.writtenRowCount} row(s).`);
+  return writeResult.writtenRowCount;
 }
 
 function canAttemptCreatorListEnrichment_(row, header) {
