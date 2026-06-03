@@ -447,7 +447,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header);
     const profileEnriched = enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
-    const importFallbackEnriched = applyCreatorImportFallbackFromChannelName_(sheet, rowItems, header);
+    const importFallbackEnriched = applyCreatorContactNameFallback_(sheet, rowItems, header, "Import fallback enrichment");
 
     return {
       staticEnriched: staticWrite.writtenRowCount,
@@ -457,15 +457,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
-  function applyCreatorImportFallbackFromChannelName_(sheet, rowItems, header) {
+  function applyCreatorContactNameFallback_(sheet, rowItems, header, stageLabel) {
     const firstNameCol = findHeaderIndex_(header, "First Name");
     const lastNameCol = findHeaderIndex_(header, "Last Name");
     const emailCol = findHeaderIndex_(header, "Email");
-    const channelNameCol = findHeaderIndex_(header, "Channel Name");
-    if (firstNameCol === -1 || lastNameCol === -1 || emailCol === -1 || channelNameCol === -1) {
-      return 0;
-    }
+    if (firstNameCol === -1 || lastNameCol === -1 || emailCol === -1) return 0;
 
+    const label = String(stageLabel || "Contact name fallback");
     const updates = [];
     rowItems.forEach(function (item) {
       if (!item || !Array.isArray(item.values)) return;
@@ -474,22 +472,48 @@ const INT_HUBSPOT_MENU_ = (function () {
       const firstName = String(row[firstNameCol] || "").trim();
       const lastName = String(row[lastNameCol] || "").trim();
       const email = String(row[emailCol] || "").trim();
+      // HubSpot requires at least one of firstname / lastname / email on a contact create.
       if (firstName || lastName || email) return;
 
-      const channelName = String(row[channelNameCol] || "").trim();
-      if (!channelName) return;
+      const fallbackName = resolveCreatorContactNameFallbackValue_(row, header);
+      if (!fallbackName) return;
 
       const changeMap = {};
-      setIfEmpty_(row, header, "First Name", channelName, changeMap);
+      setIfEmpty_(row, header, "First Name", fallbackName, changeMap);
       updates.push.apply(
         updates,
         trackedRowChangesToSheetUpdates_(item, trackedChangeMapToRowChanges_(changeMap))
       );
     });
 
-    const writeResult = writeSparseCellUpdates_(sheet, header, updates, "Import fallback enrichment");
-    Logger.log(`✅ Import fallback enrichment: filled ${writeResult.writtenRowCount} row(s).`);
+    const writeResult = writeSparseCellUpdates_(sheet, header, updates, label);
+    Logger.log(`✅ ${label}: filled ${writeResult.writtenRowCount} row(s).`);
     return writeResult.writtenRowCount;
+  }
+
+  // When a creator has no First Name, Last Name, or Email, derive a First Name so
+  // HubSpot contact creates never fail with "required properties ... are missing".
+  // Generalizes the YouTube behavior (the handle ends up in First Name) to every
+  // platform: YouTube, Instagram, TikTok, Twitch, Kick, and X.
+  function resolveCreatorContactNameFallbackValue_(row, header) {
+    // 1) The handle for the platform the Channel URL points to, then any other
+    //    platform handle present on the row.
+    const handle = getPreferredCreatorHandleForRow_(row, header, null);
+    if (handle) return handle;
+
+    // 2) Any creator name already present on the row.
+    const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
+    if (channelName) return channelName;
+
+    // 3) Last resort: the creator label embedded in the Deal Name (everything before
+    //    the " - <campaign>" suffix), so importable rows always carry a name.
+    const dealName = String(getValueByHeader_(row, header, "Deal Name") || "").trim();
+    if (dealName) {
+      const dealLabel = String(dealName.split(" - ")[0] || "").trim();
+      return dealLabel || dealName;
+    }
+
+    return "";
   }
 
   function canAttemptCreatorListEnrichment_(row, header) {
@@ -2465,6 +2489,11 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function importCreatorListToHubSpot_(ss, sheet, header, rowItems, ui, importSummary) {
+    // Safety net: guarantee every contact carries a First Name even if the row was
+    // never enriched (or was edited after enrichment), so HubSpot never rejects the
+    // create for missing firstname/lastname/email.
+    applyCreatorContactNameFallback_(sheet, rowItems, header, "HubSpot import name fallback");
+
     const emailCol = findHeaderIndex_(header, "Email");
 
     const validationIssues = collectCreatorListHubSpotImportValidationIssues_(header, rowItems, emailCol);
