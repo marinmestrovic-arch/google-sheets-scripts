@@ -1952,7 +1952,9 @@ function enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHea
         });
       }
 
-      const llmFields = emptyFields.filter(f => f !== "Phone Number");
+      const allowDropdownClassification = hasResolvedYouTubeProfileContextForLlm_(youtubeInsight);
+      const llmFields = filterProfileLlmFieldsForEvidence_(emptyFields, allowDropdownClassification)
+        .filter(f => f !== "Phone Number");
       if (llmFields.length === 0) {
         directUpdates.push.apply(
           directUpdates,
@@ -1978,6 +1980,7 @@ function enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHea
         campaignName: campaignName,
         requestedFields: llmFields.slice(),
         contextText: contextText,
+        allowDropdownClassification: allowDropdownClassification,
         changeMap: changeMap
       });
     } catch (e) {
@@ -2121,10 +2124,12 @@ function applyCreatorProfileBatchResults_(apiKey, model, header, dropdownValuesB
 
       const classificationRequests = requestChunk
         .map(function (request) {
-          const remainingClassificationFields = PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(function (field) {
-            const i = findHeaderIndex_(header, field);
-            return request.requestedFields.indexOf(field) !== -1 && i !== -1 && !String(request.item.values[i] || "").trim();
-          });
+          const remainingClassificationFields = request.allowDropdownClassification
+            ? PROFILE_LLM_CLASSIFICATION_FIELDS_.filter(function (field) {
+              const i = findHeaderIndex_(header, field);
+              return request.requestedFields.indexOf(field) !== -1 && i !== -1 && !String(request.item.values[i] || "").trim();
+            })
+            : [];
 
           return {
             rowKey: request.rowKey,
@@ -2266,6 +2271,26 @@ function buildCreatorProfileBatchPromptRows_(requests) {
       creator_context: String(request.contextText || "")
     };
   });
+}
+
+function filterProfileLlmFieldsForEvidence_(fields, allowDropdownClassification) {
+  return (fields || []).filter(function (field) {
+    if (!PROFILE_LLM_DROPDOWN_FIELDS_.has(field)) return true;
+    return !!allowDropdownClassification;
+  });
+}
+
+function hasResolvedYouTubeProfileContextForLlm_(youtubeInsight) {
+  if (!youtubeInsight || !youtubeInsight.channelId) return false;
+
+  return !!(
+    normalizeLlmString_(youtubeInsight.description) ||
+    normalizeLlmString_(youtubeInsight.countryCode) ||
+    normalizeLlmString_(youtubeInsight.dominantCategoryName) ||
+    (youtubeInsight.sampledTitles && youtubeInsight.sampledTitles.length > 0) ||
+    (youtubeInsight.sampledVideoDescriptions && youtubeInsight.sampledVideoDescriptions.length > 0) ||
+    (youtubeInsight.channelPageSnippet && normalizeLlmString_(youtubeInsight.channelPageSnippet))
+  );
 }
 
 function callOpenAiStructuredCreatorProfileBatch_(

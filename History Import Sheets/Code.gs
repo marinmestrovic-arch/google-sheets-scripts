@@ -1,5 +1,5 @@
 /*********************************************
- * INT Sheet Template - HubSpot menu actions
+ * History Import Sheets - HubSpot menu actions
  *********************************************/
 
 function onOpen() {
@@ -225,6 +225,26 @@ const INT_HUBSPOT_MENU_ = (function () {
   ]);
   const HUBSPOT_IMPORT_MULTISELECT_COLS_ = new Set(["influencervertical"]);
   const HUBSPOT_MULTISELECT_IMPORT_DELIMITER_ = ";";
+  const HUBSPOT_HISTORY_IMPORT_KEY_ = "history";
+  const HUBSPOT_HISTORY_IMPORT_INCLUDED_EXCLUDED_COL_KEYS_ = new Set([
+    "activationtype",
+    "activationname"
+  ]);
+  const HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_ = {
+    // Activation custom-object properties.
+    "Script URL": "Activations",
+    "Preview URL": "Activations",
+    "Publication Date": "Activations",
+    // Deal properties.
+    "Amount": "Deals",
+    "EXT Amount": "Deals",
+    "Contract": "Deals",
+    "Pitching Status": "Deals",
+    "Contract Signed": "Deals",
+    "Script Approved": "Deals",
+    "Preview Approved": "Deals",
+    "Published": "Deals"
+  };
   const YOUTUBE_ENRICH_FIELDS_ = [
     "YouTube Handle",
     "YouTube URL",
@@ -355,13 +375,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     const ss = sheet.getParent();
     setScriptActionProgress_(`Reading "${sheetName}"…`, 0, "running");
 
-    // Enrichment only makes sense on Deal Import copies — block Campaign/Client
-    // Import copies instead of half-matching their columns.
+    // Enrichment only makes sense on deal-style imports — block Campaign/Client
+    // imports instead of half-matching their columns.
     const detected = detectHubSpotImportKind_(sheet.getDataRange().getValues());
-    if (detected && detected.spec.key !== "deal") {
+    if (detected && !isDealStyleHubSpotImportSpec_(detected.spec)) {
       throw new Error(
         `"${sheetName}" looks like a ${detected.spec.label} import sheet. ` +
-        "Enrichment only applies to Deal Import copies."
+        "Enrichment only applies to Deal Import or History Import copies."
       );
     }
 
@@ -401,7 +421,12 @@ const INT_HUBSPOT_MENU_ = (function () {
       );
 
       props.setProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_, String(batch.nextStartRow1));
-      const result = runCreatorListEnrichment_(sheet, rowItems, header);
+      const result = runCreatorListEnrichment_(
+        sheet,
+        rowItems,
+        header,
+        detected ? detected.spec : null
+      );
       totalRows += rowItems.length;
       totalStatic += result.staticEnriched;
       totalYoutube += result.youtubeEnriched;
@@ -476,19 +501,19 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!detected) {
       throw new Error(
         `Could not determine what "${sheetName}" imports. ` +
-        "Expected a copy of the Deal Import, Campaign Import, or Client Import template."
+        "Expected a copy of the Deal Import, History Import, Campaign Import, or Client Import template."
       );
     }
 
     setScriptActionProgress_(`"${sheetName}" detected as a ${detected.spec.label} import…`, 5, "running");
 
-    if (detected.spec.key === "deal") {
-      return runDealImportForSheet_(ss, sheet, sheetName);
+    if (isDealStyleHubSpotImportSpec_(detected.spec)) {
+      return runDealImportForSheet_(ss, sheet, sheetName, detected.spec);
     }
     return runSimpleObjectImportForSheet_(ss, sheetName, detected, data);
   }
 
-  function runDealImportForSheet_(ss, sheet, sheetName) {
+  function runDealImportForSheet_(ss, sheet, sheetName, importSpec) {
     const context = getCreatorListSheetContext_(sheet);
     if (!context) return finishActionWithInfo_(`"${sheetName}" has no data.`);
 
@@ -526,7 +551,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       );
     }
 
-    return importCreatorListToHubSpot_(ss, sheet, header, preparedRows.rowItems, preparedRows, sheetName);
+    return importCreatorListToHubSpot_(ss, sheet, header, preparedRows.rowItems, preparedRows, sheetName, importSpec);
   }
 
   // Import flow for Campaign Import / Client Import copies: one HubSpot
@@ -688,6 +713,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     {
       key: "deal",
       label: "Deals",
+      importFlow: "deal",
       signatureColumns: [
         "HubSpot Record ID",
         "Deal Name",
@@ -695,6 +721,27 @@ const INT_HUBSPOT_MENU_ = (function () {
         CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
         "Deal Stage",
         "Influencer Vertical"
+      ]
+    },
+    {
+      key: HUBSPOT_HISTORY_IMPORT_KEY_,
+      label: "History Import",
+      importFlow: "deal",
+      signatureColumns: [
+        "HubSpot Record ID",
+        "Deal name",
+        CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
+        "EXT Amount",
+        "Contract",
+        "Script URL",
+        "Preview URL",
+        "Activation URL",
+        "Publication Date",
+        "Pitching Status",
+        "Contract Signed",
+        "Script Approved",
+        "Preview Approved",
+        "Published"
       ]
     },
     {
@@ -729,6 +776,14 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
   ];
   const HUBSPOT_IMPORT_KIND_MIN_SIGNATURE_SCORE_ = 2;
+
+  function isDealStyleHubSpotImportSpec_(spec) {
+    return !!(spec && (spec.key === "deal" || spec.importFlow === "deal"));
+  }
+
+  function isHistoryHubSpotImportSpec_(spec) {
+    return !!(spec && spec.key === HUBSPOT_HISTORY_IMPORT_KEY_);
+  }
 
   // Returns { spec, score, headerRow0, header } for the best-matching import
   // kind, or null when no kind matches confidently.
@@ -934,20 +989,20 @@ const INT_HUBSPOT_MENU_ = (function () {
     return knownLabels.has(text);
   }
 
-  function runCreatorListEnrichment_(sheet, rowItems, header) {
+  function runCreatorListEnrichment_(sheet, rowItems, header, importSpec) {
     const dropdownValuesByHeader = getDropdownValuesByHeader_(sheet.getParent(), "Dropdown Values");
     const clientNameByCampaignName = getClientNameByCampaignName_(sheet.getParent(), "Dropdown Values");
 
     const staticUpdates = [];
     for (const item of rowItems) {
-      const rowChanges = enrichCreatorRow_(item.values, header, clientNameByCampaignName);
+      const rowChanges = enrichCreatorRow_(item.values, header, clientNameByCampaignName, importSpec);
       if (rowChanges.length === 0) continue;
       staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
     }
 
     const staticWrite = writeSparseCellUpdates_(sheet, header, staticUpdates, "Static enrichment");
 
-    const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header);
+    const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header, importSpec);
     const profileEnriched = enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
     const importFallbackEnriched = applyCreatorContactNameFallback_(sheet, rowItems, header, "Import fallback enrichment");
 
@@ -1055,7 +1110,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
-  function enrichCreatorRow_(row, header, clientNameByCampaignName) {
+  function enrichCreatorRow_(row, header, clientNameByCampaignName, importSpec) {
     const idx = name => findHeaderIndex_(header, name);
     const get = name => { const i = idx(name); return i === -1 ? "" : String(row[i] || "").trim(); };
     const changeMap = {};
@@ -1080,7 +1135,18 @@ const INT_HUBSPOT_MENU_ = (function () {
     setIfEmpty(idx("Client name") !== -1 ? "Client name" : "Client", clientName);
 
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, platformIdentity);
-    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec);
+
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      set("Pipeline", "Campaign Management Pipeline");
+      set("Deal stage", "Published");
+      set("Pitching Status", "Approved");
+      set("Script Approved", "Yes");
+      set("Preview Approved", "Yes");
+      set("Published", "Yes");
+      if (get("Contract")) set("Contract Signed", "Yes");
+      return trackedChangeMapToRowChanges_(changeMap);
+    }
 
     // Pipeline: always Sales Pipeline
     set("Pipeline", "Sales Pipeline");
@@ -1186,13 +1252,33 @@ const INT_HUBSPOT_MENU_ = (function () {
     return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
   }
 
-  function applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap) {
+  function applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec) {
     const label = String(creatorLabel || "").trim();
     const campaign = String(campaignName || "").trim();
+
+    let changed = false;
+
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      let dealName = "";
+      if (label && campaign) {
+        dealName = label + " - " + campaign;
+        changed = setTrackedValueByHeader_(row, header, "Deal name", dealName, changeMap) || changed;
+      } else {
+        dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
+      }
+
+      if (dealName) {
+        const activationType = String(getValueByHeader_(row, header, "Activation Type") || "").trim();
+        const activationName = activationType ? dealName + " - " + activationType : dealName;
+        changed = setTrackedValueByHeader_(row, header, "Activation Name", activationName, changeMap) || changed;
+      }
+
+      return changed;
+    }
+
     if (!label || !campaign) return false;
 
     const name = label + " - " + campaign;
-    let changed = false;
     changed = setTrackedValueByHeader_(row, header, "Deal name", name, changeMap) || changed;
     changed = setTrackedValueByHeader_(row, header, "Activation name", name, changeMap) || changed;
     return changed;
@@ -1418,7 +1504,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return /(^|\.)x\.com$|(^|\.)twitter\.com$/i.test(String(host || ""));
   }
 
-  function enrichYouTubeDataForRows_(sheet, rowItems, header) {
+  function enrichYouTubeDataForRows_(sheet, rowItems, header, importSpec) {
     const apiKey = getYouTubeApiKey_();
     if (!apiKey) {
       Logger.log("ℹ️ YouTube API key not set (script property YOUTUBE_API_KEY). Skipping YouTube enrichment.");
@@ -1428,10 +1514,10 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const updates = [];
     for (const item of rowItems) {
-      if (!shouldRunYouTubeEnrichmentForRow_(item.values, header)) continue;
+      if (!shouldRunYouTubeEnrichmentForRow_(item.values, header, importSpec)) continue;
 
       try {
-        const result = enrichSingleYouTubeRow_(item, header, apiKey);
+        const result = enrichSingleYouTubeRow_(item, header, apiKey, importSpec);
         if (result.updates.length === 0) continue;
         updates.push.apply(updates, trackedRowChangesToSheetUpdates_(item, result.updates));
       } catch (e) {
@@ -1443,7 +1529,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return writeResult.writtenRowCount;
   }
 
-  function shouldRunYouTubeEnrichmentForRow_(row, header) {
+  function shouldRunYouTubeEnrichmentForRow_(row, header, importSpec) {
     const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
     const hasExplicitYouTubeInput = hasExplicitYouTubeInputForRow_(row, header);
     const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
@@ -1465,6 +1551,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     const dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, channelUrlIdentity);
     if (creatorLabel && campaignName && dealName !== (creatorLabel + " - " + campaignName)) return true;
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      const activationType = String(getValueByHeader_(row, header, "Activation Type") || "").trim();
+      const expectedActivationName = activationType ? dealName + " - " + activationType : dealName;
+      const activationName = String(getValueByHeader_(row, header, "Activation Name") || "").trim();
+      if (expectedActivationName && activationName !== expectedActivationName) return true;
+    }
 
     return false;
   }
@@ -1479,7 +1571,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return !!normalizeCreatorPlatformHandle_("youtube", getValueByHeader_(row, header, "YouTube Handle"));
   }
 
-  function enrichSingleYouTubeRow_(item, header, apiKey) {
+  function enrichSingleYouTubeRow_(item, header, apiKey, importSpec) {
     const row = item.values;
     const channelUrl = resolveCreatorYouTubeInputFromRow_(row, header);
     const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
@@ -1516,7 +1608,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, null) || String(insight.handle || "").trim();
-    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec);
 
     return {
       insight: insight,
@@ -3017,7 +3109,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return getCreatorYouTubeInsight_(channelUrl, channelName, apiKey, options);
   }
 
-  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName) {
+  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName, importSpec) {
     // Safety net: guarantee every contact carries a First Name even if the row was
     // never enriched (or was edited after enrichment), so HubSpot never rejects the
     // create for missing firstname/lastname/email.
@@ -3031,7 +3123,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       throw new Error("Validation failed:\n" + validationIssues.join("\n"));
     }
 
-    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName());
+    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName(), importSpec);
     if (payloads.length === 0) {
       throw new Error("No importable HubSpot columns found.");
     }
@@ -3256,9 +3348,9 @@ const INT_HUBSPOT_MENU_ = (function () {
     return errors.join("\n\n");
   }
 
-  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName) {
+  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName, importSpec) {
     if (emailCol === -1) {
-      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "", sheetName);
+      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "", sheetName, importSpec);
       return payload ? [payload] : [];
     }
 
@@ -3278,7 +3370,8 @@ const INT_HUBSPOT_MENU_ = (function () {
         rowsWithEmail,
         null,
         shouldLabelPayloads ? "with email" : "",
-        sheetName
+        sheetName,
+        importSpec
       );
       if (payload) payloads.push(payload);
     }
@@ -3290,7 +3383,8 @@ const INT_HUBSPOT_MENU_ = (function () {
         rowsWithoutEmail,
         new Set([emailCol]),
         shouldLabelPayloads ? "without email" : "",
-        sheetName
+        sheetName,
+        importSpec
       );
       if (payload) payloads.push(payload);
     }
@@ -3352,12 +3446,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     return text || String(fallback || "HubSpot Import");
   }
 
-  function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel, sheetName) {
+  function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel, sheetName, importSpec) {
     const activeColIndexes = [];
     header.forEach((h, idx) => {
       if (!h) return;
       if (excludedColIndexes && excludedColIndexes.has(idx)) return;
-      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
+      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h, importSpec)) return;
       const hasValue = rowItems.some(item =>
         String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
       );
@@ -3367,7 +3461,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     if (activeColIndexes.length === 0 || rowItems.length === 0) return null;
 
-    const activeHeaders = activeColIndexes.map(i => header[i]);
+    const activeHeaders = activeColIndexes.map(i => resolveHubSpotImportHeaderName_(header[i], importSpec));
     const activeRows = rowItems.map(item =>
       activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
     );
@@ -3576,13 +3670,34 @@ const INT_HUBSPOT_MENU_ = (function () {
     dealRecordIds.forEach(item => out.push(item));
   }
 
-  function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName) {
+  function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName, importSpec) {
     const text = String(headerName || "").trim();
     if (!text) return true;
+    const normalized = normalizeHeaderName_(text);
+    if (
+      isHistoryHubSpotImportSpec_(importSpec) &&
+      HUBSPOT_HISTORY_IMPORT_INCLUDED_EXCLUDED_COL_KEYS_.has(normalized)
+    ) {
+      return false;
+    }
+
     if (HUBSPOT_IMPORT_EXCLUDED_COLS_.has(text)) return true;
+    return normalized === "activationtype" || normalized === "activationname";
+  }
+
+  function resolveHubSpotImportHeaderName_(headerName, importSpec) {
+    const text = String(headerName || "").trim();
+    if (!text || !isHistoryHubSpotImportSpec_(importSpec)) return text;
 
     const normalized = normalizeHeaderName_(text);
-    return normalized === "activationtype" || normalized === "activationname";
+    const columnNames = Object.keys(HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_);
+    for (let i = 0; i < columnNames.length; i++) {
+      if (normalizeHeaderName_(columnNames[i]) === normalized) {
+        return HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_[columnNames[i]] + " " + text;
+      }
+    }
+
+    return text;
   }
 
   function saveImportedCreatorListDealMarkers_(sheet, header, dealRecordIds) {
