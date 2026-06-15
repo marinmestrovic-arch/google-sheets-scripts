@@ -91,6 +91,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     client: "Client",
     dealOwner: "Deal Owner",
     campaignName: "Campaign Name",
+    campaignStatus: "Campaign Status",
     dealType: "Deal Type",
     activationType: "Activation Type",
     pipeline: "Pipeline",
@@ -122,6 +123,11 @@ const INT_HUBSPOT_MENU_ = (function () {
       aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_KEY_]
     },
     optionColumns: [
+      {
+        columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.campaignStatus,
+        objectConfigKey: "campaign",
+        propertyName: ["campaign_status", "Campaign Status"]
+      },
       {
         columnName: HUBSPOT_DROPDOWN_VALUES_COLUMNS_.dealType,
         objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
@@ -4131,11 +4137,16 @@ const INT_HUBSPOT_MENU_ = (function () {
     }).filter(Boolean);
     if (targets.length === 0) throw new Error("HubSpot dropdown property name is not configured.");
 
-    const properties = fetchHubSpotPropertiesForObject_(objectTypeId, token);
-    for (let i = 0; i < properties.length; i++) {
-      const property = properties[i] || {};
-      if (targets.indexOf(normalizeHeaderName_(property.name)) !== -1) return String(property.name || "").trim();
-      if (targets.indexOf(normalizeHeaderName_(property.label)) !== -1) return String(property.name || "").trim();
+    // Try the (possibly cached) property list first, then refetch bypassing the
+    // cache so a freshly created HubSpot property isn't missed for up to 6 hours.
+    const attempts = [false, true];
+    for (let a = 0; a < attempts.length; a++) {
+      const properties = fetchHubSpotPropertiesForObject_(objectTypeId, token, attempts[a]);
+      for (let i = 0; i < properties.length; i++) {
+        const property = properties[i] || {};
+        if (targets.indexOf(normalizeHeaderName_(property.name)) !== -1) return String(property.name || "").trim();
+        if (targets.indexOf(normalizeHeaderName_(property.label)) !== -1) return String(property.name || "").trim();
+      }
     }
 
     throw new Error(
@@ -4638,12 +4649,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     throw new Error(`Could not find HubSpot custom object schema for "${spec && spec.key}".`);
   }
 
-  function fetchHubSpotPropertiesForObject_(objectType, token) {
+  function fetchHubSpotPropertiesForObject_(objectType, token, forceRefresh) {
     const normalizedObjectType = String(objectType || "").trim();
     if (!normalizedObjectType) return [];
 
     const cacheKey = getHubSpotPropertiesCacheKey_(token, normalizedObjectType);
-    if (cacheKey) {
+    if (cacheKey && !forceRefresh) {
       try {
         const cached = CacheService.getScriptCache().get(cacheKey);
         if (cached) {

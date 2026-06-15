@@ -4,13 +4,19 @@
  * Internal workflow scripts:
  * 1) Creator List → HubSpot (+ enrichment)
  * 2) Creator List → Pitching (Negotiation)
- * 3) INT HubSpot/dropdown/archive maintenance
+ * 3) INT Pitching → EXT Pitching
+ * 4) Update INT Pitching from EXT
+ * 5) Update INT Campaigns from EXT
+ * 6) Update INT Performance from EXT
  *********************************************/
 
 
 // ============================================================
 //  CONSTANTS
 // ============================================================
+
+const EXT_SPREADSHEET_ID_PROP_ = "EXT_SPREADSHEET_ID";
+const EXT_SHEET_DROPDOWN_HEADER_ = "EXT Sheet";
 
 const HUBSPOT_SHARED_IMPORT_WEB_APP_URL_ =
   "https://script.google.com/a/macros/arch.agency/s/AKfycbzI6gAHnhSlRLzheWkS_wNYvYODvx1aztd27cf2DbbuBJTSqOYe-oqtKAnZqRc7jCE8/exec";
@@ -27,7 +33,6 @@ const HUBSPOT_DEALS_OBJECT_TYPE_ID_ = "0-3";
 const HUBSPOT_DEALS_OBJECT_API_NAME_ = "deals";
 const HUBSPOT_CONTACTS_OBJECT_API_NAME_ = "contacts";
 const HUBSPOT_PITCHING_STATUS_PROPERTY_LABEL_ = "Pitching Status";
-const HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_ = "Deal Stage";
 const HUBSPOT_BATCH_UPDATE_SIZE_ = 100;
 const HUBSPOT_REQUEST_MIN_INTERVAL_MS_ = 250;
 const HUBSPOT_REQUEST_RETRY_COUNT_ = 5;
@@ -36,9 +41,6 @@ const HUBSPOT_PROPERTY_CACHE_TTL_SECONDS_ = 21600;
 const HUBSPOT_PROPERTY_CACHE_MAX_CHARS_ = 90000;
 const HUBSPOT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_LAST_REQUEST_MS";
 const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
-const HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_ = "activation_type";
-const HUBSPOT_EXT_AMOUNT_PROPERTY_FALLBACK_ = "ext_amount";
-const HUBSPOT_DEAL_NAME_PROPERTY_FALLBACK_ = "dealname";
 const HUBSPOT_DROPDOWN_VALUES_COLUMNS_ = {
   clientName: "Client name",
   client: "Client",
@@ -112,21 +114,12 @@ const HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_ = {
   ]
 };
 const HUBSPOT_CAMPAIGN_SYNC_STAGE_DELAY_MS_ = 30000;
-const HUBSPOT_SHEET_SYNC_ID_COLUMNS_ = new Set([
-  "HubSpot Record ID",
-  "HubSpot Activation ID"
-]);
 const HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_ = [
   {
     stageLabel: "Contract",
     mode: "first_non_empty",
     fields: [
-      { propertyLabel: "Contract", sourceColumn: "Contract URL" },
-      {
-        propertyLabel: "Contract Signed",
-        sourceColumn: "Contract URL",
-        completeValue: "Yes"
-      }
+      { propertyLabel: "Contract", sourceColumn: "Contract URL" }
     ]
   },
   {
@@ -231,25 +224,27 @@ var YT_API_KEY_INVALID_ = false;
 var YT_API_KEY_INVALID_LOGGED_ = false;
 var LAST_OPENAI_DIAGNOSTIC_ = "";
 var LAST_OPENAI_RAW_RESPONSE_ = "";
-var HUBSPOT_ACTIVATION_NAME_PROPERTY_CACHE_ = {};
-var HUBSPOT_DEAL_NAME_PROPERTY_CACHE_ = "";
-var HUBSPOT_DEAL_NAME_CACHE_ = {};
 
+// INT ↔ EXT column name mappings
+const INT_TO_EXT_PITCHING_MAP_ = { "EXT Rate": "Rate" };
+const EXT_TO_INT_PITCHING_MAP_ = {};
+const EXT_TO_INT_CAMPAIGNS_MAP_ = { "Rate": "EXT Rate" };
 const CREATOR_TO_PITCHING_NEGOTIATION_MAP_ = {
   "YouTube Average Views": "Median Views",
   "YouTube Video Median Views": "Median Views"
 };
+const INT_ONLY_PITCHING_COLS_ = new Set(["INT Rate", "INT CPM", "EXT CPM"]);
+const EXT_ONLY_PITCHING_COLS_ = new Set(["Rate", "CPM"]);
+const INT_PITCHING_FORMULA_COLS_ = new Set(["INT CPM", "EXT CPM"]);
+const INT_PERFORMANCE_FORMULA_COLS_ = new Set(["CPM"]);
+const PITCHING_NEGOTIATION_BLOCK_WIDTH_ = 5;
 const CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_ = new Set(["Status"]);
-const CREATOR_LIST_DEAL_STAGE_STATUS_MAP_ = {
-  contacted: "Contacted",
-  responded: "Responded"
-};
-const CREATOR_LIST_DEAL_STAGE_PRIORITY_ = {
-  Contacted: 1,
-  Responded: 2
-};
 const CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ = "Timestamp Imported";
 const WOODPECKER_EXPORT_HEADERS_ = ["Email", "Channel Name", "First Name", "Last Name"];
+const CREATOR_LIST_ARCHIVE_SHEET_NAME_ = "Archive";
+const CREATOR_LIST_STALE_ARCHIVE_DAYS_ = 30;
+const CREATOR_LIST_ARCHIVE_FIRST_DATA_ROW_ = 3;
+const CREATOR_LIST_ACTIVE_STATUSES_ = new Set(["contacted", "responded"]);
 const HUBSPOT_IMPORT_EXCLUDED_COLS_ = new Set([
   "Channel Name",
   "HubSpot Record ID",
@@ -387,18 +382,19 @@ function onOpen() {
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
     .addItem("Creator List → HubSpot", "importCreatorListToHubSpotOnly")
     .addItem("Woodpecker Export", "downloadCreatorListWoodpeckerCsv")
+    .addSeparator()
+    .addItem("Push to EXT Pitching", "pushReadyForPitchingToExt")
     .addToUi();
 
   SpreadsheetApp.getUi()
     .createMenu("⏰ Triggers")
     .addItem("Sync Dropdown Values from HubSpot", "syncDropdownValuesFromHubSpot")
     .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
-    .addItem("Negotiation → Active Pitches", "pushNegotiationRowsToActivePitches")
-    .addItem("Pitching → Campaigns", "pushConfirmedCreatorsToCampaigns")
-    .addItem("Campaigns → Performance", "pushPublishedCampaignsToPerformance")
-    .addItem("Update Campaigns in HubSpot", "updateCampaignsInHubSpot")
-    .addItem("Update Performance in HubSpot", "updatePerformanceInHubSpot")
-    .addItem("Archive Pitches", "archivePitches")
+    .addItem("Archive Creator List", "archiveCreatorList")
+    .addSeparator()
+    .addItem("Update Pitching from EXT", "updatePitchingFromExt")
+    .addItem("Update Campaigns from EXT", "updateCampaignsFromExt")
+    .addItem("Update Performance from EXT", "updatePerformanceFromExt")
     .addToUi();
 }
 
@@ -659,6 +655,134 @@ function downloadCreatorListWoodpeckerCsv() {
     "Woodpecker Import"
   );
 }
+
+function archiveCreatorList() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const creatorSheet = ss.getSheetByName("Creator List");
+  const archiveSheet = ss.getSheetByName(CREATOR_LIST_ARCHIVE_SHEET_NAME_);
+  if (!creatorSheet || !archiveSheet) {
+    const missing = [];
+    if (!creatorSheet) missing.push("'Creator List'");
+    if (!archiveSheet) missing.push("'" + CREATOR_LIST_ARCHIVE_SHEET_NAME_ + "'");
+    const message = "❌ Missing sheet(s): " + missing.join(", ") + ".";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const creatorContext = getCreatorListSheetContext_(creatorSheet);
+  if (!creatorContext) {
+    const message = "ℹ️ Creator List has no data.";
+    showSpreadsheetToast_(message);
+    return Logger.log(message);
+  }
+
+  const creatorData = creatorContext.data;
+  const creatorHeader = creatorContext.header;
+  const statusCol = findHeaderIndex_(creatorHeader, "Status");
+  const timestampCol = findHeaderIndex_(creatorHeader, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+  if (statusCol === -1) {
+    const message = "❌ Creator List missing 'Status' column.";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+  if (timestampCol === -1) {
+    const message = "❌ Creator List missing '" + CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + "' column.";
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const cutoffMs = Date.now() - CREATOR_LIST_STALE_ARCHIVE_DAYS_ * 24 * 60 * 60 * 1000;
+  const staleRows = [];
+  let skippedActiveStatus = 0;
+  let skippedMissingTimestamp = 0;
+  let skippedFreshTimestamp = 0;
+
+  for (let r = creatorContext.headerRow0 + 1; r < creatorData.length; r++) {
+    const row = creatorData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const status = String(row[statusCol] || "").trim().toLowerCase();
+    if (CREATOR_LIST_ACTIVE_STATUSES_.has(status)) {
+      skippedActiveStatus++;
+      continue;
+    }
+
+    const importedAt = parseSpreadsheetDateValue_(row[timestampCol]);
+    if (!importedAt) {
+      skippedMissingTimestamp++;
+      continue;
+    }
+
+    if (importedAt.getTime() > cutoffMs) {
+      skippedFreshTimestamp++;
+      continue;
+    }
+
+    staleRows.push({ row1: r + 1, values: row.slice() });
+  }
+
+  if (staleRows.length === 0) {
+    const message = "ℹ️ Archive Creator List: no stale rows to archive.";
+    showSpreadsheetToast_(message);
+    return Logger.log(
+      message +
+      ` Active status: ${skippedActiveStatus}. Missing timestamp: ${skippedMissingTimestamp}. ` +
+      `Younger than ${CREATOR_LIST_STALE_ARCHIVE_DAYS_} days: ${skippedFreshTimestamp}.`
+    );
+  }
+
+  const archiveContext = getArchiveSheetContext_(archiveSheet, creatorHeader);
+  if (!archiveContext) {
+    const message = `❌ Could not resolve a header in '${CREATOR_LIST_ARCHIVE_SHEET_NAME_}' sheet.`;
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const archiveHeader = archiveContext.header;
+  const colMap = buildCrossSheetColumnMap_(creatorHeader, archiveHeader, {}, null);
+  if (colMap.length === 0) {
+    const message = `❌ No overlapping columns between Creator List and ${CREATOR_LIST_ARCHIVE_SHEET_NAME_}.`;
+    showSpreadsheetAlert_(message);
+    return Logger.log(message);
+  }
+
+  const rowsToWrite = staleRows.map(function (item) {
+    const out = new Array(archiveHeader.length).fill("");
+    colMap.forEach(function (mapping) {
+      out[mapping.targetIdx] = item.values[mapping.sourceIdx];
+    });
+    return out;
+  });
+
+  const archiveDataStartRow1 = Math.max(
+    Number(CREATOR_LIST_ARCHIVE_FIRST_DATA_ROW_) || 3,
+    archiveContext.headerRow1 + 2
+  );
+  const insertAt1 = findFirstFreeRowFrom1_(
+    archiveSheet,
+    archiveDataStartRow1,
+    archiveHeader.length
+  );
+  archiveSheet
+    .getRange(insertAt1, 1, rowsToWrite.length, archiveHeader.length)
+    .setValues(rowsToWrite);
+
+  staleRows
+    .slice()
+    .sort(function (a, b) { return b.row1 - a.row1; })
+    .forEach(function (item) {
+      creatorSheet.deleteRow(item.row1);
+    });
+
+  const message = `✅ Archived ${staleRows.length} row(s) from Creator List to '${CREATOR_LIST_ARCHIVE_SHEET_NAME_}'.`;
+  showSpreadsheetToast_(message);
+  Logger.log(
+    message +
+    ` Kept by status: ${skippedActiveStatus}. Missing timestamp: ${skippedMissingTimestamp}. ` +
+    `Younger than ${CREATOR_LIST_STALE_ARCHIVE_DAYS_} days: ${skippedFreshTimestamp}.`
+  );
+}
+
 
 /**
  * Enriches a single Creator List row with derived fields.
@@ -3460,288 +3584,6 @@ function prepareHubSpotPitchingStatusUpdates_(items) {
   };
 }
 
-function syncCreatorListDealStagesToHubSpot_(sheet, data, header) {
-  if (!sheet || !data || data.length < 2) {
-    return {
-      attempted: 0,
-      updated: 0,
-      failed: 0,
-      skipped: 0
-    };
-  }
-
-  const statusCol = findHeaderIndex_(header, "Status");
-  const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
-  const pipelineCol = findHeaderIndex_(header, "Pipeline");
-  if (statusCol === -1 || recordIdCol === -1) {
-    Logger.log(
-      "ℹ️ Creator List Deal Stage sync skipped. Missing 'Status' or 'HubSpot Record ID' column."
-    );
-    return {
-      attempted: 0,
-      updated: 0,
-      failed: 0,
-      skipped: 0
-    };
-  }
-
-  const token = getHubSpotApiToken_();
-  if (!token) {
-    Logger.log("ℹ️ HubSpot token not set in this project. Skipping Creator List Deal Stage sync.");
-    return {
-      attempted: 0,
-      updated: 0,
-      failed: 0,
-      skipped: 0
-    };
-  }
-
-  let dealStagePropertyName = "dealstage";
-  let stageLookup;
-  try {
-    dealStagePropertyName = getHubSpotDealStagePropertyName_(token);
-    stageLookup = buildHubSpotDealPipelineStageValueLookup_(token);
-  } catch (e) {
-    Logger.log("⚠️ Creator List Deal Stage sync failed before update: " + (e && e.stack ? e.stack : e));
-    return {
-      attempted: 0,
-      updated: 0,
-      failed: 0,
-      skipped: 0
-    };
-  }
-
-  const candidatesByDealId = {};
-  const displayData = sheet.getDataRange().getDisplayValues();
-  let rowsConsidered = 0;
-  let missingRecordIdCount = 0;
-  let skippedStatusCount = 0;
-
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    const displayRow = displayData[r] || row;
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    rowsConsidered++;
-    const statusKey = normalizeHeaderName_(displayRow[statusCol]);
-    const stageLabel = CREATOR_LIST_DEAL_STAGE_STATUS_MAP_[statusKey] || "";
-    if (!stageLabel) {
-      skippedStatusCount++;
-      continue;
-    }
-
-    const recordId = String(displayRow[recordIdCol] || "").trim();
-    if (!recordId) {
-      missingRecordIdCount++;
-      continue;
-    }
-
-    const stagePriority = CREATOR_LIST_DEAL_STAGE_PRIORITY_[stageLabel] || 0;
-    if (
-      candidatesByDealId[recordId] &&
-      Number(candidatesByDealId[recordId].stagePriority || 0) > stagePriority
-    ) {
-      continue;
-    }
-
-    candidatesByDealId[recordId] = {
-      id: recordId,
-      row1: r + 1,
-      stageLabel: stageLabel,
-      stagePriority: stagePriority,
-      sheetPipeline: pipelineCol === -1 ? "" : String(displayRow[pipelineCol] || "").trim()
-    };
-  }
-
-  const dealIds = Object.keys(candidatesByDealId);
-  const candidateStageCounts = {};
-  dealIds.forEach(function (dealId) {
-    const stageLabel = String(candidatesByDealId[dealId] && candidatesByDealId[dealId].stageLabel || "").trim();
-    if (!stageLabel) return;
-    candidateStageCounts[stageLabel] = (candidateStageCounts[stageLabel] || 0) + 1;
-  });
-  let hubSpotPipelineByDealId = {};
-  try {
-    hubSpotPipelineByDealId = fetchHubSpotObjectPropertyValuesByIds_(
-      HUBSPOT_DEALS_OBJECT_API_NAME_,
-      dealIds,
-      "pipeline",
-      token
-    );
-  } catch (e) {
-    Logger.log("⚠️ Could not read current HubSpot deal pipelines. Falling back to sheet Pipeline values. " + e);
-  }
-
-  const updates = [];
-  let missingPipelineCount = 0;
-  let missingStageValueCount = 0;
-  let fallbackPipelineCount = 0;
-
-  dealIds.forEach(function (dealId) {
-    const item = candidatesByDealId[dealId];
-    const hubSpotPipeline = String(hubSpotPipelineByDealId[dealId] || "").trim();
-    const sheetPipeline = String(item && item.sheetPipeline || "").trim();
-    const pipeline = hubSpotPipeline || sheetPipeline;
-
-    if (!pipeline) {
-      missingPipelineCount++;
-      return;
-    }
-    if (!hubSpotPipeline && sheetPipeline) fallbackPipelineCount++;
-
-    const stageValue = resolveHubSpotDealStageValueForPipeline_(
-      item.stageLabel,
-      pipeline,
-      stageLookup
-    );
-    if (!stageValue) {
-      missingStageValueCount++;
-      Logger.log(
-        `⚠️ Could not resolve HubSpot Deal Stage "${item.stageLabel}" ` +
-        `for pipeline "${pipeline}" on Creator List row ${item.row1}; skipped deal ${dealId}.`
-      );
-      return;
-    }
-
-    updates.push({
-      id: dealId,
-      row1: item.row1,
-      properties: { [dealStagePropertyName]: stageValue }
-    });
-  });
-
-  const result = updates.length > 0
-    ? updateHubSpotObjectPropertiesBatch_(HUBSPOT_DEALS_OBJECT_API_NAME_, updates, token)
-    : { updated: 0, failed: 0 };
-  const skippedCount =
-    missingRecordIdCount +
-    skippedStatusCount +
-    missingPipelineCount +
-    missingStageValueCount;
-
-  Logger.log(
-    `✅ Creator List Deal Stage sync done. Updated: ${result.updated}. Failed: ${result.failed}. ` +
-    `Attempted: ${updates.length}. Candidate deals: ${dealIds.length}. Rows considered: ${rowsConsidered}. ` +
-    `Targets: ${formatCountMap_(candidateStageCounts)}. ` +
-    `Missing deal ID: ${missingRecordIdCount}. Skipped status: ${skippedStatusCount}. ` +
-    `Missing pipeline: ${missingPipelineCount}. Missing stage value: ${missingStageValueCount}. ` +
-    `Used sheet pipeline fallback: ${fallbackPipelineCount}.`
-  );
-
-  return {
-    attempted: updates.length,
-    updated: result.updated,
-    failed: result.failed,
-    skipped: skippedCount
-  };
-}
-
-function getHubSpotDealStagePropertyName_(token) {
-  try {
-    const properties = fetchHubSpotPropertiesForObject_(HUBSPOT_DEALS_OBJECT_API_NAME_, token);
-    const wantedName = normalizeHeaderName_("dealstage");
-    const wantedLabel = normalizeHeaderName_(HUBSPOT_DEAL_STAGE_PROPERTY_LABEL_);
-    let labelMatch = "";
-
-    for (let i = 0; i < properties.length; i++) {
-      const property = properties[i] || {};
-      const propertyName = String(property.name || "").trim();
-      if (!propertyName) continue;
-      if (normalizeHeaderName_(propertyName) === wantedName) return propertyName;
-      if (!labelMatch && normalizeHeaderName_(property.label) === wantedLabel) {
-        labelMatch = propertyName;
-      }
-    }
-
-    if (labelMatch) return labelMatch;
-  } catch (e) {
-    Logger.log("⚠️ Could not resolve HubSpot Deal Stage property name. Using 'dealstage'. " + e);
-  }
-
-  return "dealstage";
-}
-
-function buildHubSpotDealPipelineStageValueLookup_(token) {
-  const byPipeline = {};
-  const stageValuesByLabel = {};
-  const pipelines = fetchHubSpotDealPipelines_(token);
-
-  pipelines.forEach(function (pipeline) {
-    const pipelineKeys = uniqueNonEmptyStrings_([
-      pipeline && pipeline.id,
-      pipeline && pipeline.label
-    ]).map(function (value) {
-      return normalizeHeaderName_(value);
-    }).filter(Boolean);
-    const stages = Array.isArray(pipeline && pipeline.stages) ? pipeline.stages : [];
-
-    stages.forEach(function (stage) {
-      if (stage && stage.archived === true) return;
-
-      const stageId = String(stage && (stage.id || stage.value) || "").trim();
-      const stageLabel = String(stage && (stage.label || stage.id) || "").trim();
-      const stageKey = normalizeHeaderName_(stageLabel);
-      if (!stageId || !stageKey) return;
-
-      pipelineKeys.forEach(function (pipelineKey) {
-        if (!byPipeline[pipelineKey]) byPipeline[pipelineKey] = {};
-        byPipeline[pipelineKey][stageKey] = stageId;
-        byPipeline[pipelineKey][normalizeHeaderName_(stageId)] = stageId;
-      });
-
-      if (!stageValuesByLabel[stageKey]) stageValuesByLabel[stageKey] = {};
-      stageValuesByLabel[stageKey][stageId] = true;
-    });
-  });
-
-  const uniqueByStageLabel = {};
-  const ambiguousByStageLabel = {};
-  Object.keys(stageValuesByLabel).forEach(function (stageKey) {
-    const values = Object.keys(stageValuesByLabel[stageKey]);
-    if (values.length === 1) {
-      uniqueByStageLabel[stageKey] = values[0];
-    } else if (values.length > 1) {
-      ambiguousByStageLabel[stageKey] = values;
-    }
-  });
-
-  return {
-    byPipeline: byPipeline,
-    uniqueByStageLabel: uniqueByStageLabel,
-    ambiguousByStageLabel: ambiguousByStageLabel
-  };
-}
-
-function resolveHubSpotDealStageValueForPipeline_(stageLabel, pipeline, lookup) {
-  const stageKey = normalizeHeaderName_(stageLabel);
-  const pipelineKey = normalizeHeaderName_(pipeline);
-  if (!stageKey) return "";
-
-  if (
-    pipelineKey &&
-    lookup &&
-    lookup.byPipeline &&
-    lookup.byPipeline[pipelineKey] &&
-    lookup.byPipeline[pipelineKey][stageKey]
-  ) {
-    return lookup.byPipeline[pipelineKey][stageKey];
-  }
-
-  if (!pipelineKey && lookup && lookup.uniqueByStageLabel && lookup.uniqueByStageLabel[stageKey]) {
-    return lookup.uniqueByStageLabel[stageKey];
-  }
-
-  return "";
-}
-
-function formatCountMap_(counts) {
-  const keys = Object.keys(counts || {}).sort();
-  if (keys.length === 0) return "none";
-  return keys.map(function (key) {
-    return key + "=" + Number(counts[key] || 0);
-  }).join(", ");
-}
-
 function getHubSpotApiToken_() {
   return getScriptProperty_(HUBSPOT_API_KEY_PROP_);
 }
@@ -4668,26 +4510,18 @@ function fetchHubSpotPropertiesForObject_(objectType, token) {
 }
 
 function compactHubSpotPropertyInfo_(property) {
-  const modificationMetadata = property && property.modificationMetadata
-    ? property.modificationMetadata
-    : {};
   return {
     name: String(property && property.name || "").trim(),
     label: String(property && property.label || property && property.name || "").trim(),
     type: String(property && property.type || "").trim(),
-    fieldType: String(property && property.fieldType || "").trim(),
-    options: normalizeHubSpotPropertyOptions_(property && property.options),
-    readOnlyValue:
-      property && property.readOnlyValue === true ||
-      modificationMetadata.readOnlyValue === true,
-    calculated: property && property.calculated === true
+    fieldType: String(property && property.fieldType || "").trim()
   };
 }
 
 function getHubSpotPropertiesCacheKey_(token, objectType) {
   const type = String(objectType || "").trim();
   if (!type) return "";
-  return "HS_PROPERTIES_V2::" + getHubSpotTokenFingerprint_(token) + "::" + type;
+  return "HS_PROPERTIES::" + getHubSpotTokenFingerprint_(token) + "::" + type;
 }
 
 function getHubSpotTokenFingerprint_(token) {
@@ -4736,446 +4570,6 @@ function updateHubSpotDealPropertySingle_(token, propertyName, item) {
       })
     }
   );
-}
-
-function createHubSpotActivationForCampaignRow_(
-  campaignRow,
-  campHeader,
-  dealId,
-  activationsInfo,
-  token
-) {
-  const objectTypeId = activationsInfo && activationsInfo.objectTypeId
-    ? String(activationsInfo.objectTypeId).trim()
-    : "";
-  if (!objectTypeId || !dealId) return "";
-
-  try {
-    const properties = buildHubSpotActivationProperties_(
-      campaignRow,
-      campHeader,
-      dealId,
-      activationsInfo,
-      token
-    );
-    const created = hubspotRequestJson_(
-      HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(objectTypeId),
-      token,
-      {
-        method: "post",
-        payload: JSON.stringify({ properties: properties })
-      }
-    );
-
-    const activationId = created && created.id != null ? String(created.id).trim() : "";
-    if (!activationId) return "";
-
-    if (!associateDealToActivation_(dealId, activationId, objectTypeId, token)) {
-      Logger.log(
-        `⚠️ Created Activation ${activationId} but could not associate it to deal ${dealId}.`
-      );
-      return "";
-    }
-
-    return activationId;
-  } catch (e) {
-    Logger.log(`❌ HubSpot Activation create failed for deal ${dealId}: ${e}`);
-    return "";
-  }
-}
-
-function buildHubSpotActivationProperties_(
-  campaignRow,
-  campHeader,
-  dealId,
-  activationsInfo,
-  token
-) {
-  const objectTypeId = activationsInfo && activationsInfo.objectTypeId
-    ? String(activationsInfo.objectTypeId).trim()
-    : "";
-  const properties = {};
-  const activationType = String(getPitchValueByHeader_(campaignRow, campHeader, "Activation Type") || "").trim();
-  const extAmount = getPitchValueByHeader_(campaignRow, campHeader, "EXT Rate");
-  const extAmountText = String(extAmount == null ? "" : extAmount).trim();
-
-  const activationTypeProperty = getHubSpotPropertyNameByLabelOrFallback_(
-    objectTypeId,
-    "Activation Type",
-    token,
-    HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_
-  );
-  const extAmountProperty = getHubSpotPropertyNameByLabelOrFallback_(
-    objectTypeId,
-    "EXT Amount",
-    token,
-    HUBSPOT_EXT_AMOUNT_PROPERTY_FALLBACK_
-  );
-
-  if (activationType && activationTypeProperty) properties[activationTypeProperty] = activationType;
-  if (extAmountText && extAmountProperty) properties[extAmountProperty] = extAmountText;
-
-  const activationName = buildActivationNameForCampaignRow_(
-    campaignRow,
-    campHeader,
-    dealId,
-    activationsInfo,
-    token
-  );
-  const activationNameProperty = getHubSpotActivationNamePropertyName_(activationsInfo, token);
-  if (activationName && activationNameProperty) {
-    properties[activationNameProperty] = activationName;
-  } else {
-    const primaryDisplayProperty = activationsInfo && activationsInfo.primaryDisplayProperty
-      ? String(activationsInfo.primaryDisplayProperty).trim()
-      : "";
-    if (primaryDisplayProperty && !properties[primaryDisplayProperty]) {
-      const fallbackName = buildActivationDisplayValue_(campaignRow, campHeader);
-      if (fallbackName) properties[primaryDisplayProperty] = fallbackName;
-    }
-  }
-
-  return properties;
-}
-
-function buildActivationNameForCampaignRow_(
-  campaignRow,
-  campHeader,
-  dealId,
-  activationsInfo,
-  token
-) {
-  const activationType = String(getPitchValueByHeader_(campaignRow, campHeader, "Activation Type") || "").trim();
-  const dealName = getHubSpotDealNameById_(dealId, token);
-  if (!dealName || !activationType) return "";
-
-  const activationNumber = getNextActivationSequenceForDealType_(dealId, activationType, activationsInfo, token);
-  if (activationNumber <= 0) return `${dealName} - ${activationType}`;
-  return `${dealName} - ${activationType} #${activationNumber}`;
-}
-
-function buildActivationDisplayValue_(campaignRow, campHeader) {
-  const campaignName = String(getPitchValueByHeader_(campaignRow, campHeader, "Campaign Name") || "").trim();
-  const channelName = String(getPitchValueByHeader_(campaignRow, campHeader, "Channel Name") || "").trim();
-  const activationType = String(getPitchValueByHeader_(campaignRow, campHeader, "Activation Type") || "").trim();
-
-  return [channelName, campaignName, activationType]
-    .filter(Boolean)
-    .join(" - ")
-    .trim();
-}
-
-function associateDealToActivation_(dealId, activationId, activationsObjectTypeId, token) {
-  try {
-    hubspotRequestJson_(
-      HUBSPOT_API_BASE_ + "/crm/v4/objects/deals/" + encodeURIComponent(dealId) +
-      "/associations/default/" + encodeURIComponent(activationsObjectTypeId) + "/" + encodeURIComponent(activationId),
-      token,
-      { method: "put" }
-    );
-    return true;
-  } catch (e) {
-    Logger.log(`❌ HubSpot association failed for deal ${dealId} and Activation ${activationId}: ${e}`);
-    return false;
-  }
-}
-
-function getHubSpotActivationNamePropertyName_(activationsInfo, token) {
-  const objectTypeId = activationsInfo && activationsInfo.objectTypeId
-    ? String(activationsInfo.objectTypeId).trim()
-    : "";
-  if (!objectTypeId) return "";
-  if (HUBSPOT_ACTIVATION_NAME_PROPERTY_CACHE_[objectTypeId]) {
-    return HUBSPOT_ACTIVATION_NAME_PROPERTY_CACHE_[objectTypeId];
-  }
-
-  const resolved = getHubSpotPropertyNameByLabelOrFallback_(
-    objectTypeId,
-    "Activation Name",
-    token,
-    ""
-  );
-  const fallback = activationsInfo && activationsInfo.primaryDisplayProperty
-    ? String(activationsInfo.primaryDisplayProperty).trim()
-    : "";
-  HUBSPOT_ACTIVATION_NAME_PROPERTY_CACHE_[objectTypeId] = resolved || fallback;
-  return HUBSPOT_ACTIVATION_NAME_PROPERTY_CACHE_[objectTypeId];
-}
-
-function getHubSpotDealNamePropertyName_(token) {
-  if (HUBSPOT_DEAL_NAME_PROPERTY_CACHE_) return HUBSPOT_DEAL_NAME_PROPERTY_CACHE_;
-
-  HUBSPOT_DEAL_NAME_PROPERTY_CACHE_ = getHubSpotPropertyNameByLabelOrFallback_(
-    HUBSPOT_DEALS_OBJECT_API_NAME_,
-    "Deal name",
-    token,
-    HUBSPOT_DEAL_NAME_PROPERTY_FALLBACK_
-  );
-  return HUBSPOT_DEAL_NAME_PROPERTY_CACHE_;
-}
-
-function getHubSpotDealNameById_(dealId, token) {
-  const normalizedDealId = String(dealId || "").trim();
-  if (!normalizedDealId) return "";
-  if (Object.prototype.hasOwnProperty.call(HUBSPOT_DEAL_NAME_CACHE_, normalizedDealId)) {
-    return HUBSPOT_DEAL_NAME_CACHE_[normalizedDealId];
-  }
-
-  const dealNameProperty = getHubSpotDealNamePropertyName_(token);
-  if (!dealNameProperty) {
-    HUBSPOT_DEAL_NAME_CACHE_[normalizedDealId] = "";
-    return "";
-  }
-
-  try {
-    const data = hubspotRequestJson_(
-      HUBSPOT_API_BASE_ + "/crm/v3/objects/deals/" + encodeURIComponent(normalizedDealId) +
-      "?properties=" + encodeURIComponent(dealNameProperty),
-      token
-    );
-    const properties = data && data.properties ? data.properties : {};
-    const dealName = String(properties[dealNameProperty] || "").trim();
-    HUBSPOT_DEAL_NAME_CACHE_[normalizedDealId] = dealName;
-    return dealName;
-  } catch (e) {
-    Logger.log(`⚠️ Could not fetch HubSpot deal name for ${normalizedDealId}: ${e}`);
-    HUBSPOT_DEAL_NAME_CACHE_[normalizedDealId] = "";
-    return "";
-  }
-}
-
-function getNextActivationSequenceForDealType_(dealId, activationType, activationsInfo, token) {
-  const activationIds = fetchActivationIdsForDeal_(dealId, activationsInfo, token);
-  if (activationIds.length === 0) return 1;
-
-  const activations = fetchHubSpotActivationsByIds_(
-    activationIds,
-    activationsInfo && activationsInfo.objectTypeId,
-    token
-  );
-  const activationTypeProperty = getHubSpotPropertyNameByLabelOrFallback_(
-    activationsInfo && activationsInfo.objectTypeId,
-    "Activation Type",
-    token,
-    HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_
-  );
-  const targetType = String(activationType || "").trim();
-  let existingCount = 0;
-
-  Object.keys(activations).forEach(function (activationId) {
-    const item = activations[activationId] || {};
-    const properties = item.properties || {};
-    const existingType = String(properties[activationTypeProperty] || "").trim();
-    if (existingType === targetType) existingCount++;
-  });
-
-  return existingCount + 1;
-}
-
-function fetchActivationIdsForDeal_(dealId, activationsInfo, token) {
-  const objectTypeId = activationsInfo && activationsInfo.objectTypeId
-    ? String(activationsInfo.objectTypeId).trim()
-    : "";
-  if (!dealId || !objectTypeId) return [];
-
-  let data = null;
-  try {
-    data = hubspotRequestJson_(
-      HUBSPOT_API_BASE_ + "/crm/v4/associations/deals/" + encodeURIComponent(objectTypeId) + "/batch/read",
-      token,
-      {
-        method: "post",
-        payload: JSON.stringify({
-          inputs: [{ id: String(dealId).trim() }]
-        })
-      }
-    );
-  } catch (e) {
-    Logger.log(`⚠️ Could not fetch existing Activations for deal ${dealId}: ${e}`);
-    return [];
-  }
-  const results = Array.isArray(data && data.results) ? data.results : [];
-  if (results.length === 0) return [];
-
-  return uniqueNonEmptyStrings_(
-    results.reduce(function (acc, item) {
-      const to = Array.isArray(item && item.to) ? item.to : [];
-      to.forEach(function (entry) {
-        const activationId = entry && entry.toObjectId != null ? String(entry.toObjectId) : "";
-        if (activationId) acc.push(activationId);
-      });
-      return acc;
-    }, [])
-  );
-}
-
-function fetchHubSpotActivationsByIds_(activationIds, activationsObjectTypeId, token) {
-  const objectTypeId = String(activationsObjectTypeId || "").trim();
-  const chunks = chunkArray_(activationIds, 100);
-  const out = {};
-  if (!objectTypeId || chunks.length === 0) return out;
-
-  const activationTypeProperty = getHubSpotPropertyNameByLabelOrFallback_(
-    objectTypeId,
-    "Activation Type",
-    token,
-    HUBSPOT_ACTIVATION_TYPE_PROPERTY_FALLBACK_
-  );
-  const extAmountProperty = getHubSpotPropertyNameByLabelOrFallback_(
-    objectTypeId,
-    "EXT Amount",
-    token,
-    HUBSPOT_EXT_AMOUNT_PROPERTY_FALLBACK_
-  );
-  const activationNameProperty = getHubSpotActivationNamePropertyName_(
-    { objectTypeId: objectTypeId, primaryDisplayProperty: "" },
-    token
-  );
-
-  for (const chunk of chunks) {
-    const properties = uniqueNonEmptyStrings_([
-      activationTypeProperty,
-      extAmountProperty,
-      activationNameProperty
-    ]);
-
-    let data = null;
-    try {
-      data = hubspotRequestJson_(
-        HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(objectTypeId) + "/batch/read",
-        token,
-        {
-          method: "post",
-          payload: JSON.stringify({
-            inputs: chunk.map(function (id) { return { id: String(id) }; }),
-            properties: properties
-          })
-        }
-      );
-    } catch (e) {
-      Logger.log("⚠️ Could not fetch existing Activation details for sequence numbering: " + e);
-      continue;
-    }
-
-    if (!data || !Array.isArray(data.results)) continue;
-
-    data.results.forEach(function (item) {
-      if (item && item.id != null) out[String(item.id)] = item;
-    });
-  }
-
-  return out;
-}
-
-function getHubSpotPropertyNameByLabelOrFallback_(objectType, propertyLabel, token, fallbackName) {
-  const normalizedObjectType = String(objectType || "").trim();
-  const label = String(propertyLabel || "").trim();
-  if (!normalizedObjectType || !label) return String(fallbackName || "").trim();
-
-  try {
-    const infoByLabel = resolveHubSpotPropertyInfosByLabel_(
-      normalizedObjectType,
-      [label],
-      token
-    );
-    if (infoByLabel[label] && infoByLabel[label].name) {
-      return String(infoByLabel[label].name || "").trim();
-    }
-  } catch (e) {
-    Logger.log(`⚠️ Could not resolve HubSpot property "${label}" on ${normalizedObjectType}: ${e}`);
-  }
-
-  return String(fallbackName || "").trim();
-}
-
-function updateCampaignsInHubSpot() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Campaigns");
-  if (!sheet) {
-    showSpreadsheetAlert_("❌ 'Campaigns' sheet not found.");
-    return Logger.log("❌ 'Campaigns' sheet not found.");
-  }
-
-  const statusResult = markCampaignRowsPublishedFromActivationUrl_(sheet);
-  if (statusResult.updated > 0) SpreadsheetApp.flush();
-
-  const result = syncCampaignRowsToHubSpot_(sheet);
-  const message =
-    `Campaigns HubSpot update complete. Updated: ${result.updated}. Failed: ${result.failed}. ` +
-    `Marked published: ${statusResult.updated}.`;
-  showSpreadsheetToast_(message);
-  Logger.log("✅ " + message);
-}
-
-function updatePerformanceInHubSpot() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Performance");
-  if (!sheet) {
-    showSpreadsheetAlert_("❌ 'Performance' sheet not found.");
-    return Logger.log("❌ 'Performance' sheet not found.");
-  }
-
-  const result = syncPerformanceRowsToHubSpot_(sheet);
-  const message = `Performance HubSpot update complete. Updated: ${result.updated}. Failed: ${result.failed}.`;
-  showSpreadsheetToast_(message);
-  Logger.log("✅ " + message);
-}
-
-function markCampaignRowsPublishedFromActivationUrl_(sheet) {
-  const data = sheet.getDataRange().getValues();
-  if (!data || data.length < 2) {
-    return {
-      updated: 0,
-      skippedMissingColumns: 0
-    };
-  }
-
-  const header = (data[0] || []).map(function (value) {
-    return String(value || "").trim();
-  });
-  const statusCol = findHeaderIndex_(header, "Status");
-  const activationUrlCol = findHeaderIndex_(header, "Activation URL");
-  if (statusCol === -1 || activationUrlCol === -1) {
-    Logger.log("ℹ️ Campaigns published status update skipped. Missing 'Status' or 'Activation URL' column.");
-    return {
-      updated: 0,
-      skippedMissingColumns: 1
-    };
-  }
-
-  const updates = [];
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    const activationUrl = String(row[activationUrlCol] || "").trim();
-    if (!activationUrl) continue;
-
-    const currentStatus = row[statusCol];
-    if (String(currentStatus || "").trim() === "Published") continue;
-
-    updates.push({
-      row1: r + 1,
-      colIndex: statusCol,
-      oldValue: currentStatus,
-      newValue: "Published"
-    });
-  }
-
-  const writeResult = writeSparseCellUpdates_(
-    sheet,
-    header,
-    updates,
-    "Campaigns published status update"
-  );
-  if (writeResult.writtenRowCount > 0) {
-    Logger.log(`✅ Marked ${writeResult.writtenRowCount} Campaigns row(s) as Published from Activation URL.`);
-  }
-
-  return {
-    updated: writeResult.writtenRowCount,
-    skippedMissingColumns: 0
-  };
 }
 
 function syncCampaignRowsToHubSpot_(sheet) {
@@ -5229,16 +4623,17 @@ function syncCampaignRowsToHubSpot_(sheet) {
     };
   }
 
-  const headerPropertyLabels = getHubSpotSyncCandidateLabelsFromHeader_(header);
-  const dealStagePropertyLabels = getHubSpotSyncPropertyLabelsFromStages_(HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_);
-  const dealAmountPropertyLabels = ["Amount", "EXT Amount"];
   const dealPropertyLabels = uniqueNonEmptyStrings_(
-    headerPropertyLabels.concat(dealStagePropertyLabels).concat(dealAmountPropertyLabels)
+    flatten2d_(
+      HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_.map(function (stage) {
+        return (stage.fields || []).map(function (field) { return field.propertyLabel; });
+      })
+    )
   );
   const dealPropertyInfoByLabel = dealPropertyLabels.length > 0
     ? resolveHubSpotPropertyInfosByLabel_(HUBSPOT_DEALS_OBJECT_API_NAME_, dealPropertyLabels, token)
     : {};
-  const unresolvedDealProperties = dealStagePropertyLabels.filter(function (label) {
+  const unresolvedDealProperties = dealPropertyLabels.filter(function (label) {
     return !dealPropertyInfoByLabel[label];
   });
   if (unresolvedDealProperties.length > 0) {
@@ -5254,32 +4649,10 @@ function syncCampaignRowsToHubSpot_(sheet) {
     );
   }
 
-  const dealGenericFields = buildHubSpotSyncFieldsFromHeader_(
-    header,
-    dealPropertyInfoByLabel,
-    [],
-    HUBSPOT_SHEET_SYNC_ID_COLUMNS_
-  );
-  const dealGenericStagePlan = buildHubSpotGenericStagePlanFromSheetRows_(
-    data,
-    header,
-    "HubSpot Record ID",
-    HUBSPOT_DEALS_OBJECT_API_NAME_,
-    "Deal Fields",
-    dealGenericFields,
-    dealPropertyInfoByLabel,
-    spreadsheetTimeZone
-  );
   const groupedDealStagePlan = buildHubSpotGroupedDealStageUpdatesFromCampaignRows_(
     data,
     header,
     HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_,
-    dealPropertyInfoByLabel,
-    spreadsheetTimeZone
-  );
-  const dealAmountTotalsStagePlan = buildHubSpotDealAmountTotalStagePlan_(
-    data,
-    header,
     dealPropertyInfoByLabel,
     spreadsheetTimeZone
   );
@@ -5301,14 +4674,17 @@ function syncCampaignRowsToHubSpot_(sheet) {
         token
       );
 
-      const activationExplicitFields = getHubSpotSyncFieldsFromStages_(HUBSPOT_INT_CAMPAIGN_ACTIVATION_SYNC_STAGES_);
       const activationPropertyLabels = uniqueNonEmptyStrings_(
-        headerPropertyLabels.concat(getHubSpotSyncPropertyLabelsFromStages_(HUBSPOT_INT_CAMPAIGN_ACTIVATION_SYNC_STAGES_))
+        flatten2d_(
+          HUBSPOT_INT_CAMPAIGN_ACTIVATION_SYNC_STAGES_.map(function (stage) {
+            return (stage.fields || []).map(function (field) { return field.propertyLabel; });
+          })
+        )
       );
       const activationPropertyInfoByLabel = activationPropertyLabels.length > 0
         ? resolveHubSpotPropertyInfosByLabel_(activationsInfo.objectTypeId, activationPropertyLabels, token)
         : {};
-      const unresolvedActivationProperties = getHubSpotSyncPropertyLabelsFromStages_(HUBSPOT_INT_CAMPAIGN_ACTIVATION_SYNC_STAGES_).filter(function (label) {
+      const unresolvedActivationProperties = activationPropertyLabels.filter(function (label) {
         return !activationPropertyInfoByLabel[label];
       });
       if (unresolvedActivationProperties.length > 0) {
@@ -5318,20 +4694,13 @@ function syncCampaignRowsToHubSpot_(sheet) {
         );
       }
 
-      const activationFields = buildHubSpotSyncFieldsFromHeader_(
-        header,
-        activationPropertyInfoByLabel,
-        activationExplicitFields,
-        HUBSPOT_SHEET_SYNC_ID_COLUMNS_
-      );
-      activationStagePlan = buildHubSpotGenericStagePlanFromSheetRows_(
+      activationStagePlan = buildHubSpotStageUpdatesFromCampaignRows_(
         data,
         header,
+        HUBSPOT_INT_CAMPAIGN_ACTIVATION_SYNC_STAGES_,
+        activationPropertyInfoByLabel,
         "HubSpot Activation ID",
         activationsInfo.objectTypeId,
-        "Activation Fields",
-        activationFields,
-        activationPropertyInfoByLabel,
         spreadsheetTimeZone
       );
     } catch (e) {
@@ -5346,34 +4715,6 @@ function syncCampaignRowsToHubSpot_(sheet) {
   let totalFailed = 0;
 
   activationStagePlan.stages.forEach(function (stage) {
-    const stageResult = stage && Array.isArray(stage.updates) && stage.updates.length > 0
-      ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
-      : { updated: 0, failed: 0 };
-
-    stageResults.push({
-      stageLabel: stage.stageLabel,
-      updated: stageResult.updated,
-      failed: stageResult.failed
-    });
-    totalUpdated += stageResult.updated;
-    totalFailed += stageResult.failed;
-  });
-
-  dealGenericStagePlan.stages.forEach(function (stage) {
-    const stageResult = stage && Array.isArray(stage.updates) && stage.updates.length > 0
-      ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
-      : { updated: 0, failed: 0 };
-
-    stageResults.push({
-      stageLabel: stage.stageLabel,
-      updated: stageResult.updated,
-      failed: stageResult.failed
-    });
-    totalUpdated += stageResult.updated;
-    totalFailed += stageResult.failed;
-  });
-
-  dealAmountTotalsStagePlan.stages.forEach(function (stage) {
     const stageResult = stage && Array.isArray(stage.updates) && stage.updates.length > 0
       ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
       : { updated: 0, failed: 0 };
@@ -5422,12 +4763,6 @@ function syncCampaignRowsToHubSpot_(sheet) {
     `Activation rows considered: ${activationStagePlan.rowsConsidered}. ` +
     `Missing activation ID: ${activationStagePlan.missingIdCount}. ` +
     `Activation rows with no values: ${activationStagePlan.rowsWithNoStageValues}. ` +
-    `Generic deal rows considered: ${dealGenericStagePlan.rowsConsidered}. ` +
-    `Generic deal rows missing ID: ${dealGenericStagePlan.missingIdCount}. ` +
-    `Generic deal rows with no values: ${dealGenericStagePlan.rowsWithNoValues}. ` +
-    `Deal amount total rows considered: ${dealAmountTotalsStagePlan.rowsConsidered}. ` +
-    `Deal amount total rows missing ID: ${dealAmountTotalsStagePlan.missingIdCount}. ` +
-    `Deal amount total rows with no values: ${dealAmountTotalsStagePlan.rowsWithNoValues}. ` +
     `Stages: ${stageResults.map(function (stage) {
       return stage.stageLabel + "=" + stage.updated + "/" + stage.failed;
     }).join(", ")}.`
@@ -5438,65 +4773,6 @@ function syncCampaignRowsToHubSpot_(sheet) {
     updated: totalUpdated,
     failed: totalFailed
   };
-}
-
-function syncCampaignDealAmountTotalsToHubSpot_(sheet) {
-  if (!sheet) {
-    Logger.log("ℹ️ HubSpot Deal amount total sync skipped. Campaigns sheet not available.");
-    return {
-      updated: 0,
-      failed: 0
-    };
-  }
-
-  const token = getHubSpotApiToken_();
-  if (!token) {
-    Logger.log("ℹ️ HubSpot token not set in this project. Skipping Deal amount total sync.");
-    return {
-      updated: 0,
-      failed: 0
-    };
-  }
-
-  const data = sheet.getDataRange().getValues();
-  if (!data || data.length < 2) {
-    Logger.log("ℹ️ HubSpot Deal amount total sync skipped. Campaigns sheet has no data rows.");
-    return {
-      updated: 0,
-      failed: 0
-    };
-  }
-
-  const header = (data[0] || []).map(function (value) {
-    return String(value || "").trim();
-  });
-  const spreadsheetTimeZone =
-    (sheet.getParent() && sheet.getParent().getSpreadsheetTimeZone()) ||
-    Session.getScriptTimeZone() ||
-    "UTC";
-  const propertyInfoByLabel = resolveHubSpotPropertyInfosByLabel_(
-    HUBSPOT_DEALS_OBJECT_API_NAME_,
-    ["Amount", "EXT Amount"],
-    token
-  );
-  const stagePlan = buildHubSpotDealAmountTotalStagePlan_(
-    data,
-    header,
-    propertyInfoByLabel,
-    spreadsheetTimeZone
-  );
-  const stage = stagePlan.stages[0];
-  const result = stage && Array.isArray(stage.updates) && stage.updates.length > 0
-    ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
-    : { updated: 0, failed: 0 };
-
-  Logger.log(
-    `✅ HubSpot Deal amount total sync done. Updated: ${result.updated}. Failed: ${result.failed}. ` +
-    `Rows considered: ${stagePlan.rowsConsidered}. Missing ID: ${stagePlan.missingIdCount}. ` +
-    `Rows with no values: ${stagePlan.rowsWithNoValues}.`
-  );
-
-  return result;
 }
 
 function syncPerformanceRowsToHubSpot_(sheet) {
@@ -5556,16 +4832,17 @@ function syncPerformanceRowsToHubSpot_(sheet) {
       token
     );
 
-    const headerPropertyLabels = getHubSpotSyncCandidateLabelsFromHeader_(header);
-    const performanceExplicitFields = getHubSpotSyncFieldsFromStages_(HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_);
-    const performanceExplicitPropertyLabels = getHubSpotSyncPropertyLabelsFromStages_(HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_);
     const activationPropertyLabels = uniqueNonEmptyStrings_(
-      headerPropertyLabels.concat(performanceExplicitPropertyLabels)
+      flatten2d_(
+        HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_.map(function (stage) {
+          return (stage.fields || []).map(function (field) { return field.propertyLabel; });
+        })
+      )
     );
     const activationPropertyInfoByLabel = activationPropertyLabels.length > 0
       ? resolveHubSpotPropertyInfosByLabel_(activationsInfo.objectTypeId, activationPropertyLabels, token)
       : {};
-    const unresolvedActivationProperties = performanceExplicitPropertyLabels.filter(function (label) {
+    const unresolvedActivationProperties = activationPropertyLabels.filter(function (label) {
       return !activationPropertyInfoByLabel[label];
     });
     if (unresolvedActivationProperties.length > 0) {
@@ -5575,20 +4852,13 @@ function syncPerformanceRowsToHubSpot_(sheet) {
       );
     }
 
-    const activationFields = buildHubSpotSyncFieldsFromHeader_(
-      header,
-      activationPropertyInfoByLabel,
-      performanceExplicitFields,
-      HUBSPOT_SHEET_SYNC_ID_COLUMNS_
-    );
-    const stagePlan = buildHubSpotGenericStagePlanFromSheetRows_(
+    const stagePlan = buildHubSpotStageUpdatesFromCampaignRows_(
       data,
       header,
+      HUBSPOT_INT_PERFORMANCE_ACTIVATION_SYNC_STAGES_,
+      activationPropertyInfoByLabel,
       "HubSpot Activation ID",
       activationsInfo.objectTypeId,
-      "Performance Fields",
-      activationFields,
-      activationPropertyInfoByLabel,
       spreadsheetTimeZone
     );
 
@@ -5760,7 +5030,7 @@ function buildHubSpotGroupedDealStageProperties_(
     if (!field || !field.propertyLabel || !field.sourceColumn) return;
 
     const propertyInfo = propertyInfoByLabel[field.propertyLabel];
-    if (!isWritableHubSpotPropertyInfo_(propertyInfo)) return;
+    if (!propertyInfo) return;
 
     const colIdx = findHeaderIndex_(header, field.sourceColumn);
     if (colIdx === -1) return;
@@ -5778,9 +5048,6 @@ function buildHubSpotGroupedDealStageProperties_(
           rawValue = rows[i][colIdx];
           break;
         }
-      }
-      if (!isEmptyHubSpotSyncValue_(rawValue) && field.completeValue != null) {
-        rawValue = field.completeValue;
       }
     }
 
@@ -5850,10 +5117,7 @@ function resolveHubSpotPropertyInfosByLabel_(objectType, propertyLabels, token) 
         name: String(property.name || "").trim(),
         label: String(property.label || property.name || "").trim(),
         type: String(property.type || "").trim(),
-        fieldType: String(property.fieldType || "").trim(),
-        options: normalizeHubSpotPropertyOptions_(property.options),
-        readOnlyValue: property.readOnlyValue === true,
-        calculated: property.calculated === true
+        fieldType: String(property.fieldType || "").trim()
       };
     });
   });
@@ -5907,48 +5171,13 @@ function updateHubSpotObjectPropertiesBatch_(objectType, items, token) {
           updateHubSpotObjectPropertiesSingle_(objectType, item, token);
           updated++;
         } catch (singleError) {
-          const partialResult = updateHubSpotObjectPropertiesIndividually_(objectType, item, token);
-          if (partialResult.updated > 0) updated++;
-          if (partialResult.failed > 0 || partialResult.updated === 0) failed++;
+          failed++;
           Logger.log(
-            `⚠️ HubSpot object sync needed per-property fallback for object ${item.id} ` +
-            `(row ${item.row1}). Updated properties: ${partialResult.updated}. ` +
-            `Failed properties: ${partialResult.failed}. Original error: ${singleError}`
+            `⚠️ HubSpot Campaign sync failed for object ${item.id} ` +
+            `(row ${item.row1}): ${singleError}`
           );
         }
       });
-    }
-  });
-
-  return {
-    updated: updated,
-    failed: failed
-  };
-}
-
-function updateHubSpotObjectPropertiesIndividually_(objectType, item, token) {
-  const properties = item && item.properties ? item.properties : {};
-  let updated = 0;
-  let failed = 0;
-
-  Object.keys(properties).forEach(function (propertyName) {
-    try {
-      updateHubSpotObjectPropertiesSingle_(
-        objectType,
-        {
-          id: item.id,
-          row1: item.row1,
-          properties: { [propertyName]: properties[propertyName] }
-        },
-        token
-      );
-      updated++;
-    } catch (e) {
-      failed++;
-      Logger.log(
-        `⚠️ HubSpot property sync failed for object ${item.id}, property ${propertyName} ` +
-        `(row ${item.row1}): ${e}`
-      );
     }
   });
 
@@ -6075,7 +5304,7 @@ function buildHubSpotPropertiesFromRowForFields_(
     if (!field || !field.propertyLabel || !field.sourceColumn) return;
 
     const propertyInfo = propertyInfoByLabel[field.propertyLabel];
-    if (!isWritableHubSpotPropertyInfo_(propertyInfo)) return;
+    if (!propertyInfo) return;
 
     const colIdx = findHeaderIndex_(header, field.sourceColumn);
     if (colIdx === -1) return;
@@ -6089,321 +5318,6 @@ function buildHubSpotPropertiesFromRowForFields_(
   });
 
   return properties;
-}
-
-function buildHubSpotGenericStagePlanFromSheetRows_(
-  data,
-  header,
-  idColumnName,
-  objectTypeId,
-  stageLabel,
-  fields,
-  propertyInfoByLabel,
-  spreadsheetTimeZone
-) {
-  const idCol = findHeaderIndex_(header, idColumnName);
-  const normalizedFields = Array.isArray(fields) ? fields : [];
-  const updatesById = {};
-  let rowsConsidered = 0;
-  let missingIdCount = 0;
-  let rowsWithNoValues = 0;
-
-  if (normalizedFields.length === 0 || idCol === -1) {
-    return {
-      stages: [
-        {
-          stageLabel: stageLabel,
-          objectTypeId: objectTypeId,
-          updates: []
-        }
-      ],
-      rowsConsidered: 0,
-      missingIdCount: 0,
-      rowsWithNoValues: 0,
-      rowsWithNoStageValues: 0
-    };
-  }
-
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    rowsConsidered++;
-
-    const objectId = String(row[idCol] || "").trim();
-    if (!objectId) {
-      missingIdCount++;
-      continue;
-    }
-
-    const properties = buildHubSpotPropertiesFromRowForFields_(
-      row,
-      header,
-      normalizedFields,
-      propertyInfoByLabel,
-      spreadsheetTimeZone
-    );
-    if (Object.keys(properties).length === 0) {
-      rowsWithNoValues++;
-      continue;
-    }
-
-    if (!updatesById[objectId]) {
-      updatesById[objectId] = {
-        id: objectId,
-        properties: {},
-        row1: r + 1
-      };
-    }
-    Object.keys(properties).forEach(function (propertyName) {
-      updatesById[objectId].properties[propertyName] = properties[propertyName];
-    });
-    updatesById[objectId].row1 = r + 1;
-  }
-
-  return {
-    stages: [
-      {
-        stageLabel: stageLabel,
-        objectTypeId: objectTypeId,
-        updates: Object.keys(updatesById).map(function (objectId) {
-          return updatesById[objectId];
-        })
-      }
-    ],
-    rowsConsidered: rowsConsidered,
-    missingIdCount: missingIdCount,
-    rowsWithNoValues: rowsWithNoValues,
-    rowsWithNoStageValues: rowsWithNoValues
-  };
-}
-
-function buildHubSpotDealAmountTotalStagePlan_(
-  data,
-  header,
-  propertyInfoByLabel,
-  spreadsheetTimeZone
-) {
-  const dealIdCol = findHeaderIndex_(header, "HubSpot Record ID");
-  const activationIdCol = findHeaderIndex_(header, "HubSpot Activation ID");
-  const intRateCol = findHeaderIndex_(header, "INT Rate");
-  const extRateCol = findHeaderIndex_(header, "EXT Rate");
-  const amountPropertyInfo = propertyInfoByLabel["Amount"];
-  const extAmountPropertyInfo = propertyInfoByLabel["EXT Amount"];
-  const updates = [];
-  const activationsByDealId = {};
-  let rowsConsidered = 0;
-  let missingIdCount = 0;
-  let rowsWithNoValues = 0;
-
-  if (
-    dealIdCol === -1 ||
-    activationIdCol === -1 ||
-    (intRateCol === -1 && extRateCol === -1) ||
-    (!isWritableHubSpotPropertyInfo_(amountPropertyInfo) && !isWritableHubSpotPropertyInfo_(extAmountPropertyInfo))
-  ) {
-    return {
-      stages: [
-        {
-          stageLabel: "Deal Amount Totals",
-          objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
-          updates: []
-        }
-      ],
-      rowsConsidered: 0,
-      missingIdCount: 0,
-      rowsWithNoValues: 0,
-      rowsWithNoStageValues: 0
-    };
-  }
-
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    rowsConsidered++;
-
-    const dealId = String(row[dealIdCol] || "").trim();
-    const activationId = String(row[activationIdCol] || "").trim();
-    if (!dealId || !activationId) {
-      missingIdCount++;
-      continue;
-    }
-
-    const intAmount = intRateCol === -1 ? null : parseHubSpotAmountNumber_(row[intRateCol]);
-    const extAmount = extRateCol === -1 ? null : parseHubSpotAmountNumber_(row[extRateCol]);
-    if (intAmount == null && extAmount == null) {
-      rowsWithNoValues++;
-      continue;
-    }
-
-    if (!activationsByDealId[dealId]) activationsByDealId[dealId] = {};
-    activationsByDealId[dealId][activationId] = {
-      row1: r + 1,
-      intAmount: intAmount,
-      extAmount: extAmount
-    };
-  }
-
-  Object.keys(activationsByDealId).forEach(function (dealId) {
-    const activations = activationsByDealId[dealId] || {};
-    const totals = {
-      intAmount: 0,
-      extAmount: 0,
-      hasIntAmount: false,
-      hasExtAmount: false,
-      row1: 0
-    };
-
-    Object.keys(activations).forEach(function (activationId) {
-      const item = activations[activationId] || {};
-      if (item.intAmount != null) {
-        totals.intAmount += item.intAmount;
-        totals.hasIntAmount = true;
-      }
-      if (item.extAmount != null) {
-        totals.extAmount += item.extAmount;
-        totals.hasExtAmount = true;
-      }
-      if (item.row1) totals.row1 = item.row1;
-    });
-
-    const properties = {};
-    if (totals.hasIntAmount && isWritableHubSpotPropertyInfo_(amountPropertyInfo)) {
-      const value = serializeHubSpotPropertyValue_(roundHubSpotAmountNumber_(totals.intAmount), amountPropertyInfo, spreadsheetTimeZone);
-      if (value !== "") properties[amountPropertyInfo.name] = value;
-    }
-    if (totals.hasExtAmount && isWritableHubSpotPropertyInfo_(extAmountPropertyInfo)) {
-      const value = serializeHubSpotPropertyValue_(roundHubSpotAmountNumber_(totals.extAmount), extAmountPropertyInfo, spreadsheetTimeZone);
-      if (value !== "") properties[extAmountPropertyInfo.name] = value;
-    }
-
-    if (Object.keys(properties).length === 0) return;
-    updates.push({
-      id: dealId,
-      properties: properties,
-      row1: totals.row1
-    });
-  });
-
-  return {
-    stages: [
-      {
-        stageLabel: "Deal Amount Totals",
-        objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
-        updates: updates
-      }
-    ],
-    rowsConsidered: rowsConsidered,
-    missingIdCount: missingIdCount,
-    rowsWithNoValues: rowsWithNoValues,
-    rowsWithNoStageValues: rowsWithNoValues
-  };
-}
-
-function parseHubSpotAmountNumber_(value) {
-  if (value == null) return null;
-  if (typeof value === "number") return isFinite(value) ? value : null;
-
-  const text = String(value || "").trim();
-  if (!text) return null;
-
-  const negative = /^\(.*\)$/.test(text);
-  let cleaned = text.replace(/[^\d.,-]/g, "");
-  if (!cleaned || cleaned === "-" || cleaned === "." || cleaned === "-.") return null;
-
-  const lastComma = cleaned.lastIndexOf(",");
-  const lastDot = cleaned.lastIndexOf(".");
-  if (lastComma !== -1 && lastDot !== -1) {
-    if (lastComma > lastDot) {
-      cleaned = cleaned.replace(/\./g, "").replace(",", ".");
-    } else {
-      cleaned = cleaned.replace(/,/g, "");
-    }
-  } else if (lastComma !== -1) {
-    const commaDecimals = cleaned.length - lastComma - 1;
-    cleaned = commaDecimals > 0 && commaDecimals <= 2
-      ? cleaned.replace(",", ".")
-      : cleaned.replace(/,/g, "");
-  }
-
-  const parsed = Number(cleaned);
-  if (!isFinite(parsed)) return null;
-  return negative && parsed > 0 ? -parsed : parsed;
-}
-
-function roundHubSpotAmountNumber_(value) {
-  const amount = Number(value);
-  if (!isFinite(amount)) return 0;
-  return Math.round(amount * 100) / 100;
-}
-
-function buildHubSpotSyncFieldsFromHeader_(header, propertyInfoByLabel, explicitFields, skipColumns) {
-  const fields = [];
-  const seen = {};
-
-  function addField(field) {
-    if (!field || !field.propertyLabel || !field.sourceColumn) return;
-    const propertyInfo = propertyInfoByLabel[field.propertyLabel];
-    if (!isWritableHubSpotPropertyInfo_(propertyInfo)) return;
-    if (findHeaderIndex_(header, field.sourceColumn) === -1) return;
-
-    const key = String(propertyInfo.name || field.propertyLabel) + "||" + String(field.sourceColumn);
-    if (seen[key]) return;
-    seen[key] = true;
-    fields.push({
-      propertyLabel: field.propertyLabel,
-      sourceColumn: field.sourceColumn,
-      completeValue: field.completeValue,
-      incompleteValue: field.incompleteValue
-    });
-  }
-
-  (header || []).forEach(function (columnName) {
-    const name = String(columnName || "").trim();
-    if (!name) return;
-    if (skipColumns && skipColumns.has(name)) return;
-    addField({
-      propertyLabel: name,
-      sourceColumn: name
-    });
-  });
-
-  (explicitFields || []).forEach(addField);
-
-  return fields;
-}
-
-function getHubSpotSyncCandidateLabelsFromHeader_(header) {
-  return uniqueNonEmptyStrings_(
-    (header || []).filter(function (columnName) {
-      const name = String(columnName || "").trim();
-      return name && !HUBSPOT_SHEET_SYNC_ID_COLUMNS_.has(name);
-    })
-  );
-}
-
-function getHubSpotSyncPropertyLabelsFromStages_(stages) {
-  return uniqueNonEmptyStrings_(
-    flatten2d_(
-      (stages || []).map(function (stage) {
-        return (stage.fields || []).map(function (field) { return field.propertyLabel; });
-      })
-    )
-  );
-}
-
-function getHubSpotSyncFieldsFromStages_(stages) {
-  return flatten2d_(
-    (stages || []).map(function (stage) {
-      return stage.fields || [];
-    })
-  );
-}
-
-function isWritableHubSpotPropertyInfo_(propertyInfo) {
-  if (!propertyInfo || !propertyInfo.name) return false;
-  if (propertyInfo.readOnlyValue === true) return false;
-  if (propertyInfo.calculated === true) return false;
-  return true;
 }
 
 function isEmptyHubSpotSyncValue_(value) {
@@ -6462,86 +5376,7 @@ function serializeHubSpotPropertyValue_(value, propertyInfo, spreadsheetTimeZone
     if (normalized === "false" || normalized === "no" || normalized === "0") return "false";
   }
 
-  if (isHubSpotEnumerationProperty_(propertyInfo)) {
-    return serializeHubSpotEnumerationValue_(text, propertyInfo);
-  }
-
   return text;
-}
-
-function isHubSpotEnumerationProperty_(propertyInfo) {
-  const type = String(propertyInfo && propertyInfo.type || "").trim().toLowerCase();
-  const options = propertyInfo && Array.isArray(propertyInfo.options)
-    ? propertyInfo.options
-    : [];
-  return type === "enumeration" || options.length > 0;
-}
-
-function serializeHubSpotEnumerationValue_(text, propertyInfo) {
-  const options = propertyInfo && Array.isArray(propertyInfo.options)
-    ? propertyInfo.options
-    : [];
-  if (options.length === 0) return text;
-
-  const fieldType = String(propertyInfo && propertyInfo.fieldType || "").trim().toLowerCase();
-  const isMulti =
-    fieldType === "checkbox" ||
-    fieldType === "checkboxes" ||
-    fieldType === "multiplecheckbox" ||
-    fieldType === "multiplecheckboxes";
-
-  if (!isMulti) {
-    return resolveHubSpotOptionValue_(text, options) || "";
-  }
-
-  const delimiter = text.indexOf(";") !== -1 ? ";" : ",";
-  const parts = text
-    .split(delimiter)
-    .map(function (part) { return String(part || "").trim(); })
-    .filter(Boolean);
-  if (parts.length === 0) return "";
-
-  const values = [];
-  for (let i = 0; i < parts.length; i++) {
-    const optionValue = resolveHubSpotOptionValue_(parts[i], options);
-    if (!optionValue) return "";
-    values.push(optionValue);
-  }
-
-  return uniqueNonEmptyStrings_(values).join(";");
-}
-
-function resolveHubSpotOptionValue_(value, options) {
-  const target = normalizeHeaderName_(value);
-  if (!target) return "";
-
-  for (let i = 0; i < options.length; i++) {
-    const option = options[i] || {};
-    const optionValue = String(option.value || "").trim();
-    const optionLabel = String(option.label || "").trim();
-    if (
-      normalizeHeaderName_(optionValue) === target ||
-      normalizeHeaderName_(optionLabel) === target
-    ) {
-      return optionValue;
-    }
-  }
-
-  return "";
-}
-
-function normalizeHubSpotPropertyOptions_(options) {
-  if (!Array.isArray(options)) return [];
-  return options
-    .map(function (option) {
-      return {
-        label: String(option && option.label || option && option.value || "").trim(),
-        value: String(option && option.value || "").trim()
-      };
-    })
-    .filter(function (option) {
-      return option.value;
-    });
 }
 
 function hubspotRequestJson_(url, token, options) {
@@ -6690,12 +5525,6 @@ function pushRespondedToNegotiation() {
   const statusCol = creatorHeader.indexOf("Status");
   if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
 
-  try {
-    syncCreatorListDealStagesToHubSpot_(creatorSheet, creatorData, creatorHeader);
-  } catch (e) {
-    Logger.log("⚠️ Creator List Deal Stage sync failed: " + (e && e.stack ? e.stack : e));
-  }
-
   const contactingStart0 = findSectionRowByLabel_(creatorData, "Contacting");
   if (contactingStart0 === -1) return Logger.log("❌ 'Contacting' section not found in Creator List.");
   const contactingEnd0 = findNextSectionStart0_(creatorData, contactingStart0);
@@ -6775,516 +5604,487 @@ function pushRespondedToNegotiation() {
   Logger.log(`✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ${skippedDup} duplicate(s) skipped.`);
 }
 
-function pushNegotiationRowsToActivePitches() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Pitching");
-  if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
 
-  const data = sheet.getDataRange().getValues();
-  if (!data || data.length < 2) return Logger.log("ℹ️ Pitching has no data.");
+function moveCreatorRowsToArchived_(sheet, rowItems, header) {
+  const numCols = header.length;
 
-  const header = (data[0] || []).map(function (value) {
-    return String(value || "").trim();
-  });
-  const statusCol = findHeaderIndex_(header, "Status");
-  if (statusCol === -1) return Logger.log("❌ Pitching missing required column: Status.");
-
-  const negotiationStart0 = findSectionRowByLabel_(data, "Negotiation");
-  const activeStart0 = findSectionRowByLabel_(data, "Active Pitches");
-  if (negotiationStart0 === -1) return Logger.log("❌ 'Negotiation' section not found in Pitching.");
-  if (activeStart0 === -1) return Logger.log("❌ 'Active Pitches' section not found in Pitching.");
-
-  const negotiationEnd0 = findNextSectionStart0_(data, negotiationStart0);
-  const end0 = negotiationEnd0 === -1 ? data.length : negotiationEnd0;
-  const rowsToMove = [];
-  for (let r = negotiationStart0 + 1; r < end0; r++) {
-    const row = data[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    const status = normalizeHeaderName_(row[statusCol]);
-    if (status !== "readyforpitching" && status !== "pitched") continue;
-    rowsToMove.push({ sourceRow1: r + 1, values: row.slice() });
+  // Delete from bottom up to preserve row numbers
+  const sorted = rowItems.slice().sort((a, b) => b.row1 - a.row1);
+  for (const item of sorted) {
+    sheet.deleteRow(item.row1);
   }
 
-  if (rowsToMove.length === 0) {
-    return Logger.log("ℹ️ No Negotiation rows with Status 'Ready for Pitching' or 'Pitched'.");
-  }
-
-  rowsToMove
-    .slice()
-    .sort(function (a, b) { return b.sourceRow1 - a.sourceRow1; })
-    .forEach(function (item) {
-      sheet.deleteRow(item.sourceRow1);
-    });
-
-  const numCols = sheet.getLastColumn();
+  // Re-read to find Archived section after deletions
   const refreshed = sheet.getDataRange().getValues();
-  const refreshedNegotiationStart0 = findSectionRowByLabel_(refreshed, "Negotiation");
-  if (refreshedNegotiationStart0 !== -1) {
-    const restoreAt1 = refreshedNegotiationStart0 + 2;
-    if (rowsToMove.length > 1) {
-      sheet.insertRowsBefore(restoreAt1, rowsToMove.length);
-    } else {
-      sheet.insertRowBefore(restoreAt1);
-    }
-
-    const formatSourceRow1 = restoreAt1 + rowsToMove.length;
-    const templateRange = getSafeFormatRow_(sheet, formatSourceRow1, numCols);
-    const restoreRange = sheet.getRange(restoreAt1, 1, rowsToMove.length, numCols);
-    templateRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
-    templateRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
-    sheet.setRowHeights(restoreAt1, rowsToMove.length, sheet.getRowHeight(formatSourceRow1));
-  }
-
-  const refreshed2 = sheet.getDataRange().getValues();
-  const refreshedActiveStart0 = findSectionRowByLabel_(refreshed2, "Active Pitches");
-  if (refreshedActiveStart0 === -1) return Logger.log("❌ 'Active Pitches' section disappeared after moving rows.");
-
-  let insertAt1 = findFirstEmptyRowInSection1_(refreshed2, refreshedActiveStart0);
-  let formatSourceRow1;
-  if (insertAt1 === -1) {
-    const activeNextSection0 = findNextSectionStart0_(refreshed2, refreshedActiveStart0);
-    insertAt1 = activeNextSection0 === -1 ? refreshed2.length + 1 : activeNextSection0 + 1;
-    formatSourceRow1 = refreshedActiveStart0 + 2;
-  } else {
-    formatSourceRow1 = insertAt1 + rowsToMove.length;
-  }
-
-  if (rowsToMove.length > 1) {
-    sheet.insertRowsBefore(insertAt1, rowsToMove.length);
-  } else {
-    sheet.insertRowBefore(insertAt1);
-  }
-
-  const writeRange = sheet.getRange(insertAt1, 1, rowsToMove.length, numCols);
-  const templateRange = getSafeFormatRow_(sheet, formatSourceRow1, numCols);
-  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
-  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
-  const formulaCols0 = uniqueNumberArray_(
-    getArrayFormulaColumns_(sheet, 2, numCols).concat(getHeaderColumnIndexes_(header, ["INT CPM", "EXT CPM"]))
-  );
-  writeRowsSkippingColumns_(
-    sheet,
-    insertAt1,
-    rowsToMove.map(function (item) { return item.values; }),
-    numCols,
-    formulaCols0
-  );
-
-  Logger.log(`✅ Moved ${rowsToMove.length} row(s) from Negotiation to Active Pitches.`);
-}
-
-function pushConfirmedCreatorsToCampaigns() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const pitchingSheet = ss.getSheetByName("Pitching");
-  const campaignsSheet = ss.getSheetByName("Campaigns");
-  if (!pitchingSheet || !campaignsSheet) return Logger.log("❌ Missing 'Pitching' or 'Campaigns' sheet.");
-
-  const pitchData = pitchingSheet.getDataRange().getValues();
-  const campData = campaignsSheet.getDataRange().getValues();
-  if (pitchData.length < 2 || campData.length < 1) return Logger.log("ℹ️ One of the sheets has no data.");
-
-  const pitchHeader = (pitchData[0] || []).map(v => String(v || "").trim());
-  const campHeader = (campData[0] || []).map(v => String(v || "").trim());
-  const campNumCols = campHeader.length;
-
-  const pStatusCol = pitchHeader.indexOf("Status");
-  const pAvailabilityCol = pitchHeader.indexOf("Availability");
-  const pChannelCol = pitchHeader.indexOf("Channel Name");
-  const pRecordIdCol = pitchHeader.indexOf("HubSpot Record ID");
-  const cChannelCol = campHeader.indexOf("Channel Name");
-  const cRecordIdCol = campHeader.indexOf("HubSpot Record ID");
-  const cActivationIdCol = campHeader.indexOf("HubSpot Activation ID");
-  if (pStatusCol === -1 || pAvailabilityCol === -1 || pChannelCol === -1) {
-    return Logger.log("❌ Pitching missing required columns: Status, Availability, Channel Name.");
-  }
-  if (cChannelCol === -1) return Logger.log("❌ Campaigns missing required column: Channel Name.");
-  if (pRecordIdCol === -1) return Logger.log("❌ Pitching missing required column: HubSpot Record ID.");
-  if (cRecordIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Record ID.");
-  if (cActivationIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Activation ID.");
-
-  const archivedStart0 = findSectionRowByLabel_(pitchData, "Archived");
-  if (archivedStart0 === -1) return Logger.log("❌ Pitching section 'Archived' not found.");
-
-  const approvedPitchingStatusItems = [];
-  for (let r = 1; r < archivedStart0; r++) {
-    const row = pitchData[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (String(row[pStatusCol] || "").trim() !== "Approved") continue;
-
-    approvedPitchingStatusItems.push({
-      row1: r + 1,
-      recordId: String(row[pRecordIdCol] || "").trim(),
-      status: "Approved"
-    });
-  }
-  if (approvedPitchingStatusItems.length > 0) {
-    syncPitchingStatusesToHubSpot_(approvedPitchingStatusItems);
-  }
-
-  const commonCols = getCommonColumnsByHeader_(pitchHeader, campHeader);
-  if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Pitching and Campaigns.");
-  const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
-  const token = getHubSpotApiToken_();
-  if (!token) {
-    return Logger.log("❌ Missing HubSpot token. Set the HUBSPOT_API_KEY script property.");
-  }
-
-  let activationsInfo;
-  try {
-    activationsInfo = loadHubSpotCustomObjectInfo_(
-      {
-        key: HUBSPOT_ACTIVATION_OBJECT_KEY_,
-        aliases: ["Activation", "Activations", HUBSPOT_ACTIVATION_OBJECT_KEY_]
-      },
-      token
-    );
-  } catch (e) {
-    return Logger.log(`❌ Could not resolve Activations object type: ${e}`);
-  }
-
-  const existingBySection = getExistingSignaturesBySection_(campData, commonCols);
-  const candidates = [];
-  for (let r = 1; r < archivedStart0; r++) {
-    const row = pitchData[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (String(row[pStatusCol] || "").trim() !== "Approved") continue;
-
-    const availability = String(row[pAvailabilityCol] || "").trim();
-    const channelName = String(row[pChannelCol] || "").trim();
-    if (!channelName) continue;
-    if (!availability) {
-      Logger.log(`⚠️ Skipping "${channelName}" (row ${r + 1}): Availability is empty.`);
-      continue;
-    }
-
-    candidates.push({
-      pitchRow1: r + 1,
-      values: row,
-      availability: availability,
-      channelName: channelName
-    });
-  }
-
-  if (candidates.length === 0) {
-    Logger.log("ℹ️ No approved creators eligible to push above Archived.");
-    archivePitches();
+  const newArchived0 = findSectionRowByLabel_(refreshed, "Archived");
+  if (newArchived0 === -1) {
+    Logger.log("❌ 'Archived' section disappeared after deletion.");
     return;
   }
 
-  let inserted = 0;
-  let skippedDup = 0;
-  let skippedNoSection = 0;
-  let skippedNoDealId = 0;
-  let skippedActivationCreate = 0;
+  // Insert rows into Archived section
+  let insertAt1 = findFirstEmptyRowInSection1_(refreshed, newArchived0);
+  if (insertAt1 === -1) insertAt1 = newArchived0 + 2;
 
-  for (const item of candidates) {
-    const signature = buildSignatureFromPitchRow_(item.values, pitchHeader, commonCols);
-    if (!existingBySection[item.availability]) existingBySection[item.availability] = new Set();
-    if (existingBySection[item.availability].has(signature)) {
-      skippedDup++;
-      continue;
-    }
-
-    const campLive = campaignsSheet.getDataRange().getValues();
-    const sectionStart0 = findSectionRowByLabel_(campLive, item.availability);
-    if (sectionStart0 === -1) {
-      skippedNoSection++;
-      Logger.log(`⚠️ Campaigns section "${item.availability}" not found. Skipping "${item.channelName}".`);
-      continue;
-    }
-
-    const firstEmptyRow1 = findFirstEmptyRowInSection1_(campLive, sectionStart0);
-    if (firstEmptyRow1 === -1) {
-      Logger.log(`⚠️ No empty row found in section "${item.availability}" for "${item.channelName}".`);
-      continue;
-    }
-
-    const out = new Array(campNumCols).fill("");
-    for (const m of commonCols) out[m.cIdx] = getPitchValueForCampaignColumn_(item.values, pitchHeader, m);
-    applyPitchSpecialCampaignMappings_(out, campHeader, item.values, pitchHeader, pitchRowsByKey);
-
-    const dealId = String(getPitchValueByHeader_(item.values, pitchHeader, "HubSpot Record ID") || "").trim();
-    if (!dealId) {
-      skippedNoDealId++;
-      Logger.log(`⚠️ Skipping "${item.channelName}" (row ${item.pitchRow1}): HubSpot Record ID is empty.`);
-      continue;
-    }
-
-    const activationId = createHubSpotActivationForCampaignRow_(
-      out,
-      campHeader,
-      dealId,
-      activationsInfo,
-      token
-    );
-    if (!activationId) {
-      skippedActivationCreate++;
-      Logger.log(`⚠️ Skipping "${item.channelName}" (row ${item.pitchRow1}): could not create associated Activation in HubSpot.`);
-      continue;
-    }
-    setValueIfTargetColumnExists_(out, campHeader, "HubSpot Record ID", dealId);
-    setValueIfTargetColumnExists_(out, campHeader, "HubSpot Activation ID", activationId);
-
-    campaignsSheet.insertRowBefore(firstEmptyRow1);
-    const targetRow1 = firstEmptyRow1;
-    const formatSourceRow1 = firstEmptyRow1 + 1;
-
-    const targetRange = campaignsSheet.getRange(targetRow1, 1, 1, campNumCols);
-    const templateRange = getSafeFormatRow_(campaignsSheet, formatSourceRow1, campNumCols);
-    templateRange.copyTo(targetRange, { formatOnly: true });
-    targetRange.setValues([out]);
-
-    existingBySection[item.availability].add(signature);
-    inserted++;
-  }
-
-  if (candidates.length > 0) {
-    SpreadsheetApp.flush();
-    try {
-      syncCampaignDealAmountTotalsToHubSpot_(campaignsSheet);
-    } catch (e) {
-      Logger.log("⚠️ Deal amount total sync after Pitching → Campaigns failed: " + (e && e.stack ? e.stack : e));
-    }
-  }
-
-  Logger.log(
-    `✅ Push done. Inserted: ${inserted}. Skipped duplicates: ${skippedDup}. ` +
-    `Missing section: ${skippedNoSection}. Missing deal ID: ${skippedNoDealId}. ` +
-    `Activation create failed: ${skippedActivationCreate}.`
-  );
-
-  archivePitches();
-}
-
-function archivePitches() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Pitching");
-  if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
-
-  const data = sheet.getDataRange().getValues();
-  const header = (data[0] || []).map(v => String(v || "").trim());
-
-  const statusCol = header.indexOf("Status");
-  if (statusCol === -1) return Logger.log("❌ Pitching missing required column: Status.");
-
-  const activeStart0 = findSectionRowByLabel_(data, "Active Pitches");
-  const archivedStart0 = findSectionRowByLabel_(data, "Archived");
-  if (activeStart0 === -1) return Logger.log("❌ Could not find 'Active Pitches' section in Pitching.");
-  if (archivedStart0 === -1) return Logger.log("❌ Could not find 'Archived' section in Pitching.");
-
-  const rowsToArchive = [];
-  for (let r = activeStart0 + 1; r < archivedStart0; r++) {
-    const row = data[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    const status = String(row[statusCol] || "").trim();
-    if (status !== "Approved" && status !== "Rejected") continue;
-    rowsToArchive.push({ sourceRow1: r + 1, values: row.slice() });
-  }
-
-  if (rowsToArchive.length === 0) return Logger.log("ℹ️ No rows to archive.");
-
-  rowsToArchive
-    .slice()
-    .sort(function (a, b) { return b.sourceRow1 - a.sourceRow1; })
-    .forEach(function (entry) {
-      sheet.deleteRow(entry.sourceRow1);
-    });
-
-  const refreshed = sheet.getDataRange().getValues();
-  const refreshedActiveStart0 = findSectionRowByLabel_(refreshed, "Active Pitches");
-  const refreshedArchivedStart0 = findSectionRowByLabel_(refreshed, "Archived");
-  if (refreshedArchivedStart0 === -1) return Logger.log("❌ Archived section disappeared after deletion.");
-
-  if (refreshedActiveStart0 !== -1) {
-    const restoreAt1 = refreshedActiveStart0 + 2;
-    if (rowsToArchive.length > 1) {
-      sheet.insertRowsBefore(restoreAt1, rowsToArchive.length);
-    } else {
-      sheet.insertRowBefore(restoreAt1);
-    }
-    const formatSourceRow1 = restoreAt1 + rowsToArchive.length;
-    const numColsActive = sheet.getLastColumn();
-    const templateActiveRange = getSafeFormatRow_(sheet, formatSourceRow1, numColsActive);
-    const restoreRange = sheet.getRange(restoreAt1, 1, rowsToArchive.length, numColsActive);
-    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
-    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
-    sheet.setRowHeights(restoreAt1, rowsToArchive.length, sheet.getRowHeight(formatSourceRow1));
-  }
-
-  const refreshed2 = sheet.getDataRange().getValues();
-  const archivedStart0final = findSectionRowByLabel_(refreshed2, "Archived");
-  if (archivedStart0final === -1) return Logger.log("❌ Archived section not found after row restore.");
-
-  let insertAt1 = findFirstEmptyRowInSection1_(refreshed2, archivedStart0final);
-  if (insertAt1 === -1) insertAt1 = archivedStart0final + 2;
-
-  const numCols = sheet.getLastColumn();
-  const arrayFormulaCols0 = getArrayFormulaColumns_(sheet, 2, numCols);
-  const formulaCols0 = uniqueNumberArray_(
-    arrayFormulaCols0.concat(getHeaderColumnIndexes_(header, ["INT CPM", "EXT CPM"]))
-  );
-  const templateRange = getSafeFormatRow_(sheet, archivedStart0final + 2, numCols);
-
-  if (rowsToArchive.length > 1) {
-    sheet.insertRowsBefore(insertAt1, rowsToArchive.length);
+  if (rowItems.length > 1) {
+    sheet.insertRowsBefore(insertAt1, rowItems.length);
   } else {
     sheet.insertRowBefore(insertAt1);
   }
 
-  const writeRange = sheet.getRange(insertAt1, 1, rowsToArchive.length, numCols);
-  templateRange.copyTo(writeRange, { formatOnly: true });
-  writeRowsSkippingColumns_(
-    sheet,
-    insertAt1,
-    rowsToArchive.map(function (entry) { return entry.values; }),
-    numCols,
-    formulaCols0
-  );
+  const writeRange = sheet.getRange(insertAt1, 1, rowItems.length, numCols);
+  const templateRange = getSafeFormatRow_(sheet, insertAt1 + rowItems.length, numCols);
+  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+  writeRange.setValues(rowItems.map(item => item.values));
 
-  Logger.log(`✅ Archived ${rowsToArchive.length} row(s).`);
-}
-
-function pushPublishedCampaignsToPerformance() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const campaignsSheet = ss.getSheetByName("Campaigns");
-  const performanceSheet = ss.getSheetByName("Performance");
-  const pitchingSheet = ss.getSheetByName("Pitching");
-  if (!campaignsSheet || !performanceSheet) {
-    return Logger.log("❌ Missing 'Campaigns' or 'Performance' sheet.");
+  // Restore blank rows in Contacting section
+  const refreshed2 = sheet.getDataRange().getValues();
+  const contactingStart0 = findSectionRowByLabel_(refreshed2, "Contacting");
+  if (contactingStart0 !== -1) {
+    const restoreAt1 = contactingStart0 + 2;
+    if (rowItems.length > 1) {
+      sheet.insertRowsBefore(restoreAt1, rowItems.length);
+    } else {
+      sheet.insertRowBefore(restoreAt1);
+    }
+    const fmtSource = getSafeFormatRow_(sheet, restoreAt1 + rowItems.length, numCols);
+    const restoreRange = sheet.getRange(restoreAt1, 1, rowItems.length, numCols);
+    fmtSource.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+    fmtSource.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
   }
 
-  const campaignsData = campaignsSheet.getDataRange().getValues();
-  const campaignsDisplayData = campaignsSheet.getDataRange().getDisplayValues();
-  const performanceData = performanceSheet.getDataRange().getValues();
-  if (campaignsData.length < 2 || performanceData.length < 1) {
+  Logger.log(`✅ Moved ${rowItems.length} row(s) to Creator List Archived section.`);
+}
+
+
+// ============================================================
+//  (3) INT PITCHING → EXT PITCHING
+// ============================================================
+
+function pushReadyForPitchingToExt() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const intPitching = ss.getSheetByName("Pitching");
+  if (!intPitching) return Logger.log("❌ 'Pitching' sheet not found.");
+
+  const extSs = getExtSpreadsheet_();
+  if (!extSs) return;
+  const extPitching = extSs.getSheetByName("Pitching");
+  if (!extPitching) return Logger.log("❌ 'Pitching' sheet not found in EXT spreadsheet.");
+
+  const intData = intPitching.getDataRange().getValues();
+  const extData = extPitching.getDataRange().getValues();
+  if (intData.length < 2 || extData.length < 1) {
     return Logger.log("ℹ️ One of the sheets has no data.");
   }
 
-  const campaignsHeader = (campaignsData[0] || []).map(v => String(v || "").trim());
-  const performanceHeader = (performanceData[0] || []).map(v => String(v || "").trim());
-  const statusCol = campaignsHeader.indexOf("Status");
-  if (statusCol === -1) return Logger.log("❌ Campaigns missing required column: Status.");
+  const intHeader = intData[0].map(v => String(v || "").trim());
+  const extHeader = extData[0].map(v => String(v || "").trim());
 
-  const commonCols = getCommonColumnsByHeader_(campaignsHeader, performanceHeader);
-  if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Campaigns and Performance.");
-  const performanceFormulaCols0 = uniqueNumberArray_(
-    getArrayFormulaColumns_(performanceSheet, 2, performanceHeader.length).concat(
-      getHeaderColumnIndexes_(performanceHeader, [
-        "Expected CPM",
-        "Expected INT CPM",
-        "Expected EXT CPM"
-      ])
-    )
-  );
-  const performanceFormulaColLookup = {};
-  performanceFormulaCols0.forEach(function (col0) {
-    performanceFormulaColLookup[String(col0)] = true;
-  });
+  const intStatusCol = intHeader.indexOf("Status");
+  if (intStatusCol === -1) return Logger.log("❌ INT Pitching missing 'Status' column.");
 
-  let pitchRowsByKey = new Map();
-  let pitchRowsByDealActivationKey = new Map();
-  let pitchHeader = [];
-  if (pitchingSheet) {
-    const pitchData = pitchingSheet.getDataRange().getValues();
-    const pitchDisplayData = pitchingSheet.getDataRange().getDisplayValues();
-    if (pitchData.length >= 2) {
-      pitchHeader = (pitchData[0] || []).map(v => String(v || "").trim());
-      const endRow = pitchData.length;
-      pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, endRow);
-      pitchRowsByDealActivationKey = getPitchRowsByDealActivationKey_(
-        pitchData,
-        pitchDisplayData,
-        pitchHeader,
-        endRow
-      );
-    }
-  }
+  // Find rows above Archived with Status = "Ready for pitching"
+  const archivedStart0 = findSectionRowByLabel_(intData, "Archived");
+  const endRow = archivedStart0 === -1 ? intData.length : archivedStart0;
 
-  const rowsToAppend = [];
-  const performanceExpectedViewsCol = findHeaderIndex_(performanceHeader, "Expected Views");
-  let expectedViewsFromPitching = 0;
-  let expectedViewsMissingAfterPitching = 0;
-  for (let r = 1; r < campaignsData.length; r++) {
-    const row = campaignsData[r];
-    const displayRow = campaignsDisplayData[r] || row;
+  const candidates = [];
+  for (let r = 1; r < endRow; r++) {
+    const row = intData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    if (String(row[statusCol] || "").trim() !== "Published") continue;
-
-    const out = new Array(performanceHeader.length).fill("");
-    for (const m of commonCols) {
-      if (performanceFormulaColLookup[String(m.cIdx)]) continue;
-      out[m.cIdx] = row[m.pIdx];
-    }
-
-    const expectedViews = getPitchValueByHeader_(row, campaignsHeader, "Expected Views");
-    if (String(expectedViews || "").trim() !== "") {
-      setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", expectedViews);
-    }
-
-    const pitchRowByDealActivation = pitchRowsByDealActivationKey.size > 0
-      ? getPitchRowByDealActivationKey_(displayRow, campaignsHeader, pitchRowsByDealActivationKey)
-      : null;
-    if (String(expectedViews || "").trim() === "" && performanceExpectedViewsCol !== -1) {
-      const medianViews = pitchRowByDealActivation
-        ? getPitchValueByHeader_(pitchRowByDealActivation, pitchHeader, "Median Views")
-        : "";
-      if (String(medianViews == null ? "" : medianViews).trim() !== "") {
-        out[performanceExpectedViewsCol] = medianViews;
-        expectedViewsFromPitching++;
-      }
-    }
-
-    if (
-      pitchRowsByKey.size > 0 &&
-      String(expectedViews || "").trim() === "" &&
-      performanceExpectedViewsCol !== -1 &&
-      String(out[performanceExpectedViewsCol] == null ? "" : out[performanceExpectedViewsCol]).trim() === ""
-    ) {
-      const key = buildPitchCompositeKey_(row, campaignsHeader);
-      const pitchRow = key ? pitchRowsByKey.get(key) : null;
-      if (pitchRow) {
-        const medianViews = getPitchValueByHeader_(pitchRow, pitchHeader, "Median Views");
-        if (String(medianViews == null ? "" : medianViews).trim() !== "") {
-          setValueIfTargetColumnExists_(out, performanceHeader, "Expected Views", medianViews);
-          expectedViewsFromPitching++;
-        }
-      }
-    }
-
-    if (
-      String(expectedViews || "").trim() === "" &&
-      performanceExpectedViewsCol !== -1 &&
-      String(out[performanceExpectedViewsCol] == null ? "" : out[performanceExpectedViewsCol]).trim() === ""
-    ) {
-      expectedViewsMissingAfterPitching++;
-    }
-
-    rowsToAppend.push(out);
+    if (String(row[intStatusCol] || "").trim() !== "Ready for pitching") continue;
+    candidates.push({ row1: r + 1, values: row });
   }
 
-  if (rowsToAppend.length === 0) return Logger.log("ℹ️ No published Campaigns rows to push.");
+  if (candidates.length === 0) {
+    return Logger.log("ℹ️ No rows with Status 'Ready for pitching'.");
+  }
 
-  const startRow1 = findFirstFreeRowFrom1_(performanceSheet, 3, performanceHeader.length);
-  writeRowsSkippingColumns_(
-    performanceSheet,
-    startRow1,
-    rowsToAppend,
-    performanceHeader.length,
-    performanceFormulaCols0
-  );
+  // Column mapping: INT → EXT (rename EXT Rate→Rate; skip INT-only fields and EXT CPM)
+  const colMap = buildCrossSheetColumnMap_(intHeader, extHeader, INT_TO_EXT_PITCHING_MAP_, INT_ONLY_PITCHING_COLS_);
 
-  Logger.log(
-    `✅ Pushed ${rowsToAppend.length} published row(s) to Performance starting at row ${startRow1}. ` +
-    `Expected Views from Pitching: ${expectedViewsFromPitching}. ` +
-    `Missing Expected Views after Pitching lookup: ${expectedViewsMissingAfterPitching}.`
-  );
+  // Duplicate detection via composite key
+  const extCompositeKeys = buildCompositeKeySet_(extData, extHeader);
+
+  // EXT Active Pitches section
+  const extActiveStart0 = findSectionRowByLabel_(extData, "Active Pitches");
+  if (extActiveStart0 === -1) return Logger.log("❌ 'Active Pitches' section not found in EXT Pitching.");
+
+  const extNumCols = extHeader.length;
+  const extStatusCol = extHeader.indexOf("Status");
+  let inserted = 0;
+  let skippedDup = 0;
+
+  for (const item of candidates) {
+    const key = buildCompositeKey_(item.values, intHeader);
+    if (key && extCompositeKeys.has(key)) { skippedDup++; continue; }
+
+    const out = new Array(extNumCols).fill("");
+    for (const m of colMap) out[m.targetIdx] = item.values[m.sourceIdx];
+
+    // Override Status to "Pitched" in EXT
+    if (extStatusCol !== -1) out[extStatusCol] = "Pitched";
+
+    // Find insertion point (re-read each time because rows shift)
+    const extLive = extPitching.getDataRange().getValues();
+    const liveActiveStart0 = findSectionRowByLabel_(extLive, "Active Pitches");
+    let insertAt1 = findFirstEmptyRowInSection1_(extLive, liveActiveStart0);
+    if (insertAt1 === -1) {
+      const extArchived0 = findSectionRowByLabel_(extLive, "Archived");
+      insertAt1 = extArchived0 !== -1 ? extArchived0 + 1 : extLive.length + 1;
+    }
+
+    extPitching.insertRowBefore(insertAt1);
+    const targetRange = extPitching.getRange(insertAt1, 1, 1, extNumCols);
+    const templateRange = getSafeFormatRow_(extPitching, insertAt1 + 1, extNumCols);
+    templateRange.copyTo(targetRange, { formatOnly: true });
+    targetRange.setValues([out]);
+
+    if (key) extCompositeKeys.add(key);
+    inserted++;
+  }
+
+  // Update INT Status from "Ready for pitching" → "Pitched"
+  if (inserted > 0) {
+    for (const item of candidates) {
+      if (String(item.values[intStatusCol] || "").trim() === "Ready for pitching") {
+        intPitching.getRange(item.row1, intStatusCol + 1).setValue("Pitched");
+      }
+    }
+  }
+
+  Logger.log(`✅ Pushed to EXT Pitching: ${inserted} inserted, ${skippedDup} skipped (duplicates).`);
 }
 
 
 // ============================================================
-//  ROW MAPPING HELPERS
+//  (4) UPDATE INT PITCHING FROM EXT
 // ============================================================
+
+function updatePitchingFromExt() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const intPitching = ss.getSheetByName("Pitching");
+  if (!intPitching) return Logger.log("❌ 'Pitching' sheet not found.");
+
+  const extSs = getExtSpreadsheet_();
+  if (!extSs) return;
+  const extPitching = extSs.getSheetByName("Pitching");
+  if (!extPitching) return Logger.log("❌ 'Pitching' sheet not found in EXT spreadsheet.");
+
+  const intData = intPitching.getDataRange().getValues();
+  const extData = extPitching.getDataRange().getValues();
+  if (intData.length < 2 || extData.length < 2) {
+    return Logger.log("ℹ️ One of the sheets has insufficient data.");
+  }
+
+  const intHeader = intData[0].map(v => String(v || "").trim());
+  const extHeader = extData[0].map(v => String(v || "").trim());
+
+  // Build INT row lookup by composite key
+  const intRowMap = new Map();
+  for (let r = 1; r < intData.length; r++) {
+    const row = intData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    const key = buildCampaignSyncCompositeKey_(row, intHeader);
+    if (key && !intRowMap.has(key)) intRowMap.set(key, r);
+  }
+
+  // Column mapping: EXT → INT, excluding the negotiation rate block and CPM.
+  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, EXT_TO_INT_PITCHING_MAP_, EXT_ONLY_PITCHING_COLS_);
+  const hubSpotRecordIdIdx = findHeaderIndex_(intHeader, "HubSpot Record ID");
+  const statusIdx = findHeaderIndex_(intHeader, "Status");
+  const hubSpotPitchingStatusItems = [];
+
+  let updated = 0;
+  for (let r = 1; r < extData.length; r++) {
+    const extRow = extData[r];
+    if (isBlankRow_(extRow) || isSectionLabelRow_(extRow)) continue;
+
+    const key = buildCampaignSyncCompositeKey_(extRow, extHeader);
+    if (!key) continue;
+
+    const intRowIdx = intRowMap.get(key);
+    if (intRowIdx === undefined) continue;
+
+    const intRow = intData[intRowIdx];
+    const changedIndexes = new Set();
+
+    syncPitchingNegotiationBlock_(extRow, extHeader, intRow, intHeader).forEach(idx => changedIndexes.add(idx));
+
+    for (const m of colMap) {
+      const extVal = extRow[m.sourceIdx];
+      if (String(extVal || "").trim() === "") continue;
+      if (String(intRow[m.targetIdx] || "").trim() !== String(extVal || "").trim()) {
+        intRow[m.targetIdx] = extVal;
+        changedIndexes.add(m.targetIdx);
+      }
+    }
+
+    if (hubSpotRecordIdIdx !== -1 && statusIdx !== -1) {
+      hubSpotPitchingStatusItems.push({
+        row1: intRowIdx + 1,
+        recordId: String(intRow[hubSpotRecordIdIdx] || "").trim(),
+        status: String(intRow[statusIdx] || "").trim()
+      });
+    }
+
+    if (writeChangedRowCells_(intPitching, intRowIdx + 1, intHeader, intRow, changedIndexes, INT_PITCHING_FORMULA_COLS_)) {
+      updated++;
+    }
+  }
+
+  Logger.log(`✅ Updated ${updated} row(s) in INT Pitching from EXT.`);
+  if (hubSpotRecordIdIdx === -1 || statusIdx === -1) {
+    return Logger.log("ℹ️ HubSpot Pitching Status sync skipped. Missing 'HubSpot Record ID' or 'Status' column in Pitching.");
+  }
+  syncPitchingStatusesToHubSpot_(hubSpotPitchingStatusItems);
+}
+
+
+// ============================================================
+//  (5) UPDATE INT CAMPAIGNS FROM EXT
+// ============================================================
+
+function updateCampaignsFromExt() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const intCampaigns = ss.getSheetByName("Campaigns");
+  const intPitching = ss.getSheetByName("Pitching");
+  if (!intCampaigns) return Logger.log("❌ 'Campaigns' sheet not found.");
+
+  const extSs = getExtSpreadsheet_();
+  if (!extSs) return;
+  const extCampaigns = extSs.getSheetByName("Campaigns");
+  if (!extCampaigns) return Logger.log("❌ 'Campaigns' sheet not found in EXT spreadsheet.");
+
+  const intData = intCampaigns.getDataRange().getValues();
+  const extData = extCampaigns.getDataRange().getValues();
+  if (intData.length < 2 || extData.length < 2) {
+    return Logger.log("ℹ️ One of the sheets has insufficient data.");
+  }
+
+  const intHeader = intData[0].map(v => String(v || "").trim());
+  const extHeader = extData[0].map(v => String(v || "").trim());
+  const pitchingIntRateLookup = buildCampaignIntRateLookupFromPitching_(intPitching);
+
+  // Build INT row lookup by composite key
+  const intRowMap = new Map();
+  for (let r = 1; r < intData.length; r++) {
+    const row = intData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    const key = buildCampaignSyncCompositeKey_(row, intHeader);
+    if (key && !intRowMap.has(key)) intRowMap.set(key, r);
+  }
+
+  // Column mapping: EXT → INT (Rate→EXT Rate)
+  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, EXT_TO_INT_CAMPAIGNS_MAP_, new Set());
+
+  let updated = 0;
+  let inserted = 0;
+
+  for (let r = 1; r < extData.length; r++) {
+    const extRow = extData[r];
+    if (isBlankRow_(extRow) || isSectionLabelRow_(extRow)) continue;
+
+    const key = buildCampaignSyncCompositeKey_(extRow, extHeader);
+    if (!key) continue;
+
+    const intRowIdx = intRowMap.get(key);
+    if (intRowIdx !== undefined) {
+      // Update existing row
+      const intRow = intData[intRowIdx];
+      let changed = false;
+
+      for (const m of colMap) {
+        const extVal = extRow[m.sourceIdx];
+        if (String(extVal || "").trim() === "") continue;
+        if (String(intRow[m.targetIdx] || "").trim() !== String(extVal || "").trim()) {
+          intRow[m.targetIdx] = extVal;
+          changed = true;
+        }
+      }
+      if (applyCampaignIntRateFromPitchingLookup_(intRow, intHeader, pitchingIntRateLookup)) {
+        changed = true;
+      }
+
+      if (changed) {
+        intCampaigns.getRange(intRowIdx + 1, 1, 1, intHeader.length).setValues([intRow]);
+        updated++;
+      }
+    } else {
+      // Insert new row into the matching month section
+      const monthSection = findRowSection_(extData, r);
+      if (!monthSection) continue;
+
+      const intLive = intCampaigns.getDataRange().getValues();
+      const sectionStart0 = findSectionRowByLabel_(intLive, monthSection);
+      if (sectionStart0 === -1) continue;
+
+      let insertAt1 = findFirstEmptyRowInSection1_(intLive, sectionStart0);
+      if (insertAt1 === -1) continue;
+
+      const intNumCols = intHeader.length;
+      const out = new Array(intNumCols).fill("");
+      for (const m of colMap) out[m.targetIdx] = extRow[m.sourceIdx];
+      applyCampaignIntRateFromPitchingLookup_(out, intHeader, pitchingIntRateLookup);
+
+      intCampaigns.insertRowBefore(insertAt1);
+      const targetRange = intCampaigns.getRange(insertAt1, 1, 1, intNumCols);
+      const templateRange = getSafeFormatRow_(intCampaigns, insertAt1 + 1, intNumCols);
+      templateRange.copyTo(targetRange, { formatOnly: true });
+      targetRange.setValues([out]);
+
+      inserted++;
+    }
+  }
+
+  Logger.log(`✅ INT Campaigns: ${updated} updated, ${inserted} inserted from EXT.`);
+  try {
+    syncCampaignRowsToHubSpot_(intCampaigns);
+  } catch (e) {
+    Logger.log("⚠️ INT Campaigns HubSpot sync failed: " + (e && e.stack ? e.stack : e));
+  }
+}
+
+
+// ============================================================
+//  (6) UPDATE INT PERFORMANCE FROM EXT
+// ============================================================
+
+function updatePerformanceFromExt() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const intPerformance = ss.getSheetByName("Performance");
+  if (!intPerformance) return Logger.log("❌ 'Performance' sheet not found.");
+
+  const extSs = getExtSpreadsheet_();
+  if (!extSs) return;
+  const extPerformance = extSs.getSheetByName("Performance");
+  if (!extPerformance) return Logger.log("❌ 'Performance' sheet not found in EXT spreadsheet.");
+
+  const intData = intPerformance.getDataRange().getValues();
+  const extData = extPerformance.getDataRange().getValues();
+  if (intData.length < 1 || extData.length < 2) {
+    return Logger.log("ℹ️ One of the sheets has insufficient data.");
+  }
+
+  const intHeader = intData[0].map(v => String(v || "").trim());
+  const extHeader = extData[0].map(v => String(v || "").trim());
+
+  // Build INT row lookup by composite key
+  const intRowMap = new Map();
+  for (let r = 1; r < intData.length; r++) {
+    const row = intData[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    const key = buildCompositeKey_(row, intHeader);
+    if (key && !intRowMap.has(key)) intRowMap.set(key, r);
+  }
+
+  // Column mapping: EXT → INT using matching column names, excluding formula columns.
+  const colMap = buildCrossSheetColumnMap_(extHeader, intHeader, {}, INT_PERFORMANCE_FORMULA_COLS_);
+  const existingPerformanceSignatures = buildMappedRowSignatureSetFromTarget_(intData, colMap);
+
+  let updated = 0;
+  let inserted = 0;
+
+  for (let r = 1; r < extData.length; r++) {
+    const extRow = extData[r];
+    if (isBlankRow_(extRow) || isSectionLabelRow_(extRow)) continue;
+
+    const key = buildCompositeKey_(extRow, extHeader);
+    const signature = buildMappedRowSignatureFromSource_(extRow, colMap);
+
+    const intRowIdx = key ? intRowMap.get(key) : undefined;
+    if (intRowIdx !== undefined) {
+      // Update existing row
+      const intRow = intData[intRowIdx];
+      let changed = false;
+
+      for (const m of colMap) {
+        const extVal = extRow[m.sourceIdx];
+        if (String(extVal || "").trim() === "") continue;
+        if (String(intRow[m.targetIdx] || "").trim() !== String(extVal || "").trim()) {
+          intRow[m.targetIdx] = extVal;
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        intPerformance.getRange(intRowIdx + 1, 1, 1, intHeader.length).setValues([intRow]);
+        updated++;
+      }
+    } else {
+      if (signature && existingPerformanceSignatures.has(signature)) continue;
+
+      const intNumCols = intHeader.length;
+      const out = new Array(intNumCols).fill("");
+      for (const m of colMap) out[m.targetIdx] = extRow[m.sourceIdx];
+
+      const insertAt1 = findFirstFreeRowFrom1_(intPerformance, 3, intNumCols);
+      const targetRange = intPerformance.getRange(insertAt1, 1, 1, intNumCols);
+      targetRange.setValues([out]);
+
+      if (key) intRowMap.set(key, insertAt1 - 1);
+      if (signature) existingPerformanceSignatures.add(signature);
+      inserted++;
+    }
+  }
+
+  Logger.log(`✅ INT Performance: ${updated} updated, ${inserted} inserted from EXT.`);
+  try {
+    syncPerformanceRowsToHubSpot_(intPerformance);
+  } catch (e) {
+    Logger.log("⚠️ INT Performance HubSpot sync failed: " + (e && e.stack ? e.stack : e));
+  }
+}
+
+// ============================================================
+//  CROSS-SPREADSHEET HELPERS
+// ============================================================
+
+function getExtSpreadsheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  const dropdownValuesByHeader = getDropdownValuesByHeader_(ss, "Dropdown Values");
+  const dropdownExtSheetValue = Array.isArray(dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_]) &&
+    dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_].length > 0
+    ? String(dropdownValuesByHeader[EXT_SHEET_DROPDOWN_HEADER_][0] || "").trim()
+    : "";
+
+  let extId = extractSpreadsheetId_(getScriptProperty_(EXT_SPREADSHEET_ID_PROP_));
+  if (!extId) {
+    extId = extractSpreadsheetId_(dropdownExtSheetValue);
+  }
+
+  if (!extId) {
+    SpreadsheetApp.getUi().alert(
+      "❌ EXT spreadsheet not configured.\n\n" +
+      "Set script property " + EXT_SPREADSHEET_ID_PROP_ +
+      ", or add an 'EXT Sheet' column in 'Dropdown Values' and put the EXT spreadsheet ID or URL in row 2."
+    );
+    return null;
+  }
+
+  props.setProperty(EXT_SPREADSHEET_ID_PROP_, extId);
+
+  try {
+    return SpreadsheetApp.openById(extId);
+  } catch (e) {
+    Logger.log("❌ Could not open EXT spreadsheet: " + e);
+    SpreadsheetApp.getUi().alert("❌ Could not open EXT spreadsheet. Check the ID and permissions.");
+    return null;
+  }
+}
+
+function extractSpreadsheetId_(value) {
+  const raw = String(value || "").trim().replace(/^['"]|['"]$/g, "");
+  if (!raw) return "";
+
+  const urlMatch = raw.match(/\/spreadsheets\/d\/([a-zA-Z0-9_-]+)/i);
+  if (urlMatch && urlMatch[1]) return urlMatch[1];
+
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(raw)) return raw;
+  return "";
+}
+
 
 function buildCrossSheetColumnMap_(sourceHeader, targetHeader, renameMap, skipCols) {
   const map = [];
@@ -7311,6 +6111,103 @@ function buildCrossSheetColumnMap_(sourceHeader, targetHeader, renameMap, skipCo
   return map;
 }
 
+function buildCampaignIntRateLookupFromPitching_(sheet) {
+  const lookup = new Map();
+  if (!sheet) return lookup;
+
+  const data = sheet.getDataRange().getValues();
+  if (!data || data.length < 2) return lookup;
+
+  const header = (data[0] || []).map(function (value) {
+    return String(value || "").trim();
+  });
+  const dealIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  if (dealIdCol === -1) return lookup;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const dealId = String(row[dealIdCol] || "").trim();
+    const extRate = getNegotiatedPitchingValueByHeader_(row, header, "EXT Rate");
+    const intRate = getNegotiatedPitchingValueByHeader_(row, header, "INT Rate");
+    if (!dealId || extRate === "" || intRate === "") continue;
+
+    lookup.set(buildCampaignDealRateLookupKey_(dealId, extRate), intRate);
+  }
+
+  return lookup;
+}
+
+function applyCampaignIntRateFromPitchingLookup_(campaignRow, campaignHeader, lookup) {
+  if (!campaignRow || !Array.isArray(campaignHeader) || !lookup || lookup.size === 0) return false;
+
+  const intRateIdx = findHeaderIndex_(campaignHeader, "INT Rate");
+  if (intRateIdx === -1) return false;
+
+  const intRate = getCampaignIntRateFromPitchingLookup_(campaignRow, campaignHeader, lookup);
+  if (intRate === "") return false;
+
+  const currentValue = String(campaignRow[intRateIdx] == null ? "" : campaignRow[intRateIdx]).trim();
+  const nextValue = String(intRate == null ? "" : intRate).trim();
+  if (currentValue === nextValue) return false;
+
+  campaignRow[intRateIdx] = intRate;
+  return true;
+}
+
+function getCampaignIntRateFromPitchingLookup_(campaignRow, campaignHeader, lookup) {
+  const dealId = String(getValueByHeader_(campaignRow, campaignHeader, "HubSpot Record ID") || "").trim();
+  const extRate = getValueByHeader_(campaignRow, campaignHeader, "EXT Rate");
+  if (!dealId || extRate === "") return "";
+
+  const key = buildCampaignDealRateLookupKey_(dealId, extRate);
+  return lookup.has(key) ? lookup.get(key) : "";
+}
+
+function buildCampaignDealRateLookupKey_(dealId, rate) {
+  const normalizedDealId = String(dealId || "").trim();
+  const normalizedRate = normalizeCampaignRateLookupValue_(rate);
+  return normalizedDealId && normalizedRate ? (normalizedDealId + "||" + normalizedRate) : "";
+}
+
+function normalizeCampaignRateLookupValue_(value) {
+  if (value == null) return "";
+  if (typeof value === "number") {
+    return isFinite(value) ? String(value) : "";
+  }
+
+  const text = String(value || "").trim();
+  if (!text) return "";
+
+  const numericText = text.replace(/,/g, "");
+  if (/^-?\d+(?:\.\d+)?$/.test(numericText)) {
+    return String(Number(numericText));
+  }
+
+  return text;
+}
+
+function getNegotiatedPitchingValueByHeader_(row, header, startHeaderName) {
+  const startIdx = findHeaderIndex_(header, startHeaderName);
+  if (startIdx === -1) return "";
+
+  let endIdx = header.length - 1;
+  for (let c = startIdx + 1; c < header.length; c++) {
+    if (String(header[c] || "").trim() !== "") {
+      endIdx = c - 1;
+      break;
+    }
+  }
+
+  for (let c = endIdx; c >= startIdx; c--) {
+    const value = row[c];
+    if (String(value == null ? "" : value).trim() !== "") return value;
+  }
+
+  return "";
+}
+
 
 function buildCompositeKey_(row, header) {
   const keys = [
@@ -7323,6 +6220,20 @@ function buildCompositeKey_(row, header) {
   return keys.join("||");
 }
 
+function buildCampaignSyncCompositeKey_(row, header) {
+  const activationId = String(getValueByHeader_(row, header, "HubSpot Activation ID") || "").trim();
+  if (activationId) {
+    return [
+      activationId,
+      String(getValueByHeader_(row, header, "Deal Type") || "").trim(),
+      String(getValueByHeader_(row, header, "Activation Type") || "").trim()
+    ].join("||");
+  }
+
+  return buildCompositeKey_(row, header);
+}
+
+
 function buildCompositeKeySet_(data, header) {
   const set = new Set();
   for (let r = 1; r < data.length; r++) {
@@ -7332,6 +6243,66 @@ function buildCompositeKeySet_(data, header) {
     if (key) set.add(key);
   }
   return set;
+}
+
+function syncPitchingNegotiationBlock_(extRow, extHeader, intRow, intHeader) {
+  const extStartIdx = extHeader.indexOf("Rate");
+  const intStartIdx = intHeader.indexOf("EXT Rate");
+  if (extStartIdx === -1 || intStartIdx === -1) return [];
+
+  const changedIndexes = [];
+  const maxWidth = Math.min(
+    PITCHING_NEGOTIATION_BLOCK_WIDTH_,
+    extHeader.length - extStartIdx,
+    intHeader.length - intStartIdx
+  );
+
+  for (let offset = 0; offset < maxWidth; offset++) {
+    const extColumnName = String(extHeader[extStartIdx + offset] || "").trim();
+    const intColumnName = String(intHeader[intStartIdx + offset] || "").trim();
+    if (
+      extColumnName === "CPM" ||
+      intColumnName === "EXT CPM" ||
+      intColumnName === "INT CPM"
+    ) {
+      continue;
+    }
+
+    const extVal = extRow[extStartIdx + offset];
+    if (String(extVal || "").trim() === "") continue;
+
+    if (String(intRow[intStartIdx + offset] || "").trim() !== String(extVal || "").trim()) {
+      intRow[intStartIdx + offset] = extVal;
+      changedIndexes.push(intStartIdx + offset);
+    }
+  }
+
+  return changedIndexes;
+}
+
+function writeChangedRowCells_(sheet, row1, header, row, changedIndexes, skipHeaders) {
+  if (!changedIndexes || changedIndexes.size === 0) return false;
+
+  let wrote = false;
+  Array.from(changedIndexes)
+    .sort((a, b) => a - b)
+    .forEach(idx => {
+      const columnName = String(header[idx] || "").trim();
+      if (skipHeaders && skipHeaders.has(columnName)) return;
+
+      sheet.getRange(row1, idx + 1).setValue(row[idx]);
+      wrote = true;
+    });
+
+  return wrote;
+}
+
+
+function findRowSection_(data, rowIdx) {
+  for (let r = rowIdx - 1; r >= 0; r--) {
+    if (isSectionLabelRow_(data[r])) return String(data[r][0] || "").trim();
+  }
+  return "";
 }
 
 
@@ -7444,245 +6415,6 @@ function getCommonColumnsByHeader_(sourceHeader, targetHeader) {
     if (sourceMap.has(name)) common.push({ name: name, pIdx: sourceMap.get(name), cIdx: j });
   }
   return common;
-}
-
-function getArrayFormulaColumns_(sheet, probeRow1, numCols) {
-  if (!sheet || probeRow1 < 1 || numCols < 1) return [];
-  if (sheet.getMaxRows() < probeRow1) return [];
-
-  const formulas = sheet.getRange(probeRow1, 1, 1, numCols).getFormulas()[0] || [];
-  const cols = [];
-
-  for (let c = 0; c < formulas.length; c++) {
-    if (/ARRAYFORMULA\s*\(/i.test(String(formulas[c] || ""))) cols.push(c);
-  }
-  return cols;
-}
-
-function writeRowsSkippingColumns_(sheet, startRow1, rows, numCols, skipCols0) {
-  const rowValues = Array.isArray(rows) ? rows : [];
-  const columnCount = Math.max(0, Number(numCols) || 0);
-  if (!sheet || startRow1 < 1 || rowValues.length === 0 || columnCount === 0) return;
-
-  const skipLookup = {};
-  (skipCols0 || []).forEach(function (col0) {
-    const normalizedCol0 = Number(col0);
-    if (isFinite(normalizedCol0) && normalizedCol0 >= 0 && normalizedCol0 < columnCount) {
-      skipLookup[String(normalizedCol0)] = true;
-    }
-  });
-
-  let segmentStart0 = -1;
-  for (let col0 = 0; col0 <= columnCount; col0++) {
-    const isSkipped = col0 === columnCount || skipLookup[String(col0)] === true;
-    if (!isSkipped && segmentStart0 === -1) {
-      segmentStart0 = col0;
-      continue;
-    }
-    if (!isSkipped || segmentStart0 === -1) continue;
-
-    const segmentWidth = col0 - segmentStart0;
-    const segmentValues = rowValues.map(function (row) {
-      const sourceRow = Array.isArray(row) ? row : [];
-      const out = [];
-      for (let c = segmentStart0; c < col0; c++) {
-        out.push(c < sourceRow.length ? sourceRow[c] : "");
-      }
-      return out;
-    });
-    sheet.getRange(startRow1, segmentStart0 + 1, rowValues.length, segmentWidth).setValues(segmentValues);
-    segmentStart0 = -1;
-  }
-}
-
-function getHeaderColumnIndexes_(header, columnNames) {
-  const out = [];
-  (columnNames || []).forEach(function (columnName) {
-    const idx = findHeaderIndex_(header, columnName);
-    if (idx !== -1) out.push(idx);
-  });
-  return out;
-}
-
-function uniqueNumberArray_(values) {
-  const out = [];
-  const seen = {};
-  (values || []).forEach(function (value) {
-    const numberValue = Number(value);
-    if (!isFinite(numberValue)) return;
-
-    const key = String(numberValue);
-    if (seen[key]) return;
-    seen[key] = true;
-    out.push(numberValue);
-  });
-  return out;
-}
-
-function getExistingSignaturesBySection_(campaignData, commonCols) {
-  const out = {};
-  let currentSection = "";
-
-  for (let r = 1; r < campaignData.length; r++) {
-    const row = campaignData[r];
-    if (isSectionLabelRow_(row)) {
-      currentSection = String(row[0] || "").trim();
-      if (!out[currentSection]) out[currentSection] = new Set();
-      continue;
-    }
-    if (!currentSection || isBlankRow_(row)) continue;
-
-    const signature = buildSignatureFromCampaignRow_(row, commonCols);
-    if (signature) out[currentSection].add(signature);
-  }
-
-  return out;
-}
-
-function buildSignatureFromPitchRow_(row, pitchHeader, commonCols) {
-  return commonCols
-    .filter(function (mapping) {
-      return !isCampaignTransferSignatureExcludedColumn_(mapping && mapping.name);
-    })
-    .map(function (mapping) {
-      return String(getPitchValueForCampaignColumn_(row, pitchHeader, mapping) || "").trim();
-    })
-    .join("||");
-}
-
-function buildSignatureFromCampaignRow_(row, commonCols) {
-  return commonCols
-    .filter(function (mapping) {
-      return !isCampaignTransferSignatureExcludedColumn_(mapping && mapping.name);
-    })
-    .map(function (mapping) {
-      return String(row[mapping.cIdx] || "").trim();
-    })
-    .join("||");
-}
-
-function isCampaignTransferSignatureExcludedColumn_(columnName) {
-  return String(columnName || "").trim() === "HubSpot Record ID";
-}
-
-function getPitchValueForCampaignColumn_(row, pitchHeader, mapping) {
-  if (!mapping || !mapping.name) return "";
-
-  const columnName = String(mapping.name || "").trim();
-  if (columnName === "EXT Rate") return getNegotiatedPitchingValueByHeader_(row, pitchHeader, "EXT Rate");
-  if (columnName === "Rate") return getNegotiatedPitchingValueByHeader_(row, pitchHeader, "Rate");
-  if (columnName === "Status") return "Active";
-  return row[mapping.pIdx];
-}
-
-function getNegotiatedPitchingValueByHeader_(row, header, startHeaderName) {
-  const startIdx = header.indexOf(String(startHeaderName || "").trim());
-  if (startIdx === -1) return "";
-
-  let endIdx = header.length - 1;
-  for (let c = startIdx + 1; c < header.length; c++) {
-    if (String(header[c] || "").trim() !== "") {
-      endIdx = c - 1;
-      break;
-    }
-  }
-
-  for (let c = endIdx; c >= startIdx; c--) {
-    const value = row[c];
-    if (String(value == null ? "" : value).trim() !== "") return value;
-  }
-
-  return "";
-}
-
-function getPitchValueByHeader_(row, pitchHeader, headerName) {
-  const idx = pitchHeader.indexOf(String(headerName || "").trim());
-  return idx === -1 ? "" : row[idx];
-}
-
-function getPitchingExpectedCpmValue_(row, pitchHeader) {
-  return getFirstNonEmptyPitchValueByHeaders_(row, pitchHeader, ["EXT CPM", "CPM"]);
-}
-
-function getFirstNonEmptyPitchValueByHeaders_(row, pitchHeader, headerNames) {
-  for (let i = 0; i < headerNames.length; i++) {
-    const value = getPitchValueByHeader_(row, pitchHeader, headerNames[i]);
-    if (String(value == null ? "" : value).trim() !== "") return value;
-  }
-  return "";
-}
-
-function applyPitchSpecialCampaignMappings_(outRow, campHeader, pitchRow, pitchHeader, pitchRowsByKey) {
-  const matchedPitchRow =
-    getPitchRowByCompositeKey_(pitchRow, pitchHeader, pitchRowsByKey) || pitchRow;
-
-  setValueIfTargetColumnExists_(outRow, campHeader, "Expected Views", getPitchValueByHeader_(matchedPitchRow, pitchHeader, "Median Views"));
-}
-
-function setValueIfTargetColumnExists_(row, header, columnName, value) {
-  const idx = header.indexOf(String(columnName || "").trim());
-  if (idx !== -1) row[idx] = value;
-}
-
-function getPitchRowsByKey_(pitchData, pitchHeader, endRow0) {
-  const out = new Map();
-  const stop0 = Math.min(Number(endRow0) || pitchData.length, pitchData.length);
-  for (let r = 1; r < stop0; r++) {
-    const row = pitchData[r];
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    const key = buildPitchCompositeKey_(row, pitchHeader);
-    if (!key || out.has(key)) continue;
-    out.set(key, row);
-  }
-  return out;
-}
-
-function getPitchRowsByDealActivationKey_(pitchData, pitchDisplayData, pitchHeader, endRow0) {
-  const out = new Map();
-  const stop0 = Math.min(Number(endRow0) || pitchData.length, pitchData.length);
-  for (let r = 1; r < stop0; r++) {
-    const row = pitchData[r];
-    const displayRow = pitchDisplayData && pitchDisplayData[r] ? pitchDisplayData[r] : row;
-    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-
-    const key = buildDealActivationKey_(displayRow, pitchHeader);
-    if (!key) continue;
-
-    const existingRow = out.get(key);
-    if (
-      existingRow &&
-      String(getPitchValueByHeader_(existingRow, pitchHeader, "Median Views") || "").trim() !== ""
-    ) {
-      continue;
-    }
-
-    out.set(key, row);
-  }
-  return out;
-}
-
-function getPitchRowByCompositeKey_(row, pitchHeader, pitchRowsByKey) {
-  const key = buildPitchCompositeKey_(row, pitchHeader);
-  if (!key || !pitchRowsByKey) return null;
-  return pitchRowsByKey.get(key) || null;
-}
-
-function getPitchRowByDealActivationKey_(row, header, pitchRowsByDealActivationKey) {
-  const key = buildDealActivationKey_(row, header);
-  if (!key || !pitchRowsByDealActivationKey) return null;
-  return pitchRowsByDealActivationKey.get(key) || null;
-}
-
-function buildPitchCompositeKey_(row, pitchHeader) {
-  return buildCompositeKey_(row, pitchHeader);
-}
-
-function buildDealActivationKey_(row, header) {
-  const dealId = String(getValueByHeader_(row, header, "HubSpot Record ID") || "").trim();
-  const activationType = String(getValueByHeader_(row, header, "Activation Type") || "").trim();
-  if (!dealId || !activationType) return "";
-  return dealId + "||" + normalizeHeaderName_(activationType);
 }
 
 function setTrackedValue_(row, colIndex, value, changeMap) {
@@ -7989,6 +6721,38 @@ function getCreatorListSheetContext_(sheet) {
     headerRow0: headerRow0,
     headerRow1: headerRow0 + 1,
     archivedStart0: archivedStart0
+  };
+}
+
+function getArchiveSheetContext_(sheet, fallbackHeader) {
+  if (!sheet) return null;
+
+  let data = sheet.getDataRange().getValues();
+  let headerRow0 = detectHeaderRow0ForColumns_(
+    data,
+    ["Status", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_],
+    10
+  );
+
+  if (headerRow0 === -1) {
+    const header = Array.isArray(fallbackHeader) && fallbackHeader.length > 0
+      ? fallbackHeader.slice()
+      : ["Status", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_];
+
+    sheet.getRange(1, 1, 1, header.length).setValues([header]);
+    data = sheet.getDataRange().getValues();
+    headerRow0 = 0;
+  }
+
+  const resolvedHeader = (data[headerRow0] || []).map(function (value) {
+    return String(value || "").trim();
+  });
+
+  return {
+    data: data,
+    header: resolvedHeader,
+    headerRow0: headerRow0,
+    headerRow1: headerRow0 + 1
   };
 }
 
