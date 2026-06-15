@@ -387,6 +387,7 @@ function onOpen() {
     .addItem("Enrich Creator List", "enrichCreatorListRowsInBatches")
     .addItem("Creator List → HubSpot", "importCreatorListToHubSpotOnly")
     .addItem("Woodpecker Export", "downloadCreatorListWoodpeckerCsv")
+    .addItem("Pitching → Campaigns", "pushConfirmedCreatorsToCampaigns")
     .addToUi();
 
   SpreadsheetApp.getUi()
@@ -394,7 +395,6 @@ function onOpen() {
     .addItem("Sync Dropdown Values from HubSpot", "syncDropdownValuesFromHubSpot")
     .addItem("Responded → Negotiation", "pushRespondedToNegotiation")
     .addItem("Negotiation → Active Pitches", "pushNegotiationRowsToActivePitches")
-    .addItem("Pitching → Campaigns", "pushConfirmedCreatorsToCampaigns")
     .addItem("Campaigns → Performance", "pushPublishedCampaignsToPerformance")
     .addItem("Update Campaigns in HubSpot", "updateCampaignsInHubSpot")
     .addItem("Update Performance in HubSpot", "updatePerformanceInHubSpot")
@@ -3485,7 +3485,12 @@ function prepareHubSpotPitchingStatusUpdates_(items) {
   };
 }
 
-function syncCreatorListDealStagesToHubSpot_(sheet, data, header) {
+function syncCreatorListDealStagesToHubSpot_(sheet, data, header, options) {
+  options = options || {};
+  const allowedRow1s = Array.isArray(options.row1s)
+    ? new Set(options.row1s.map(function (row1) { return Number(row1); }).filter(Boolean))
+    : null;
+
   if (!sheet || !data || data.length < 2) {
     return {
       attempted: 0,
@@ -3543,6 +3548,9 @@ function syncCreatorListDealStagesToHubSpot_(sheet, data, header) {
   let skippedStatusCount = 0;
 
   for (let r = 1; r < data.length; r++) {
+    const row1 = r + 1;
+    if (allowedRow1s && !allowedRow1s.has(row1)) continue;
+
     const row = data[r];
     const displayRow = displayData[r] || row;
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
@@ -3571,7 +3579,7 @@ function syncCreatorListDealStagesToHubSpot_(sheet, data, header) {
 
     candidatesByDealId[recordId] = {
       id: recordId,
-      row1: r + 1,
+      row1: row1,
       stageLabel: stageLabel,
       stagePriority: stagePriority,
       sheetPipeline: pipelineCol === -1 ? "" : String(displayRow[pipelineCol] || "").trim()
@@ -6715,12 +6723,6 @@ function pushRespondedToNegotiation() {
   const statusCol = creatorHeader.indexOf("Status");
   if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
 
-  try {
-    syncCreatorListDealStagesToHubSpot_(creatorSheet, creatorData, creatorHeader);
-  } catch (e) {
-    Logger.log("⚠️ Creator List Deal Stage sync failed: " + (e && e.stack ? e.stack : e));
-  }
-
   const contactingStart0 = findSectionRowByLabel_(creatorData, "Contacting");
   if (contactingStart0 === -1) return Logger.log("❌ 'Contacting' section not found in Creator List.");
   const contactingEnd0 = findNextSectionStart0_(creatorData, contactingStart0);
@@ -6751,20 +6753,26 @@ function pushRespondedToNegotiation() {
     CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_
   );
   const pitchingNumCols = pitchingHeader.length;
+  const existingPitchingRecordIds = buildHubSpotRecordIdSet_(pitchingData, pitchingHeader);
   const existingPitchingCompositeKeys = buildCompositeKeySet_(pitchingData, pitchingHeader);
   const existingPitchingSignatures = buildMappedRowSignatureSetFromTarget_(pitchingData, colMap);
 
   // Build Pitching rows
   const pitchingRows = [];
+  const movedCreatorRow1s = [];
   let skippedDup = 0;
   respondedRows.forEach(item => {
+    const recordId = String(getValueByHeader_(item.values, creatorHeader, "HubSpot Record ID") || "").trim();
     const compositeKey = buildCompositeKey_(item.values, creatorHeader);
     const signature = buildMappedRowSignatureFromSource_(item.values, colMap);
     if (
+      (recordId && existingPitchingRecordIds.has(recordId)) ||
       (compositeKey && existingPitchingCompositeKeys.has(compositeKey)) ||
       (signature && existingPitchingSignatures.has(signature))
     ) {
+      if (recordId) existingPitchingRecordIds.add(recordId);
       if (compositeKey) existingPitchingCompositeKeys.add(compositeKey);
+      if (signature) existingPitchingSignatures.add(signature);
       skippedDup++;
       return;
     }
@@ -6772,7 +6780,9 @@ function pushRespondedToNegotiation() {
     const out = new Array(pitchingNumCols).fill("");
     for (const m of colMap) out[m.targetIdx] = item.values[m.sourceIdx];
     pitchingRows.push(out);
+    movedCreatorRow1s.push(item.row1);
 
+    if (recordId) existingPitchingRecordIds.add(recordId);
     if (compositeKey) existingPitchingCompositeKeys.add(compositeKey);
     if (signature) existingPitchingSignatures.add(signature);
   });
@@ -6796,6 +6806,15 @@ function pushRespondedToNegotiation() {
   templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
   templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
   writeRange.setValues(pitchingRows);
+  SpreadsheetApp.flush();
+
+  try {
+    syncCreatorListDealStagesToHubSpot_(creatorSheet, creatorData, creatorHeader, {
+      row1s: movedCreatorRow1s
+    });
+  } catch (e) {
+    Logger.log("⚠️ Creator List Deal Stage sync failed for moved Responded rows: " + (e && e.stack ? e.stack : e));
+  }
 
   Logger.log(`✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ${skippedDup} duplicate(s) skipped.`);
 }
@@ -6993,7 +7012,7 @@ function pushConfirmedCreatorsToCampaigns() {
 
   if (candidates.length === 0) {
     Logger.log("ℹ️ No approved creators eligible to push above Archived.");
-    archivePitches();
+    archivePitches({ includeApproved: true });
     return;
   }
 
@@ -7079,19 +7098,24 @@ function pushConfirmedCreatorsToCampaigns() {
     `Activation create failed: ${skippedActivationCreate}.`
   );
 
-  archivePitches();
+  archivePitches({ includeApproved: true });
 }
 
-function archivePitches() {
+function archivePitches(options) {
+  options = options || {};
+  const includeApproved = options.includeApproved === true;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Pitching");
   if (!sheet) return Logger.log("❌ 'Pitching' sheet not found.");
 
   const data = sheet.getDataRange().getValues();
+  const displayData = sheet.getDataRange().getDisplayValues();
   const header = (data[0] || []).map(v => String(v || "").trim());
 
   const statusCol = header.indexOf("Status");
   if (statusCol === -1) return Logger.log("❌ Pitching missing required column: Status.");
+  const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  const pipelineCol = findHeaderIndex_(header, "Pipeline");
 
   const activeStart0 = findSectionRowByLabel_(data, "Active Pitches");
   const archivedStart0 = findSectionRowByLabel_(data, "Archived");
@@ -7101,73 +7125,200 @@ function archivePitches() {
   const rowsToArchive = [];
   for (let r = activeStart0 + 1; r < archivedStart0; r++) {
     const row = data[r];
+    const displayRow = displayData[r] || row;
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
-    const status = String(row[statusCol] || "").trim();
-    if (status !== "Approved" && status !== "Rejected") continue;
-    rowsToArchive.push({ sourceRow1: r + 1, values: row.slice() });
+    const status = String(displayRow[statusCol] || "").trim();
+    if (status !== "Rejected" && (!includeApproved || status !== "Approved")) continue;
+    rowsToArchive.push({
+      sourceRow1: r + 1,
+      status: status,
+      recordId: recordIdCol === -1 ? "" : String(displayRow[recordIdCol] || "").trim(),
+      pipeline: pipelineCol === -1 ? "" : String(displayRow[pipelineCol] || "").trim()
+    });
   }
 
   if (rowsToArchive.length === 0) return Logger.log("ℹ️ No rows to archive.");
 
-  rowsToArchive
-    .slice()
-    .sort(function (a, b) { return b.sourceRow1 - a.sourceRow1; })
-    .forEach(function (entry) {
-      sheet.deleteRow(entry.sourceRow1);
-    });
+  const localLostUpdates = markRejectedPitchDealStagesLost_(sheet, header, rowsToArchive);
+  try {
+    syncRejectedPitchDealStagesToLost_(rowsToArchive);
+  } catch (e) {
+    Logger.log("⚠️ Rejected Pitching Deal Stage sync failed: " + (e && e.stack ? e.stack : e));
+  }
 
-  const refreshed = sheet.getDataRange().getValues();
-  const refreshedActiveStart0 = findSectionRowByLabel_(refreshed, "Active Pitches");
-  const refreshedArchivedStart0 = findSectionRowByLabel_(refreshed, "Archived");
-  if (refreshedArchivedStart0 === -1) return Logger.log("❌ Archived section disappeared after deletion.");
+  movePitchRowsToArchivedSection_(sheet, rowsToArchive);
 
-  if (refreshedActiveStart0 !== -1) {
-    const restoreAt1 = refreshedActiveStart0 + 2;
-    if (rowsToArchive.length > 1) {
-      sheet.insertRowsBefore(restoreAt1, rowsToArchive.length);
-    } else {
-      sheet.insertRowBefore(restoreAt1);
+  Logger.log(`✅ Archived ${rowsToArchive.length} row(s). Local Deal Stage set to Lost: ${localLostUpdates}.`);
+}
+
+function markRejectedPitchDealStagesLost_(sheet, header, rowsToArchive) {
+  const dealStageCol = findHeaderIndex_(header, "Deal Stage");
+  if (dealStageCol === -1) return 0;
+
+  let updated = 0;
+  (rowsToArchive || []).forEach(function (entry) {
+    if (normalizeHeaderName_(entry && entry.status) !== "rejected") return;
+
+    sheet.getRange(entry.sourceRow1, dealStageCol + 1).setValue("Lost");
+    updated++;
+  });
+
+  if (updated > 0) SpreadsheetApp.flush();
+  return updated;
+}
+
+function syncRejectedPitchDealStagesToLost_(rowsToArchive) {
+  const candidatesByDealId = {};
+  let missingRecordIdCount = 0;
+  let skippedNonRejectedCount = 0;
+
+  (rowsToArchive || []).forEach(function (entry) {
+    if (normalizeHeaderName_(entry && entry.status) !== "rejected") {
+      skippedNonRejectedCount++;
+      return;
     }
-    const formatSourceRow1 = restoreAt1 + rowsToArchive.length;
-    const numColsActive = sheet.getLastColumn();
-    const templateActiveRange = getSafeFormatRow_(sheet, formatSourceRow1, numColsActive);
-    const restoreRange = sheet.getRange(restoreAt1, 1, rowsToArchive.length, numColsActive);
-    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
-    templateActiveRange.copyTo(restoreRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
-    sheet.setRowHeights(restoreAt1, rowsToArchive.length, sheet.getRowHeight(formatSourceRow1));
+
+    const recordId = String(entry && entry.recordId || "").trim();
+    if (!recordId) {
+      missingRecordIdCount++;
+      return;
+    }
+
+    const pipeline = String(entry && entry.pipeline || "").trim();
+    if (!candidatesByDealId[recordId]) {
+      candidatesByDealId[recordId] = {
+        id: recordId,
+        row1: entry.sourceRow1,
+        sheetPipeline: pipeline
+      };
+    } else if (!candidatesByDealId[recordId].sheetPipeline && pipeline) {
+      candidatesByDealId[recordId].sheetPipeline = pipeline;
+    }
+  });
+
+  const dealIds = Object.keys(candidatesByDealId);
+  if (dealIds.length === 0) {
+    Logger.log(
+      `ℹ️ Rejected Pitching Deal Stage sync skipped. Missing deal ID: ${missingRecordIdCount}. ` +
+      `Non-rejected archived rows: ${skippedNonRejectedCount}.`
+    );
+    return {
+      attempted: 0,
+      updated: 0,
+      failed: 0,
+      skipped: missingRecordIdCount + skippedNonRejectedCount
+    };
   }
 
-  const refreshed2 = sheet.getDataRange().getValues();
-  const archivedStart0final = findSectionRowByLabel_(refreshed2, "Archived");
-  if (archivedStart0final === -1) return Logger.log("❌ Archived section not found after row restore.");
-
-  let insertAt1 = findFirstEmptyRowInSection1_(refreshed2, archivedStart0final);
-  if (insertAt1 === -1) insertAt1 = archivedStart0final + 2;
-
-  const numCols = sheet.getLastColumn();
-  const arrayFormulaCols0 = getArrayFormulaColumns_(sheet, 2, numCols);
-  const formulaCols0 = uniqueNumberArray_(
-    arrayFormulaCols0.concat(getHeaderColumnIndexes_(header, ["INT CPM", "EXT CPM"]))
-  );
-  const templateRange = getSafeFormatRow_(sheet, archivedStart0final + 2, numCols);
-
-  if (rowsToArchive.length > 1) {
-    sheet.insertRowsBefore(insertAt1, rowsToArchive.length);
-  } else {
-    sheet.insertRowBefore(insertAt1);
+  const token = getHubSpotApiToken_();
+  if (!token) {
+    Logger.log("ℹ️ HubSpot token not set in this project. Skipping rejected Pitching Deal Stage sync.");
+    return {
+      attempted: 0,
+      updated: 0,
+      failed: 0,
+      skipped: missingRecordIdCount + skippedNonRejectedCount
+    };
   }
 
-  const writeRange = sheet.getRange(insertAt1, 1, rowsToArchive.length, numCols);
-  templateRange.copyTo(writeRange, { formatOnly: true });
-  writeRowsSkippingColumns_(
-    sheet,
-    insertAt1,
-    rowsToArchive.map(function (entry) { return entry.values; }),
-    numCols,
-    formulaCols0
+  let dealStagePropertyName = "dealstage";
+  let stageLookup;
+  try {
+    dealStagePropertyName = getHubSpotDealStagePropertyName_(token);
+    stageLookup = buildHubSpotDealPipelineStageValueLookup_(token);
+  } catch (e) {
+    Logger.log("⚠️ Rejected Pitching Deal Stage sync failed before update: " + (e && e.stack ? e.stack : e));
+    return {
+      attempted: 0,
+      updated: 0,
+      failed: 0,
+      skipped: missingRecordIdCount + skippedNonRejectedCount
+    };
+  }
+
+  let hubSpotPipelineByDealId = {};
+  try {
+    hubSpotPipelineByDealId = fetchHubSpotObjectPropertyValuesByIds_(
+      HUBSPOT_DEALS_OBJECT_API_NAME_,
+      dealIds,
+      "pipeline",
+      token
+    );
+  } catch (e) {
+    Logger.log("⚠️ Could not read current HubSpot deal pipelines for rejected pitches. Falling back to sheet Pipeline values. " + e);
+  }
+
+  const updates = [];
+  let missingPipelineCount = 0;
+  let missingStageValueCount = 0;
+  let fallbackPipelineCount = 0;
+
+  dealIds.forEach(function (dealId) {
+    const item = candidatesByDealId[dealId];
+    const hubSpotPipeline = String(hubSpotPipelineByDealId[dealId] || "").trim();
+    const sheetPipeline = String(item && item.sheetPipeline || "").trim();
+    const pipeline = hubSpotPipeline || sheetPipeline;
+    if (!hubSpotPipeline && sheetPipeline) fallbackPipelineCount++;
+    if (!pipeline) missingPipelineCount++;
+
+    const stageValue = resolveHubSpotDealStageValueForPipeline_("Lost", pipeline, stageLookup);
+    if (!stageValue) {
+      missingStageValueCount++;
+      Logger.log(
+        `⚠️ Could not resolve HubSpot Deal Stage "Lost" ` +
+        `for pipeline "${pipeline}" on Pitching row ${item.row1}; skipped deal ${dealId}.`
+      );
+      return;
+    }
+
+    updates.push({
+      id: dealId,
+      row1: item.row1,
+      properties: { [dealStagePropertyName]: stageValue }
+    });
+  });
+
+  const result = updates.length > 0
+    ? updateHubSpotObjectPropertiesBatch_(HUBSPOT_DEALS_OBJECT_API_NAME_, updates, token)
+    : { updated: 0, failed: 0 };
+
+  Logger.log(
+    `✅ Rejected Pitching Deal Stage sync done. Updated: ${result.updated}. Failed: ${result.failed}. ` +
+    `Attempted: ${updates.length}. Candidate deals: ${dealIds.length}. Missing deal ID: ${missingRecordIdCount}. ` +
+    `Non-rejected archived rows: ${skippedNonRejectedCount}. Missing pipeline: ${missingPipelineCount}. ` +
+    `Missing Lost stage value: ${missingStageValueCount}. Used sheet pipeline fallback: ${fallbackPipelineCount}.`
   );
 
-  Logger.log(`✅ Archived ${rowsToArchive.length} row(s).`);
+  return {
+    attempted: updates.length,
+    updated: result.updated,
+    failed: result.failed,
+    skipped: missingRecordIdCount + skippedNonRejectedCount + missingPipelineCount + missingStageValueCount
+  };
+}
+
+function movePitchRowsToArchivedSection_(sheet, rowsToArchive) {
+  const rows = (rowsToArchive || []).slice().sort(function (a, b) {
+    return a.sourceRow1 - b.sourceRow1;
+  });
+  let movedCount = 0;
+
+  rows.forEach(function (entry) {
+    const sourceRow1 = entry.sourceRow1 - movedCount;
+    const liveData = sheet.getDataRange().getValues();
+    const archivedStart0 = findSectionRowByLabel_(liveData, "Archived");
+    if (archivedStart0 === -1) throw new Error("Archived section disappeared while moving rows.");
+
+    let insertAt1 = findFirstEmptyRowInSection1_(liveData, archivedStart0);
+    if (insertAt1 === -1) {
+      const nextSection0 = findNextSectionStart0_(liveData, archivedStart0);
+      insertAt1 = nextSection0 === -1 ? liveData.length + 1 : nextSection0 + 1;
+    }
+    if (insertAt1 > sheet.getMaxRows()) sheet.insertRowAfter(sheet.getMaxRows());
+
+    sheet.moveRows(sheet.getRange(sourceRow1, 1, 1, sheet.getMaxColumns()), insertAt1);
+    movedCount++;
+  });
 }
 
 function pushPublishedCampaignsToPerformance() {
@@ -7356,6 +7507,22 @@ function buildCompositeKeySet_(data, header) {
     const key = buildCompositeKey_(row, header);
     if (key) set.add(key);
   }
+  return set;
+}
+
+function buildHubSpotRecordIdSet_(data, header) {
+  const set = new Set();
+  const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  if (recordIdCol === -1) return set;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const recordId = String(row[recordIdCol] || "").trim();
+    if (recordId) set.add(recordId);
+  }
+
   return set;
 }
 
