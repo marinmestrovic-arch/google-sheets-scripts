@@ -6722,6 +6722,8 @@ function pushRespondedToNegotiation() {
 
   const statusCol = creatorHeader.indexOf("Status");
   if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
+  const recordIdCol = findHeaderIndex_(creatorHeader, "HubSpot Record ID");
+  if (recordIdCol === -1) return Logger.log("❌ Creator List missing 'HubSpot Record ID' column.");
 
   const contactingStart0 = findSectionRowByLabel_(creatorData, "Contacting");
   if (contactingStart0 === -1) return Logger.log("❌ 'Contacting' section not found in Creator List.");
@@ -6733,14 +6735,25 @@ function pushRespondedToNegotiation() {
 
   // Find responded rows
   const respondedRows = [];
+  let skippedMissingRecordId = 0;
   for (let r = contactingStart0 + 1; r < creatorEnd0; r++) {
     const row = creatorData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     if (String(row[statusCol] || "").trim() !== "Responded") continue;
-    respondedRows.push({ row1: r + 1, values: row.slice() });
+    const recordId = String(row[recordIdCol] || "").trim();
+    if (!recordId) {
+      skippedMissingRecordId++;
+      continue;
+    }
+    respondedRows.push({ row1: r + 1, values: row.slice(), recordId: recordId });
   }
 
   if (respondedRows.length === 0) {
+    if (skippedMissingRecordId > 0) {
+      return Logger.log(
+        `ℹ️ No rows copied to Pitching Negotiation. ${skippedMissingRecordId} Responded row(s) skipped because HubSpot Record ID is empty.`
+      );
+    }
     return Logger.log("ℹ️ No rows with Status 'Responded' in Contacting section.");
   }
 
@@ -6762,7 +6775,7 @@ function pushRespondedToNegotiation() {
   const movedCreatorRow1s = [];
   let skippedDup = 0;
   respondedRows.forEach(item => {
-    const recordId = String(getValueByHeader_(item.values, creatorHeader, "HubSpot Record ID") || "").trim();
+    const recordId = item.recordId;
     const compositeKey = buildCompositeKey_(item.values, creatorHeader);
     const signature = buildMappedRowSignatureFromSource_(item.values, colMap);
     if (
@@ -6788,7 +6801,9 @@ function pushRespondedToNegotiation() {
   });
 
   if (pitchingRows.length === 0) {
-    return Logger.log(`ℹ️ No new rows copied to Pitching Negotiation. ${skippedDup} duplicate(s) skipped.`);
+    return Logger.log(
+      `ℹ️ No new rows copied to Pitching Negotiation. ${skippedDup} duplicate(s) skipped, ${skippedMissingRecordId} missing HubSpot Record ID skipped.`
+    );
   }
 
   // Insert into Negotiation section
@@ -6816,7 +6831,9 @@ function pushRespondedToNegotiation() {
     Logger.log("⚠️ Creator List Deal Stage sync failed for moved Responded rows: " + (e && e.stack ? e.stack : e));
   }
 
-  Logger.log(`✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ${skippedDup} duplicate(s) skipped.`);
+  Logger.log(
+    `✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ${skippedDup} duplicate(s) skipped, ${skippedMissingRecordId} missing HubSpot Record ID skipped.`
+  );
 }
 
 function pushNegotiationRowsToActivePitches() {
