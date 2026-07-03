@@ -85,7 +85,6 @@ const INT_HUBSPOT_MENU_ = (function () {
   const HUBSPOT_PROPERTY_CACHE_MAX_CHARS_ = 90000;
   const HUBSPOT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_LAST_REQUEST_MS";
   const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
-  const HUBSPOT_PIPELINE_STAGE_MAP_PROP_ = "HUBSPOT_PIPELINE_STAGE_MAP";
   const HUBSPOT_DROPDOWN_VALUES_COLUMNS_ = {
     clientName: "Client name",
     client: "Client",
@@ -419,10 +418,9 @@ const INT_HUBSPOT_MENU_ = (function () {
       return message;
     }
 
-    // Narrow each Deal Stage dropdown to match the Pipeline the script just filled in
-    // (setValue bypasses onEdit, so the dropdown wouldn't update on its own).
-    setScriptActionProgress_(`Updating Deal Stage dropdowns on "${sheetName}"…`, 99, "running");
-    reapplyCreatorListDealStageValidation_(ss, null, sheet);
+    // Keep Pipeline and Deal Stage dropdowns on their full HubSpot option lists.
+    setScriptActionProgress_(`Updating Pipeline and Deal Stage dropdowns on "${sheetName}"…`, 99, "running");
+    reapplyCreatorListPipelineAndDealStageValidation_(ss, null, sheet);
 
     const summary =
       `Enrichment of "${sheetName}" complete. Rows: ${totalRows}. Static: ${totalStatic}. ` +
@@ -3018,6 +3016,16 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName) {
+    // Validate every deal row against HubSpot's live pipeline configuration before
+    // building or sending any import payload. The dropdowns intentionally expose
+    // all stages, so correctness is enforced here instead of in the sheet UI.
+    setScriptActionProgress_(
+      `Validating Pipeline / Deal Stage pairs for ${rowItems.length} row(s)…`,
+      8,
+      "running"
+    );
+    validateCreatorListHubSpotPipelineStagePairs_(header, rowItems);
+
     // Safety net: guarantee every contact carries a First Name even if the row was
     // never enriched (or was edited after enrichment), so HubSpot never rejects the
     // create for missing firstname/lastname/email.
@@ -3153,7 +3161,13 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function getMissingCreatorListHubSpotImportColumns_(header) {
-    return ["Deal Name", "HubSpot Record ID", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_]
+    return [
+      "Deal Name",
+      "Pipeline",
+      "Deal Stage",
+      "HubSpot Record ID",
+      CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_
+    ]
       .filter(function (columnName) {
         return findHeaderIndex_(header, columnName) === -1;
       });
@@ -3230,6 +3244,149 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
 
     return issues;
+  }
+
+  function validateCreatorListHubSpotPipelineStagePairs_(header, rowItems) {
+    const token = getHubSpotApiToken_();
+    if (!token) {
+      throw new Error(
+        "Validation failed:\n" +
+        "Pipeline / Deal Stage pairs could not be checked, so the import was not started. " +
+        "Set script property " + HUBSPOT_API_KEY_PROP_ + "."
+      );
+    }
+
+    let pipelines;
+    try {
+      pipelines = fetchHubSpotDealPipelines_(token);
+    } catch (e) {
+      throw new Error(
+        "Validation failed:\n" +
+        "Pipeline / Deal Stage pairs could not be checked, so the import was not started. " +
+        (e && e.message ? e.message : String(e))
+      );
+    }
+
+    if (!Array.isArray(pipelines) || pipelines.length === 0) {
+      throw new Error(
+        "Validation failed:\n" +
+        "HubSpot returned no active deal pipelines. The import was not started."
+      );
+    }
+
+    const issues = collectCreatorListHubSpotPipelineStagePairIssues_(
+      header,
+      rowItems,
+      pipelines
+    );
+    if (issues.length > 0) {
+      throw new Error(
+        "Validation failed:\n" +
+        issues.join("\n") +
+        "\nNo HubSpot import was started. Fix every Pipeline / Deal Stage pair and try again."
+      );
+    }
+  }
+
+  function collectCreatorListHubSpotPipelineStagePairIssues_(header, rowItems, pipelines) {
+    const pipelineCol = findHeaderIndex_(header, "Pipeline");
+    const dealStageCol = findHeaderIndex_(header, "Deal Stage");
+    const issues = [];
+
+    if (pipelineCol === -1 || dealStageCol === -1) {
+      return ["Columns \"Pipeline\" and \"Deal Stage\" are required."];
+    }
+
+    const pipelineLookup = buildHubSpotPipelineStagePairLookup_(pipelines);
+
+    (rowItems || []).forEach(function (item) {
+      const pipeline = String(item.values[pipelineCol] || "").trim();
+      const dealStage = String(item.values[dealStageCol] || "").trim();
+
+      if (!pipeline) {
+        issues.push(`Row ${item.row1}, column "Pipeline": is blank.`);
+        return;
+      }
+      if (!dealStage) {
+        issues.push(`Row ${item.row1}, column "Deal Stage": is blank.`);
+        return;
+      }
+
+      const pipelineEntries = pipelineLookup[normalizeDropdownLookupValue_(pipeline)] || [];
+      if (pipelineEntries.length === 0) {
+        issues.push(
+          `Row ${item.row1}: Pipeline "${pipeline}" is not an active HubSpot deal pipeline ` +
+          `(Deal Stage "${dealStage}").`
+        );
+        return;
+      }
+
+      const stageKey = normalizeDropdownLookupValue_(dealStage);
+      const pairExists = pipelineEntries.some(function (entry) {
+        return !!entry.stageKeys[stageKey];
+      });
+      if (pairExists) return;
+
+      const validStages = uniqueNonEmptyStrings_(
+        pipelineEntries.reduce(function (all, entry) {
+          return all.concat(entry.stageLabels);
+        }, [])
+      );
+      const displayedStages = validStages.slice(0, 8);
+      const moreStages = validStages.length > displayedStages.length
+        ? `, and ${validStages.length - displayedStages.length} more`
+        : "";
+      const validStageHint = displayedStages.length > 0
+        ? ` Valid stages for this pipeline: ${displayedStages.join(", ")}${moreStages}.`
+        : "";
+
+      issues.push(
+        `Row ${item.row1}: Deal Stage "${dealStage}" does not belong to Pipeline "${pipeline}".` +
+        validStageHint
+      );
+    });
+
+    if (issues.length > 15) {
+      issues.splice(15, issues.length - 15, `${issues.length - 15} more invalid row(s) not shown.`);
+    }
+
+    return issues;
+  }
+
+  function buildHubSpotPipelineStagePairLookup_(pipelines) {
+    const lookup = {};
+
+    (pipelines || []).forEach(function (pipeline) {
+      if (!pipeline || pipeline.archived === true) return;
+
+      const pipelineLabel = String(pipeline.label || pipeline.id || "").trim();
+      const entry = {
+        label: pipelineLabel,
+        stageKeys: {},
+        stageLabels: []
+      };
+
+      const stages = Array.isArray(pipeline.stages) ? pipeline.stages : [];
+      stages.forEach(function (stage) {
+        if (!stage || stage.archived === true) return;
+
+        const stageLabel = String(stage.label || stage.id || stage.value || "").trim();
+        uniqueNonEmptyStrings_([stage.label, stage.id, stage.value]).forEach(function (alias) {
+          entry.stageKeys[normalizeDropdownLookupValue_(alias)] = true;
+        });
+        if (stageLabel) entry.stageLabels.push(stageLabel);
+      });
+      entry.stageLabels = uniqueNonEmptyStrings_(entry.stageLabels);
+
+      uniqueNonEmptyStrings_([pipeline.label, pipeline.id]).forEach(function (alias) {
+        const key = normalizeDropdownLookupValue_(alias);
+        if (!key) return;
+        if (!lookup[key]) lookup[key] = [];
+        if (lookup[key].indexOf(entry) === -1) lookup[key].push(entry);
+      });
+    });
+
+    return lookup;
   }
 
   function validateHubSpotImportPayloads_(payloads) {
@@ -3838,9 +3995,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     writeHubSpotDropdownValues_(sheet, valuesByColumnName);
 
-    const pipelineStageMap = fetchHubSpotDealPipelineStageMap_(token);
-    persistHubSpotPipelineStageMap_(pipelineStageMap);
-    reapplyCreatorListDealStageValidation_(spreadsheet, pipelineStageMap);
+    reapplyCreatorListPipelineAndDealStageValidation_(spreadsheet, valuesByColumnName);
 
     return buildHubSpotDropdownSyncResult_(valuesByColumnName);
   }
@@ -3849,34 +4004,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     return String(
       PropertiesService.getScriptProperties().getProperty(HUBSPOT_API_KEY_PROP_) || ""
     ).trim();
-  }
-
-  function persistHubSpotPipelineStageMap_(map) {
-    const payload = JSON.stringify({ v: 1, map: map || {} });
-    if (payload.length > 9000) {
-      Logger.log(
-        "Pipeline→stage map too large to persist (" + payload.length + " chars); skipping."
-      );
-      return false;
-    }
-    PropertiesService.getDocumentProperties().setProperty(
-      HUBSPOT_PIPELINE_STAGE_MAP_PROP_,
-      payload
-    );
-    return true;
-  }
-
-  function readHubSpotPipelineStageMap_() {
-    try {
-      const raw = PropertiesService.getDocumentProperties().getProperty(
-        HUBSPOT_PIPELINE_STAGE_MAP_PROP_
-      );
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      return parsed && parsed.map && typeof parsed.map === "object" ? parsed.map : null;
-    } catch (e) {
-      return null;
-    }
   }
 
   function fetchHubSpotDropdownDealOwnerNames_(token) {
@@ -4121,21 +4248,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     });
   }
 
-  function fetchHubSpotDealPipelineStageMap_(token) {
-    const map = {};
-    fetchHubSpotDealPipelines_(token).forEach(function (pipeline) {
-      const label = String(pipeline && pipeline.label || "").trim();
-      if (!label) return;
-      const stages = Array.isArray(pipeline && pipeline.stages) ? pipeline.stages : [];
-      map[label] = uniqueHubSpotDropdownValues_(
-        stages
-          .filter(function (stage) { return !(stage && stage.archived === true); })
-          .map(function (stage) { return String(stage && stage.label || "").trim(); })
-      );
-    });
-    return map;
-  }
-
   function resolveHubSpotDropdownObjectTypeId_(token, objectConfig) {
     const configuredObjectTypeId = String(objectConfig && objectConfig.objectTypeId || "").trim();
     if (configuredObjectTypeId) return configuredObjectTypeId;
@@ -4368,84 +4480,78 @@ const INT_HUBSPOT_MENU_ = (function () {
     });
   }
 
-  function buildFullStageList_(map) {
-    const all = [];
-    Object.keys(map || {}).forEach(function (key) {
-      (map[key] || []).forEach(function (stage) { all.push(stage); });
-    });
-    return uniqueHubSpotDropdownValues_(all);
-  }
+  function buildFullDropdownValidationRule_(values) {
+    const options = normalizeHubSpotDropdownValues_(values);
+    if (options.length === 0) return null;
 
-  function listContainsLabel_(list, value) {
-    const key = normalizeDropdownLookupValue_(value);
-    if (!key) return false;
-    return (list || []).some(function (item) {
-      return normalizeDropdownLookupValue_(item) === key;
-    });
-  }
-
-  function buildDealStageValidationRule_(stages) {
     return SpreadsheetApp.newDataValidation()
-      .requireValueInList(stages, true)
+      .requireValueInList(options, true)
       .setAllowInvalid(false)
       .build();
   }
 
-  // Retrofit every existing Creator List row: restrict its Deal Stage dropdown to
-  // the stages of its current Pipeline and clear any value that no longer matches.
-  function reapplyCreatorListDealStageValidation_(ss, mapArg, targetSheet) {
+  function getFullDropdownValuesForColumn_(ss, valuesByColumnName, columnName) {
+    if (valuesByColumnName && Array.isArray(valuesByColumnName[columnName])) {
+      return valuesByColumnName[columnName];
+    }
+
+    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
+    const valuesByHeader = getDropdownValuesByHeader_(ss, config.sheetName);
+    return valuesByHeader[columnName] || [];
+  }
+
+  // Keep visible Pipeline and Deal Stage dropdowns on the full HubSpot option
+  // lists. Deal Stage is intentionally not restricted by the selected Pipeline.
+  function reapplyCreatorListPipelineAndDealStageValidation_(
+    ss,
+    valuesByColumnName,
+    targetSheet,
+    startRow1Arg,
+    endRow1Arg
+  ) {
     const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
     const sheet = targetSheet || (spreadsheet && spreadsheet.getSheetByName("Creator List"));
-    if (!sheet) return { processed: 0, cleared: 0 };
-
-    const map = mapArg || readHubSpotPipelineStageMap_();
-    if (!map) return { processed: 0, cleared: 0 };
+    if (!spreadsheet || !sheet) return { processed: 0, updatedColumns: 0 };
 
     const lastRow = sheet.getLastRow();
-    if (lastRow < 2) return { processed: 0, cleared: 0 };
+    if (lastRow < 2) return { processed: 0, updatedColumns: 0 };
 
     const header = sheet
       .getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1))
       .getDisplayValues()[0];
-    const pipelineCol0 = findHeaderIndex_(header, "Pipeline");
-    const dealStageCol0 = findHeaderIndex_(header, "Deal Stage");
-    if (pipelineCol0 === -1 || dealStageCol0 === -1) return { processed: 0, cleared: 0 };
+    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
+    const columnNames = [config.columns.pipeline, config.columns.dealStage];
+    const startRow1 = Math.max(2, Number(startRow1Arg) || 2);
+    const endRow1 = Math.min(lastRow, Number(endRow1Arg) || lastRow);
+    if (endRow1 < startRow1) return { processed: 0, updatedColumns: 0 };
 
-    const rowCount = lastRow - 1;
-    const stageRange = sheet.getRange(2, dealStageCol0 + 1, rowCount, 1);
-    const pipelineValues = sheet.getRange(2, pipelineCol0 + 1, rowCount, 1).getDisplayValues();
-    const stageValues = stageRange.getDisplayValues();
-    const fullStages = buildFullStageList_(map);
+    const rowCount = endRow1 - startRow1 + 1;
+    let updatedColumns = 0;
 
-    const rules = new Array(rowCount);
-    const nextStageValues = new Array(rowCount);
-    let cleared = 0;
+    columnNames.forEach(function (columnName) {
+      const col0 = findHeaderIndex_(header, columnName);
+      if (col0 === -1) return;
 
-    for (let i = 0; i < rowCount; i++) {
-      const pipeline = String((pipelineValues[i] && pipelineValues[i][0]) || "").trim();
-      const currentStage = String((stageValues[i] && stageValues[i][0]) || "").trim();
-      nextStageValues[i] = [currentStage];
+      const rule = buildFullDropdownValidationRule_(
+        getFullDropdownValuesForColumn_(spreadsheet, valuesByColumnName, columnName)
+      );
+      if (!rule) return;
 
-      const hasPipeline = !!pipeline && Object.prototype.hasOwnProperty.call(map, pipeline);
-      const stages = hasPipeline ? map[pipeline] : fullStages;
-      rules[i] = [buildDealStageValidationRule_(stages.length ? stages : fullStages)];
+      sheet.getRange(startRow1, col0 + 1, rowCount, 1).setDataValidation(rule);
+      updatedColumns++;
+    });
 
-      if (hasPipeline && stages.length && currentStage && !listContainsLabel_(stages, currentStage)) {
-        nextStageValues[i] = [""];
-        cleared++;
-      }
-    }
-
-    stageRange.setDataValidations(rules);
-    if (cleared > 0) {
-      stageRange.setValues(nextStageValues);
-    }
-
-    return { processed: rowCount, cleared: cleared };
+    return { processed: rowCount, updatedColumns: updatedColumns };
   }
 
-  // Simple onEdit handler: when a row's Pipeline changes, restrict that row's Deal
-  // Stage dropdown to the pipeline's stages and clear a now-invalid stage value.
+  // Legacy name kept for any existing trigger/library references. It now applies
+  // the full Pipeline and Deal Stage lists instead of narrowing Deal Stage.
+  function reapplyCreatorListDealStageValidation_(ss, unusedMapArg, targetSheet) {
+    return reapplyCreatorListPipelineAndDealStageValidation_(ss, null, targetSheet);
+  }
+
+  // Repair stale row-level dropdown validation after edits without changing any
+  // existing cell values. Both columns always keep their full HubSpot option list.
   function handleCreatorListEdit_(e) {
     try {
       if (!e || !e.range) return;
@@ -4459,70 +4565,24 @@ const INT_HUBSPOT_MENU_ = (function () {
       const dealStageCol0 = findHeaderIndex_(header, "Deal Stage");
       if (pipelineCol0 === -1 || dealStageCol0 === -1) return;
 
-      // Column gate: ignore edits that don't touch the Pipeline column.
+      // Column gate: ignore edits that don't touch Pipeline or Deal Stage.
       const startCol0 = e.range.getColumn() - 1;
       const endCol0 = startCol0 + e.range.getNumColumns() - 1;
-      if (pipelineCol0 < startCol0 || pipelineCol0 > endCol0) return;
+      const touchesPipeline = pipelineCol0 >= startCol0 && pipelineCol0 <= endCol0;
+      const touchesDealStage = dealStageCol0 >= startCol0 && dealStageCol0 <= endCol0;
+      if (!touchesPipeline && !touchesDealStage) return;
 
       const startRow1 = Math.max(e.range.getRow(), 2); // skip header row
       const endRow1 = e.range.getRow() + e.range.getNumRows() - 1;
       if (endRow1 < startRow1) return;
 
-      const map = readHubSpotPipelineStageMap_();
-      if (!map) {
-        showSpreadsheetToast_(
-          "Pipeline→stage list not synced yet. Run ⏰ Triggers → Sync Dropdown Values from HubSpot."
-        );
-        return;
-      }
-
-      const fullStages = buildFullStageList_(map);
-      const rowCount = endRow1 - startRow1 + 1;
-      const pipelineValues = sheet
-        .getRange(startRow1, pipelineCol0 + 1, rowCount, 1)
-        .getDisplayValues();
-      const stageRange = sheet.getRange(startRow1, dealStageCol0 + 1, rowCount, 1);
-      const stageValues = stageRange.getDisplayValues();
-
-      const rules = new Array(rowCount);
-      const nextStageValues = new Array(rowCount);
-      let cleared = 0;
-      let sawUnknownPipeline = false;
-
-      for (let i = 0; i < rowCount; i++) {
-        const pipeline = String((pipelineValues[i] && pipelineValues[i][0]) || "").trim();
-        const currentStage = String((stageValues[i] && stageValues[i][0]) || "").trim();
-        nextStageValues[i] = [currentStage];
-
-        if (!pipeline) {
-          rules[i] = [buildDealStageValidationRule_(fullStages)];
-          continue;
-        }
-
-        if (!Object.prototype.hasOwnProperty.call(map, pipeline)) {
-          rules[i] = [buildDealStageValidationRule_(fullStages)];
-          sawUnknownPipeline = true;
-          continue;
-        }
-
-        const stages = map[pipeline];
-        rules[i] = [buildDealStageValidationRule_(stages.length ? stages : fullStages)];
-        if (stages.length && currentStage && !listContainsLabel_(stages, currentStage)) {
-          nextStageValues[i] = [""];
-          cleared++;
-        }
-      }
-
-      stageRange.setDataValidations(rules);
-      if (cleared > 0) {
-        stageRange.setValues(nextStageValues);
-      }
-
-      if (sawUnknownPipeline) {
-        showSpreadsheetToast_(
-          "Some pipelines aren't in the synced list. Re-run Sync Dropdown Values from HubSpot."
-        );
-      }
+      reapplyCreatorListPipelineAndDealStageValidation_(
+        sheet.getParent(),
+        null,
+        sheet,
+        startRow1,
+        endRow1
+      );
     } catch (err) {
       Logger.log("handleCreatorListEdit_ failed: " + (err && err.message ? err.message : err));
     }
@@ -5700,6 +5760,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     runWoodpeckerExportForSubsheet: runWoodpeckerExportForSubsheet,
     syncDropdownValuesFromHubSpot: syncDropdownValuesFromHubSpot,
     handleCreatorListEdit_: handleCreatorListEdit_,
+    reapplyCreatorListPipelineAndDealStageValidation_: reapplyCreatorListPipelineAndDealStageValidation_,
     reapplyCreatorListDealStageValidation_: reapplyCreatorListDealStageValidation_
   };
 })();
