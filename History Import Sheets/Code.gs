@@ -3173,6 +3173,16 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName, importSpec) {
+    // Validate every deal row against HubSpot's live pipeline configuration before
+    // building or sending any import payload. This prevents HubSpot from silently
+    // rejecting rows whose Pipeline / Deal Stage combination does not exist.
+    setScriptActionProgress_(
+      `Validating Pipeline / Deal Stage pairs for ${rowItems.length} row(s)…`,
+      8,
+      "running"
+    );
+    validateCreatorListHubSpotPipelineStagePairs_(header, rowItems);
+
     // Safety net: guarantee every contact carries a First Name even if the row was
     // never enriched (or was edited after enrichment), so HubSpot never rejects the
     // create for missing firstname/lastname/email.
@@ -3309,7 +3319,13 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function getMissingCreatorListHubSpotImportColumns_(header) {
-    return ["Deal Name", "HubSpot Record ID", CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_]
+    return [
+      "Deal Name",
+      "Pipeline",
+      "Deal Stage",
+      "HubSpot Record ID",
+      CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_
+    ]
       .filter(function (columnName) {
         return findHeaderIndex_(header, columnName) === -1;
       });
@@ -3386,6 +3402,147 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
 
     return issues;
+  }
+
+  function validateCreatorListHubSpotPipelineStagePairs_(header, rowItems) {
+    const token = getHubSpotApiToken_();
+    if (!token) {
+      throw new Error(
+        "Validation failed:\n" +
+        "Pipeline / Deal Stage pairs could not be checked, so the import was not started. " +
+        "Set script property " + HUBSPOT_API_KEY_PROP_ + "."
+      );
+    }
+
+    let pipelines;
+    try {
+      pipelines = fetchHubSpotDealPipelines_(token);
+    } catch (e) {
+      throw new Error(
+        "Validation failed:\n" +
+        "Pipeline / Deal Stage pairs could not be checked, so the import was not started. " +
+        (e && e.message ? e.message : String(e))
+      );
+    }
+
+    if (!Array.isArray(pipelines) || pipelines.length === 0) {
+      throw new Error(
+        "Validation failed:\n" +
+        "HubSpot returned no active deal pipelines. The import was not started."
+      );
+    }
+
+    const issues = collectCreatorListHubSpotPipelineStagePairIssues_(
+      header,
+      rowItems,
+      pipelines
+    );
+    if (issues.length > 0) {
+      throw new Error(
+        "Validation failed:\n" +
+        issues.join("\n") +
+        "\nNo HubSpot import was started. Fix every Pipeline / Deal Stage pair and try again."
+      );
+    }
+  }
+
+  function collectCreatorListHubSpotPipelineStagePairIssues_(header, rowItems, pipelines) {
+    const pipelineCol = findHeaderIndex_(header, "Pipeline");
+    const dealStageCol = findHeaderIndex_(header, "Deal Stage");
+    const issues = [];
+
+    if (pipelineCol === -1 || dealStageCol === -1) {
+      return ["Columns \"Pipeline\" and \"Deal Stage\" are required."];
+    }
+
+    const pipelineLookup = buildHubSpotPipelineStagePairLookup_(pipelines);
+
+    (rowItems || []).forEach(function (item) {
+      const pipeline = String(item.values[pipelineCol] || "").trim();
+      const dealStage = String(item.values[dealStageCol] || "").trim();
+
+      if (!pipeline) {
+        issues.push(`Row ${item.row1}, column "Pipeline": is blank.`);
+        return;
+      }
+      if (!dealStage) {
+        issues.push(`Row ${item.row1}, column "Deal Stage": is blank.`);
+        return;
+      }
+
+      const pipelineEntries = pipelineLookup[normalizeDropdownLookupValue_(pipeline)] || [];
+      if (pipelineEntries.length === 0) {
+        issues.push(
+          `Row ${item.row1}: Pipeline "${pipeline}" is not an active HubSpot deal pipeline ` +
+          `(Deal Stage "${dealStage}").`
+        );
+        return;
+      }
+
+      const stageKey = normalizeDropdownLookupValue_(dealStage);
+      const pairExists = pipelineEntries.some(function (entry) {
+        return !!entry.stageKeys[stageKey];
+      });
+      if (pairExists) return;
+
+      const validStages = uniqueNonEmptyStrings_(
+        pipelineEntries.reduce(function (all, entry) {
+          return all.concat(entry.stageLabels);
+        }, [])
+      );
+      const displayedStages = validStages.slice(0, 8);
+      const moreStages = validStages.length > displayedStages.length
+        ? `, and ${validStages.length - displayedStages.length} more`
+        : "";
+      const validStageHint = displayedStages.length > 0
+        ? ` Valid stages for this pipeline: ${displayedStages.join(", ")}${moreStages}.`
+        : "";
+
+      issues.push(
+        `Row ${item.row1}: Deal Stage "${dealStage}" does not belong to Pipeline "${pipeline}".` +
+        validStageHint
+      );
+    });
+
+    if (issues.length > 15) {
+      issues.splice(15, issues.length - 15, `${issues.length - 15} more invalid row(s) not shown.`);
+    }
+
+    return issues;
+  }
+
+  function buildHubSpotPipelineStagePairLookup_(pipelines) {
+    const lookup = {};
+
+    (pipelines || []).forEach(function (pipeline) {
+      if (!pipeline || pipeline.archived === true) return;
+
+      const entry = {
+        stageKeys: {},
+        stageLabels: []
+      };
+
+      const stages = Array.isArray(pipeline.stages) ? pipeline.stages : [];
+      stages.forEach(function (stage) {
+        if (!stage || stage.archived === true) return;
+
+        const stageLabel = String(stage.label || stage.id || stage.value || "").trim();
+        uniqueNonEmptyStrings_([stage.label, stage.id, stage.value]).forEach(function (alias) {
+          entry.stageKeys[normalizeDropdownLookupValue_(alias)] = true;
+        });
+        if (stageLabel) entry.stageLabels.push(stageLabel);
+      });
+      entry.stageLabels = uniqueNonEmptyStrings_(entry.stageLabels);
+
+      uniqueNonEmptyStrings_([pipeline.label, pipeline.id]).forEach(function (alias) {
+        const key = normalizeDropdownLookupValue_(alias);
+        if (!key) return;
+        if (!lookup[key]) lookup[key] = [];
+        if (lookup[key].indexOf(entry) === -1) lookup[key].push(entry);
+      });
+    });
+
+    return lookup;
   }
 
   function validateHubSpotImportPayloads_(payloads) {
