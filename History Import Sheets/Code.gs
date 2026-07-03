@@ -399,6 +399,10 @@ const INT_HUBSPOT_MENU_ = (function () {
     const header = context.header;
     const stopRow1 = context.archivedStart0 === -1 ? context.data.length : context.archivedStart0;
     const startRow1 = Math.max(context.headerRow1 + 1, 3);
+    const alreadyEnrichedSnapshot = buildAlreadyEnrichedCreatorSnapshot_(context.data, header, startRow1, stopRow1);
+    Logger.log(
+      `ℹ️ Enrichment startup scan: ${alreadyEnrichedSnapshot.rowCount} row(s) already have Channel Name filled.`
+    );
     const scanTotal = Math.max(stopRow1 - startRow1 + 1, 1);
     let nextStartRow1 = startRow1;
     let totalRows = 0;
@@ -408,7 +412,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     let totalImportFallback = 0;
 
     while (nextStartRow1 <= stopRow1) {
-      const batch = collectCreatorListEnrichmentBatch_(context.data, header, nextStartRow1, stopRow1);
+      const batch = collectCreatorListEnrichmentBatch_(
+        context.data,
+        header,
+        nextStartRow1,
+        stopRow1,
+        alreadyEnrichedSnapshot.row1Set
+      );
       const rowItems = batch.rowItems;
       if (rowItems.length === 0) break;
 
@@ -437,7 +447,9 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
     if (totalRows === 0) {
-      const message = `"${sheetName}" enrichment complete. No remaining rows to process.`;
+      const message =
+        `"${sheetName}" enrichment complete. No remaining rows to process. ` +
+        `Skipped already enriched: ${alreadyEnrichedSnapshot.rowCount}.`;
       setScriptActionProgress_(message, 100, "done");
       showSpreadsheetToast_(message);
       Logger.log(`✅ ${message}`);
@@ -452,7 +464,8 @@ const INT_HUBSPOT_MENU_ = (function () {
     const summary =
       `Enrichment of "${sheetName}" complete. Rows: ${totalRows}. Static: ${totalStatic}. ` +
       `YouTube: ${totalYoutube}. AI: ${totalProfile}. ` +
-      `Import Fallback: ${totalImportFallback}.`;
+      `Import Fallback: ${totalImportFallback}. ` +
+      `Skipped already enriched: ${alreadyEnrichedSnapshot.rowCount}.`;
     setScriptActionProgress_(summary, 100, "done");
     showSpreadsheetToast_(summary);
     Logger.log(`✅ ${summary}`);
@@ -1090,7 +1103,34 @@ const INT_HUBSPOT_MENU_ = (function () {
     return candidateFields.some(field => String(getValueByHeader_(row, header, field) || "").trim());
   }
 
-  function collectCreatorListEnrichmentBatch_(data, header, startRow1, stopRow1) {
+  function buildAlreadyEnrichedCreatorSnapshot_(data, header, startRow1, stopRow1) {
+    const channelNameCol = findHeaderIndex_(header, "Channel Name");
+    const row1Set = {};
+    let rowCount = 0;
+
+    if (channelNameCol === -1) {
+      return {
+        row1Set: row1Set,
+        rowCount: rowCount
+      };
+    }
+
+    for (let row1 = Math.max(Number(startRow1) || 1, 1); row1 <= stopRow1; row1++) {
+      const row = data[row1 - 1];
+      if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+      if (!String(row[channelNameCol] || "").trim()) continue;
+
+      row1Set[row1] = true;
+      rowCount++;
+    }
+
+    return {
+      row1Set: row1Set,
+      rowCount: rowCount
+    };
+  }
+
+  function collectCreatorListEnrichmentBatch_(data, header, startRow1, stopRow1, alreadyEnrichedRow1Set) {
     const rowItems = [];
     let lastScannedRow1 = Math.max(Number(startRow1) || 1, 1) - 1;
 
@@ -1098,6 +1138,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       lastScannedRow1 = row1;
       const row = data[row1 - 1];
       if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+      if (alreadyEnrichedRow1Set && alreadyEnrichedRow1Set[row1]) continue;
       if (!canAttemptCreatorListEnrichment_(row, header)) continue;
 
       rowItems.push({ row1: row1, values: row.slice() });
@@ -1178,7 +1219,8 @@ const INT_HUBSPOT_MENU_ = (function () {
     const identityByKey = {};
 
     identities.forEach(function (identity) {
-      if (!identity || !identity.key || identityByKey[identity.key]) return;
+      if (!identity || !identity.key) return;
+      if (identityByKey[identity.key] && identityByKey[identity.key].handle) return;
       identityByKey[identity.key] = identity;
     });
 
@@ -1190,9 +1232,17 @@ const INT_HUBSPOT_MENU_ = (function () {
         setIfEmpty_(row, header, spec.handleHeader, identity.handle, changeMap);
       }
       if (identity.canonicalUrl && (identity.handle || identity.key === "youtube")) {
-        setIfEmpty_(row, header, spec.urlHeader, identity.canonicalUrl, changeMap);
+        setTrackedValueByHeader_(row, header, spec.urlHeader, identity.canonicalUrl, changeMap);
       }
     });
+
+    const primaryIdentity = identities.length > 0 ? identities[0] : null;
+    const primaryCanonicalIdentity = primaryIdentity && primaryIdentity.key
+      ? (primaryIdentity.handle ? primaryIdentity : identityByKey[primaryIdentity.key])
+      : null;
+    if (primaryCanonicalIdentity && primaryCanonicalIdentity.canonicalUrl && primaryCanonicalIdentity.handle) {
+      setTrackedValueByHeader_(row, header, "Channel URL", primaryCanonicalIdentity.canonicalUrl, changeMap);
+    }
 
     const preferredHandle = getPreferredCreatorHandleForRow_(row, header, identities.length > 0 ? identities[0] : null);
     if (preferredHandle) {
@@ -1463,7 +1513,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!normalizedHandle) return "";
 
     const pathHandle = normalizedHandle.replace(/^@/, "");
-    if (platformKey === "youtube") return "https://www.youtube.com/@" + pathHandle;
+    if (platformKey === "youtube") return "https://youtube.com/@" + pathHandle;
     if (platformKey === "instagram") return "https://www.instagram.com/" + pathHandle + "/";
     if (platformKey === "tiktok") return "https://www.tiktok.com/@" + pathHandle;
     if (platformKey === "twitch") return "https://www.twitch.tv/" + pathHandle;
@@ -1589,7 +1639,10 @@ const INT_HUBSPOT_MENU_ = (function () {
       setIfEmpty_(row, header, "YouTube Followers", insight.subscribers, changeMap);
     }
     if (insight.handle) setIfEmpty_(row, header, "YouTube Handle", insight.handle, changeMap);
-    if (insight.canonicalUrl) setIfEmpty_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+    if (insight.canonicalUrl) {
+      setTrackedValueByHeader_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+      if (insight.handle) setTrackedValueByHeader_(row, header, "Channel URL", insight.canonicalUrl, changeMap);
+    }
     const preferredHandle = getPreferredCreatorHandleForRow_(row, header, null) || String(insight.handle || "").trim();
     if (preferredHandle) {
       setIfEmpty_(row, header, "Channel Name", preferredHandle, changeMap);
@@ -1652,12 +1705,15 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!handle && /\/@/i.test(String(resolved.canonicalUrl || ""))) {
       handle = normalizeYouTubeHandle_(resolved.canonicalUrl);
     }
+    const canonicalUrl = handle
+      ? buildCreatorPlatformCanonicalUrl_("youtube", handle)
+      : (resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl));
 
     const insight = {
       channelId: resolved.channelId,
       channelName: String(snippet.title || channelName || "").trim(),
       handle: handle,
-      canonicalUrl: resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl),
+      canonicalUrl: canonicalUrl,
       description: String(snippet.description || branding.description || "").trim(),
       countryCode: String(snippet.country || branding.country || "").trim(),
       subscribers: Number(statistics.subscriberCount || 0),
@@ -1767,6 +1823,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     const out = Object.assign({}, insight);
     out.sampledTitles = uniqueNonEmptyStrings_(out.sampledTitles || []);
     out.sampledVideoDescriptions = uniqueNonEmptyStrings_(out.sampledVideoDescriptions || []);
+    out.handle = normalizeCreatorPlatformHandle_("youtube", out.handle);
+    if (!out.handle && /\/@/i.test(String(out.canonicalUrl || ""))) {
+      out.handle = normalizeCreatorPlatformHandle_("youtube", out.canonicalUrl);
+    }
+    if (out.handle) {
+      out.canonicalUrl = buildCreatorPlatformCanonicalUrl_("youtube", out.handle);
+    }
     out.bioEmails = extractExplicitEmailsFromText_(out.description || "");
     out.videoDescriptionEmails = extractExplicitEmailsFromTextList_(out.sampledVideoDescriptions || []);
 
@@ -2017,7 +2080,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       if (handleChannelId) {
         return {
           channelId: handleChannelId,
-          canonicalUrl: "https://www.youtube.com/" + normalizeYouTubeHandle_(raw)
+          canonicalUrl: buildCreatorPlatformCanonicalUrl_("youtube", raw)
         };
       }
     }
@@ -2110,7 +2173,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
   function buildCanonicalYouTubeUrl_(channelId, customUrl) {
     const handle = normalizeYouTubeHandle_(customUrl);
-    if (handle) return "https://www.youtube.com/" + handle;
+    if (handle) return buildCreatorPlatformCanonicalUrl_("youtube", handle);
     return channelId ? "https://www.youtube.com/channel/" + channelId : "";
   }
 
@@ -3182,11 +3245,12 @@ const INT_HUBSPOT_MENU_ = (function () {
   // are prefixed with the object alias so the shared importer routes every
   // column to that object instead of guessing by generic header hints.
   function buildSimpleHubSpotImportPayload_(ss, header, rowItems, spec, sheetName) {
+    const spreadsheetLocale = ss.getSpreadsheetLocale();
     const activeColIndexes = [];
     header.forEach((h, idx) => {
       if (!h) return;
       const hasValue = rowItems.some(item =>
-        String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
+        String(formatHubSpotImportCellValue_(h, item.values[idx], spreadsheetLocale) || "").trim() !== ""
       );
       if (!hasValue) return;
       activeColIndexes.push(idx);
@@ -3205,14 +3269,14 @@ const INT_HUBSPOT_MENU_ = (function () {
       return alias ? alias + " " + header[i] : header[i];
     });
     const activeRows = rowItems.map(item =>
-      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
+      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i], spreadsheetLocale))
     );
     const safeSpreadsheetName = toAsciiSafeHubSpotImportName_(ss.getName(), "HubSpot Import");
 
     return {
       sheetName: toAsciiSafeHubSpotImportName_(sheetName, spec.label),
       spreadsheetName: safeSpreadsheetName + " - " + spec.label,
-      spreadsheetLocale: ss.getSpreadsheetLocale(),
+      spreadsheetLocale: spreadsheetLocale,
       headers: activeHeaders,
       rows: activeRows,
       sourceRowNumbers: rowItems.map(item => item.row1),
@@ -3447,13 +3511,14 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel, sheetName, importSpec) {
+    const spreadsheetLocale = ss.getSpreadsheetLocale();
     const activeColIndexes = [];
     header.forEach((h, idx) => {
       if (!h) return;
       if (excludedColIndexes && excludedColIndexes.has(idx)) return;
       if (shouldExcludeCreatorListColumnFromHubSpotImport_(h, importSpec)) return;
       const hasValue = rowItems.some(item =>
-        String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
+        String(formatHubSpotImportCellValue_(h, item.values[idx], spreadsheetLocale) || "").trim() !== ""
       );
       if (!hasValue) return;
       activeColIndexes.push(idx);
@@ -3463,7 +3528,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const activeHeaders = activeColIndexes.map(i => resolveHubSpotImportHeaderName_(header[i], importSpec));
     const activeRows = rowItems.map(item =>
-      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
+      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i], spreadsheetLocale))
     );
     const safeSpreadsheetName = toAsciiSafeHubSpotImportName_(ss.getName(), "HubSpot Import");
     const label = String(importLabel || "").trim();
@@ -3471,7 +3536,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return {
       sheetName: toAsciiSafeHubSpotImportName_(sheetName, "Creator List"),
       spreadsheetName: label ? safeSpreadsheetName + " - " + label : safeSpreadsheetName,
-      spreadsheetLocale: ss.getSpreadsheetLocale(),
+      spreadsheetLocale: spreadsheetLocale,
       headers: activeHeaders,
       rows: activeRows,
       sourceRowNumbers: rowItems.map(item => item.row1),
@@ -3744,15 +3809,112 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
-  function formatHubSpotImportCellValue_(headerName, value) {
+  function formatHubSpotImportCellValue_(headerName, value, spreadsheetLocale) {
     const text = String(value == null ? "" : value).trim();
     if (!text) return "";
+
+    if (isHubSpotImportDateColumn_(headerName)) {
+      return formatHubSpotImportDateCellValue_(value, spreadsheetLocale);
+    }
 
     if (!HUBSPOT_IMPORT_MULTISELECT_COLS_.has(normalizeHeaderName_(headerName))) {
       return text;
     }
 
     return normalizeHubSpotMultiselectImportValue_(text);
+  }
+
+  function isHubSpotImportDateColumn_(headerName) {
+    return normalizeHeaderName_(headerName) === "publicationdate";
+  }
+
+  function formatHubSpotImportDateCellValue_(value, spreadsheetLocale) {
+    const text = String(value == null ? "" : value).trim();
+    const date = parseHubSpotImportDateCellValue_(value, spreadsheetLocale);
+    if (!date) return text;
+
+    const importDateFormat = getHubSpotImportDateFormatForLocale_(spreadsheetLocale);
+    const pattern = importDateFormat === "MONTH_DAY_YEAR"
+      ? "MM/dd/yyyy"
+      : (importDateFormat === "YEAR_MONTH_DAY" ? "yyyy/MM/dd" : "dd/MM/yyyy");
+
+    return Utilities.formatDate(date, Session.getScriptTimeZone(), pattern);
+  }
+
+  function getHubSpotImportDateFormatForLocale_(spreadsheetLocale) {
+    const locale = String(spreadsheetLocale || "").replace("-", "_").toLowerCase();
+    if (locale === "en_us") return "MONTH_DAY_YEAR";
+    if (/^(ja|ko|zh)(_|$)/.test(locale)) return "YEAR_MONTH_DAY";
+    return "DAY_MONTH_YEAR";
+  }
+
+  function parseHubSpotImportDateCellValue_(value, spreadsheetLocale) {
+    if (
+      Object.prototype.toString.call(value) === "[object Date]" ||
+      (typeof value === "number" && isFinite(value))
+    ) {
+      return parseSpreadsheetDateValue_(value);
+    }
+
+    const text = String(value == null ? "" : value).trim();
+    if (!text) return null;
+
+    if (/^-?\d+(\.\d+)?$/.test(text)) {
+      return parseSpreadsheetDateValue_(Number(text));
+    }
+
+    const ymdMatch = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    if (ymdMatch) {
+      return buildValidDateOnly_(
+        Number(ymdMatch[1]),
+        Number(ymdMatch[2]),
+        Number(ymdMatch[3])
+      );
+    }
+
+    const dmyOrMdyMatch = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})$/);
+    if (dmyOrMdyMatch) {
+      const first = Number(dmyOrMdyMatch[1]);
+      const second = Number(dmyOrMdyMatch[2]);
+      const year = normalizeTwoDigitYear_(Number(dmyOrMdyMatch[3]));
+      if (getHubSpotImportDateFormatForLocale_(spreadsheetLocale) === "MONTH_DAY_YEAR") {
+        return buildValidDateOnly_(year, first, second) || buildValidDateOnly_(year, second, first);
+      }
+      return buildValidDateOnly_(year, second, first) || buildValidDateOnly_(year, first, second);
+    }
+
+    return parseSpreadsheetDateValue_(text);
+  }
+
+  function normalizeTwoDigitYear_(year) {
+    if (!isFinite(year)) return year;
+    return year < 100 ? 2000 + year : year;
+  }
+
+  function buildValidDateOnly_(year, month, day) {
+    if (
+      !isFinite(year) ||
+      !isFinite(month) ||
+      !isFinite(day) ||
+      year < 1900 ||
+      month < 1 ||
+      month > 12 ||
+      day < 1 ||
+      day > 31
+    ) {
+      return null;
+    }
+
+    const date = new Date(year, month - 1, day);
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day
+    ) {
+      return null;
+    }
+
+    return date;
   }
 
   function normalizeHubSpotMultiselectImportValue_(value) {
