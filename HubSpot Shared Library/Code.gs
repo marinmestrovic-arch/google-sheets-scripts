@@ -278,7 +278,15 @@ function prepareHubSpotImportFromPayload_(payload, token, options) {
     };
   }
 
-  var fileName = "HubSpot Import - " + payload.spreadsheetName + ".csv";
+  var displayName = "HubSpot Import - " + payload.spreadsheetName;
+  // HubSpot matches importRequest.files[].fileName against the filename that
+  // UrlFetchApp writes into the multipart Content-Disposition header. That
+  // header can only carry ASCII, so any non-ASCII character in the sheet name
+  // (e.g. an en-dash "–" pasted/autocorrected into " - ") gets re-encoded
+  // there while the JSON field keeps the raw byte, breaking the match with a
+  // 400 VALIDATION_ERROR. Fold the upload filename to ASCII so the two parts
+  // are always byte-for-byte identical; the import job keeps the pretty name.
+  var fileName = asciiSafeFileName_(displayName) + ".csv";
   var fileBlob = Utilities.newBlob(
     toCsvBytes_([payload.headers].concat(payload.rows)),
     "text/csv",
@@ -286,6 +294,7 @@ function prepareHubSpotImportFromPayload_(payload, token, options) {
   );
   var importRequest = buildHubSpotImportRequest_(
     fileName,
+    displayName,
     resolvedColumns.mappings,
     payload.spreadsheetLocale
   );
@@ -694,9 +703,10 @@ function toCsvBytes_(grid) {
   return Utilities.newBlob("\uFEFF" + csv, "text/csv;charset=utf-8").getBytes();
 }
 
-function buildHubSpotImportRequest_(fileName, columnMappings, spreadsheetLocale) {
+function buildHubSpotImportRequest_(fileName, importName, columnMappings, spreadsheetLocale) {
   return {
-    name: "Google Sheets Import - " + fileName.replace(/\.csv$/i, ""),
+    name: "Google Sheets Import - " +
+      String(importName || fileName.replace(/\.csv$/i, "")),
     dateFormat: getHubSpotImportDateFormat_(spreadsheetLocale),
     importOperations: buildHubSpotImportOperations_(columnMappings),
     files: [
@@ -1527,6 +1537,27 @@ function sanitizeFileName_(value) {
   return String(value || "HubSpot Import")
     .replace(/[\\/:*?"<>|]+/g, "-")
     .trim() || "HubSpot Import";
+}
+
+// Folds a name to pure printable ASCII so it survives the multipart
+// Content-Disposition header unchanged. This guarantees the uploaded file's
+// name and importRequest.files[].fileName match byte-for-byte, regardless of
+// what Unicode the spreadsheet title contains.
+function asciiSafeFileName_(value) {
+  var mapped = String(value == null ? "" : value);
+  if (typeof mapped.normalize === "function") {
+    // Decompose accented letters (e-acute -> e), then strip the combining
+    // marks (U+0300-U+036F) so they fold to plain ASCII below rather than
+    // being replaced wholesale by the non-ASCII catch-all.
+    mapped = mapped.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+  }
+  return (
+    mapped
+      .replace(/[^\x20-\x7e]/g, "-")  // any non-ASCII (en-dash, etc.) -> "-"
+      .replace(/[\\/:*?"<>|]+/g, "-") // characters illegal in file names
+      .replace(/\s+/g, " ")
+      .trim() || "HubSpot Import"
+  );
 }
 
 function escapeRegExp_(value) {
