@@ -1,5 +1,5 @@
 /*********************************************
- * INT Sheet Template - HubSpot menu actions
+ * History Import Sheets - HubSpot menu actions
  *********************************************/
 
 function onOpen() {
@@ -85,6 +85,7 @@ const INT_HUBSPOT_MENU_ = (function () {
   const HUBSPOT_PROPERTY_CACHE_MAX_CHARS_ = 90000;
   const HUBSPOT_LAST_REQUEST_MS_PROP_ = "HUBSPOT_LAST_REQUEST_MS";
   const HUBSPOT_ACTIVATION_OBJECT_KEY_ = "activations";
+  const HUBSPOT_PIPELINE_STAGE_MAP_PROP_ = "HUBSPOT_PIPELINE_STAGE_MAP";
   const HUBSPOT_DROPDOWN_VALUES_COLUMNS_ = {
     clientName: "Client name",
     client: "Client",
@@ -224,6 +225,26 @@ const INT_HUBSPOT_MENU_ = (function () {
   ]);
   const HUBSPOT_IMPORT_MULTISELECT_COLS_ = new Set(["influencervertical"]);
   const HUBSPOT_MULTISELECT_IMPORT_DELIMITER_ = ";";
+  const HUBSPOT_HISTORY_IMPORT_KEY_ = "history";
+  const HUBSPOT_HISTORY_IMPORT_INCLUDED_EXCLUDED_COL_KEYS_ = new Set([
+    "activationtype",
+    "activationname"
+  ]);
+  const HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_ = {
+    // Activation custom-object properties.
+    "Script URL": "Activations",
+    "Preview URL": "Activations",
+    "Publication Date": "Activations",
+    // Deal properties.
+    "Amount": "Deals",
+    "EXT Amount": "Deals",
+    "Contract": "Deals",
+    "Pitching Status": "Deals",
+    "Contract Signed": "Deals",
+    "Script Approved": "Deals",
+    "Preview Approved": "Deals",
+    "Published": "Deals"
+  };
   const YOUTUBE_ENRICH_FIELDS_ = [
     "YouTube Handle",
     "YouTube URL",
@@ -354,13 +375,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     const ss = sheet.getParent();
     setScriptActionProgress_(`Reading "${sheetName}"…`, 0, "running");
 
-    // Enrichment only makes sense on Deal Import copies — block Campaign/Client
-    // Import copies instead of half-matching their columns.
+    // Enrichment only makes sense on deal-style imports — block Campaign/Client
+    // imports instead of half-matching their columns.
     const detected = detectHubSpotImportKind_(sheet.getDataRange().getValues());
-    if (detected && detected.spec.key !== "deal") {
+    if (detected && !isDealStyleHubSpotImportSpec_(detected.spec)) {
       throw new Error(
         `"${sheetName}" looks like a ${detected.spec.label} import sheet. ` +
-        "Enrichment only applies to Deal Import copies."
+        "Enrichment only applies to Deal Import or History Import copies."
       );
     }
 
@@ -378,6 +399,10 @@ const INT_HUBSPOT_MENU_ = (function () {
     const header = context.header;
     const stopRow1 = context.archivedStart0 === -1 ? context.data.length : context.archivedStart0;
     const startRow1 = Math.max(context.headerRow1 + 1, 3);
+    const alreadyEnrichedSnapshot = buildAlreadyEnrichedCreatorSnapshot_(context.data, header, startRow1, stopRow1);
+    Logger.log(
+      `ℹ️ Enrichment startup scan: ${alreadyEnrichedSnapshot.rowCount} row(s) already have Channel Name filled.`
+    );
     const scanTotal = Math.max(stopRow1 - startRow1 + 1, 1);
     let nextStartRow1 = startRow1;
     let totalRows = 0;
@@ -387,7 +412,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     let totalImportFallback = 0;
 
     while (nextStartRow1 <= stopRow1) {
-      const batch = collectCreatorListEnrichmentBatch_(context.data, header, nextStartRow1, stopRow1);
+      const batch = collectCreatorListEnrichmentBatch_(
+        context.data,
+        header,
+        nextStartRow1,
+        stopRow1,
+        alreadyEnrichedSnapshot.row1Set
+      );
       const rowItems = batch.rowItems;
       if (rowItems.length === 0) break;
 
@@ -400,7 +431,12 @@ const INT_HUBSPOT_MENU_ = (function () {
       );
 
       props.setProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_, String(batch.nextStartRow1));
-      const result = runCreatorListEnrichment_(sheet, rowItems, header);
+      const result = runCreatorListEnrichment_(
+        sheet,
+        rowItems,
+        header,
+        detected ? detected.spec : null
+      );
       totalRows += rowItems.length;
       totalStatic += result.staticEnriched;
       totalYoutube += result.youtubeEnriched;
@@ -411,21 +447,25 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     props.deleteProperty(CREATOR_LIST_ENRICH_CURSOR_PROP_);
     if (totalRows === 0) {
-      const message = `"${sheetName}" enrichment complete. No remaining rows to process.`;
+      const message =
+        `"${sheetName}" enrichment complete. No remaining rows to process. ` +
+        `Skipped already enriched: ${alreadyEnrichedSnapshot.rowCount}.`;
       setScriptActionProgress_(message, 100, "done");
       showSpreadsheetToast_(message);
       Logger.log(`✅ ${message}`);
       return message;
     }
 
-    // Keep Pipeline and Deal Stage dropdowns on their full HubSpot option lists.
-    setScriptActionProgress_(`Updating Pipeline and Deal Stage dropdowns on "${sheetName}"…`, 99, "running");
-    reapplyCreatorListPipelineAndDealStageValidation_(ss, null, sheet);
+    // Narrow each Deal Stage dropdown to match the Pipeline the script just filled in
+    // (setValue bypasses onEdit, so the dropdown wouldn't update on its own).
+    setScriptActionProgress_(`Updating Deal Stage dropdowns on "${sheetName}"…`, 99, "running");
+    reapplyCreatorListDealStageValidation_(ss, null, sheet);
 
     const summary =
       `Enrichment of "${sheetName}" complete. Rows: ${totalRows}. Static: ${totalStatic}. ` +
       `YouTube: ${totalYoutube}. AI: ${totalProfile}. ` +
-      `Import Fallback: ${totalImportFallback}.`;
+      `Import Fallback: ${totalImportFallback}. ` +
+      `Skipped already enriched: ${alreadyEnrichedSnapshot.rowCount}.`;
     setScriptActionProgress_(summary, 100, "done");
     showSpreadsheetToast_(summary);
     Logger.log(`✅ ${summary}`);
@@ -474,19 +514,19 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!detected) {
       throw new Error(
         `Could not determine what "${sheetName}" imports. ` +
-        "Expected a copy of the Deal Import, Campaign Import, or Client Import template."
+        "Expected a copy of the Deal Import, History Import, Campaign Import, or Client Import template."
       );
     }
 
     setScriptActionProgress_(`"${sheetName}" detected as a ${detected.spec.label} import…`, 5, "running");
 
-    if (detected.spec.key === "deal") {
-      return runDealImportForSheet_(ss, sheet, sheetName);
+    if (isDealStyleHubSpotImportSpec_(detected.spec)) {
+      return runDealImportForSheet_(ss, sheet, sheetName, detected.spec);
     }
     return runSimpleObjectImportForSheet_(ss, sheetName, detected, data);
   }
 
-  function runDealImportForSheet_(ss, sheet, sheetName) {
+  function runDealImportForSheet_(ss, sheet, sheetName, importSpec) {
     const context = getCreatorListSheetContext_(sheet);
     if (!context) return finishActionWithInfo_(`"${sheetName}" has no data.`);
 
@@ -524,7 +564,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       );
     }
 
-    return importCreatorListToHubSpot_(ss, sheet, header, preparedRows.rowItems, preparedRows, sheetName);
+    return importCreatorListToHubSpot_(ss, sheet, header, preparedRows.rowItems, preparedRows, sheetName, importSpec);
   }
 
   // Import flow for Campaign Import / Client Import copies: one HubSpot
@@ -686,6 +726,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     {
       key: "deal",
       label: "Deals",
+      importFlow: "deal",
       signatureColumns: [
         "HubSpot Record ID",
         "Deal Name",
@@ -693,6 +734,27 @@ const INT_HUBSPOT_MENU_ = (function () {
         CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
         "Deal Stage",
         "Influencer Vertical"
+      ]
+    },
+    {
+      key: HUBSPOT_HISTORY_IMPORT_KEY_,
+      label: "History Import",
+      importFlow: "deal",
+      signatureColumns: [
+        "HubSpot Record ID",
+        "Deal name",
+        CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_,
+        "EXT Amount",
+        "Contract",
+        "Script URL",
+        "Preview URL",
+        "Activation URL",
+        "Publication Date",
+        "Pitching Status",
+        "Contract Signed",
+        "Script Approved",
+        "Preview Approved",
+        "Published"
       ]
     },
     {
@@ -727,6 +789,14 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
   ];
   const HUBSPOT_IMPORT_KIND_MIN_SIGNATURE_SCORE_ = 2;
+
+  function isDealStyleHubSpotImportSpec_(spec) {
+    return !!(spec && (spec.key === "deal" || spec.importFlow === "deal"));
+  }
+
+  function isHistoryHubSpotImportSpec_(spec) {
+    return !!(spec && spec.key === HUBSPOT_HISTORY_IMPORT_KEY_);
+  }
 
   // Returns { spec, score, headerRow0, header } for the best-matching import
   // kind, or null when no kind matches confidently.
@@ -932,20 +1002,20 @@ const INT_HUBSPOT_MENU_ = (function () {
     return knownLabels.has(text);
   }
 
-  function runCreatorListEnrichment_(sheet, rowItems, header) {
+  function runCreatorListEnrichment_(sheet, rowItems, header, importSpec) {
     const dropdownValuesByHeader = getDropdownValuesByHeader_(sheet.getParent(), "Dropdown Values");
     const clientNameByCampaignName = getClientNameByCampaignName_(sheet.getParent(), "Dropdown Values");
 
     const staticUpdates = [];
     for (const item of rowItems) {
-      const rowChanges = enrichCreatorRow_(item.values, header, clientNameByCampaignName);
+      const rowChanges = enrichCreatorRow_(item.values, header, clientNameByCampaignName, importSpec);
       if (rowChanges.length === 0) continue;
       staticUpdates.push.apply(staticUpdates, trackedRowChangesToSheetUpdates_(item, rowChanges));
     }
 
     const staticWrite = writeSparseCellUpdates_(sheet, header, staticUpdates, "Static enrichment");
 
-    const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header);
+    const youtubeEnriched = enrichYouTubeDataForRows_(sheet, rowItems, header, importSpec);
     const profileEnriched = enrichProfileFieldsViaLlm_(sheet, rowItems, header, dropdownValuesByHeader);
     const importFallbackEnriched = applyCreatorContactNameFallback_(sheet, rowItems, header, "Import fallback enrichment");
 
@@ -1033,7 +1103,34 @@ const INT_HUBSPOT_MENU_ = (function () {
     return candidateFields.some(field => String(getValueByHeader_(row, header, field) || "").trim());
   }
 
-  function collectCreatorListEnrichmentBatch_(data, header, startRow1, stopRow1) {
+  function buildAlreadyEnrichedCreatorSnapshot_(data, header, startRow1, stopRow1) {
+    const channelNameCol = findHeaderIndex_(header, "Channel Name");
+    const row1Set = {};
+    let rowCount = 0;
+
+    if (channelNameCol === -1) {
+      return {
+        row1Set: row1Set,
+        rowCount: rowCount
+      };
+    }
+
+    for (let row1 = Math.max(Number(startRow1) || 1, 1); row1 <= stopRow1; row1++) {
+      const row = data[row1 - 1];
+      if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+      if (!String(row[channelNameCol] || "").trim()) continue;
+
+      row1Set[row1] = true;
+      rowCount++;
+    }
+
+    return {
+      row1Set: row1Set,
+      rowCount: rowCount
+    };
+  }
+
+  function collectCreatorListEnrichmentBatch_(data, header, startRow1, stopRow1, alreadyEnrichedRow1Set) {
     const rowItems = [];
     let lastScannedRow1 = Math.max(Number(startRow1) || 1, 1) - 1;
 
@@ -1041,6 +1138,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       lastScannedRow1 = row1;
       const row = data[row1 - 1];
       if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+      if (alreadyEnrichedRow1Set && alreadyEnrichedRow1Set[row1]) continue;
       if (!canAttemptCreatorListEnrichment_(row, header)) continue;
 
       rowItems.push({ row1: row1, values: row.slice() });
@@ -1053,7 +1151,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
-  function enrichCreatorRow_(row, header, clientNameByCampaignName) {
+  function enrichCreatorRow_(row, header, clientNameByCampaignName, importSpec) {
     const idx = name => findHeaderIndex_(header, name);
     const get = name => { const i = idx(name); return i === -1 ? "" : String(row[i] || "").trim(); };
     const changeMap = {};
@@ -1078,7 +1176,18 @@ const INT_HUBSPOT_MENU_ = (function () {
     setIfEmpty(idx("Client name") !== -1 ? "Client name" : "Client", clientName);
 
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, platformIdentity);
-    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec);
+
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      set("Pipeline", "Campaign Management Pipeline");
+      set("Deal stage", "Published");
+      set("Pitching Status", "Approved");
+      set("Script Approved", "Yes");
+      set("Preview Approved", "Yes");
+      set("Published", "Yes");
+      if (get("Contract")) set("Contract Signed", "Yes");
+      return trackedChangeMapToRowChanges_(changeMap);
+    }
 
     // Pipeline: always Sales Pipeline
     set("Pipeline", "Sales Pipeline");
@@ -1110,7 +1219,8 @@ const INT_HUBSPOT_MENU_ = (function () {
     const identityByKey = {};
 
     identities.forEach(function (identity) {
-      if (!identity || !identity.key || identityByKey[identity.key]) return;
+      if (!identity || !identity.key) return;
+      if (identityByKey[identity.key] && identityByKey[identity.key].handle) return;
       identityByKey[identity.key] = identity;
     });
 
@@ -1122,9 +1232,17 @@ const INT_HUBSPOT_MENU_ = (function () {
         setIfEmpty_(row, header, spec.handleHeader, identity.handle, changeMap);
       }
       if (identity.canonicalUrl && (identity.handle || identity.key === "youtube")) {
-        setIfEmpty_(row, header, spec.urlHeader, identity.canonicalUrl, changeMap);
+        setTrackedValueByHeader_(row, header, spec.urlHeader, identity.canonicalUrl, changeMap);
       }
     });
+
+    const primaryIdentity = identities.length > 0 ? identities[0] : null;
+    const primaryCanonicalIdentity = primaryIdentity && primaryIdentity.key
+      ? (primaryIdentity.handle ? primaryIdentity : identityByKey[primaryIdentity.key])
+      : null;
+    if (primaryCanonicalIdentity && primaryCanonicalIdentity.canonicalUrl && primaryCanonicalIdentity.handle) {
+      setTrackedValueByHeader_(row, header, "Channel URL", primaryCanonicalIdentity.canonicalUrl, changeMap);
+    }
 
     const preferredHandle = getPreferredCreatorHandleForRow_(row, header, identities.length > 0 ? identities[0] : null);
     if (preferredHandle) {
@@ -1184,13 +1302,33 @@ const INT_HUBSPOT_MENU_ = (function () {
     return String(getValueByHeader_(row, header, "Channel Name") || "").trim();
   }
 
-  function applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap) {
+  function applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec) {
     const label = String(creatorLabel || "").trim();
     const campaign = String(campaignName || "").trim();
+
+    let changed = false;
+
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      let dealName = "";
+      if (label && campaign) {
+        dealName = label + " - " + campaign;
+        changed = setTrackedValueByHeader_(row, header, "Deal name", dealName, changeMap) || changed;
+      } else {
+        dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
+      }
+
+      if (dealName) {
+        const activationType = String(getValueByHeader_(row, header, "Activation Type") || "").trim();
+        const activationName = activationType ? dealName + " - " + activationType : dealName;
+        changed = setTrackedValueByHeader_(row, header, "Activation Name", activationName, changeMap) || changed;
+      }
+
+      return changed;
+    }
+
     if (!label || !campaign) return false;
 
     const name = label + " - " + campaign;
-    let changed = false;
     changed = setTrackedValueByHeader_(row, header, "Deal name", name, changeMap) || changed;
     changed = setTrackedValueByHeader_(row, header, "Activation name", name, changeMap) || changed;
     return changed;
@@ -1375,7 +1513,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!normalizedHandle) return "";
 
     const pathHandle = normalizedHandle.replace(/^@/, "");
-    if (platformKey === "youtube") return "https://www.youtube.com/@" + pathHandle;
+    if (platformKey === "youtube") return "https://youtube.com/@" + pathHandle;
     if (platformKey === "instagram") return "https://www.instagram.com/" + pathHandle + "/";
     if (platformKey === "tiktok") return "https://www.tiktok.com/@" + pathHandle;
     if (platformKey === "twitch") return "https://www.twitch.tv/" + pathHandle;
@@ -1416,7 +1554,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return /(^|\.)x\.com$|(^|\.)twitter\.com$/i.test(String(host || ""));
   }
 
-  function enrichYouTubeDataForRows_(sheet, rowItems, header) {
+  function enrichYouTubeDataForRows_(sheet, rowItems, header, importSpec) {
     const apiKey = getYouTubeApiKey_();
     if (!apiKey) {
       Logger.log("ℹ️ YouTube API key not set (script property YOUTUBE_API_KEY). Skipping YouTube enrichment.");
@@ -1426,10 +1564,10 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const updates = [];
     for (const item of rowItems) {
-      if (!shouldRunYouTubeEnrichmentForRow_(item.values, header)) continue;
+      if (!shouldRunYouTubeEnrichmentForRow_(item.values, header, importSpec)) continue;
 
       try {
-        const result = enrichSingleYouTubeRow_(item, header, apiKey);
+        const result = enrichSingleYouTubeRow_(item, header, apiKey, importSpec);
         if (result.updates.length === 0) continue;
         updates.push.apply(updates, trackedRowChangesToSheetUpdates_(item, result.updates));
       } catch (e) {
@@ -1441,7 +1579,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return writeResult.writtenRowCount;
   }
 
-  function shouldRunYouTubeEnrichmentForRow_(row, header) {
+  function shouldRunYouTubeEnrichmentForRow_(row, header, importSpec) {
     const channelUrlIdentity = parseCreatorPlatformUrl_(getValueByHeader_(row, header, "Channel URL"));
     const hasExplicitYouTubeInput = hasExplicitYouTubeInputForRow_(row, header);
     const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
@@ -1463,6 +1601,12 @@ const INT_HUBSPOT_MENU_ = (function () {
     const dealName = String(getValueByHeader_(row, header, "Deal name") || "").trim();
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, channelUrlIdentity);
     if (creatorLabel && campaignName && dealName !== (creatorLabel + " - " + campaignName)) return true;
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      const activationType = String(getValueByHeader_(row, header, "Activation Type") || "").trim();
+      const expectedActivationName = activationType ? dealName + " - " + activationType : dealName;
+      const activationName = String(getValueByHeader_(row, header, "Activation Name") || "").trim();
+      if (expectedActivationName && activationName !== expectedActivationName) return true;
+    }
 
     return false;
   }
@@ -1477,7 +1621,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return !!normalizeCreatorPlatformHandle_("youtube", getValueByHeader_(row, header, "YouTube Handle"));
   }
 
-  function enrichSingleYouTubeRow_(item, header, apiKey) {
+  function enrichSingleYouTubeRow_(item, header, apiKey, importSpec) {
     const row = item.values;
     const channelUrl = resolveCreatorYouTubeInputFromRow_(row, header);
     const channelName = String(getValueByHeader_(row, header, "Channel Name") || "").trim();
@@ -1495,7 +1639,10 @@ const INT_HUBSPOT_MENU_ = (function () {
       setIfEmpty_(row, header, "YouTube Followers", insight.subscribers, changeMap);
     }
     if (insight.handle) setIfEmpty_(row, header, "YouTube Handle", insight.handle, changeMap);
-    if (insight.canonicalUrl) setIfEmpty_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+    if (insight.canonicalUrl) {
+      setTrackedValueByHeader_(row, header, "YouTube URL", insight.canonicalUrl, changeMap);
+      if (insight.handle) setTrackedValueByHeader_(row, header, "Channel URL", insight.canonicalUrl, changeMap);
+    }
     const preferredHandle = getPreferredCreatorHandleForRow_(row, header, null) || String(insight.handle || "").trim();
     if (preferredHandle) {
       setIfEmpty_(row, header, "Channel Name", preferredHandle, changeMap);
@@ -1514,7 +1661,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const campaignName = String(getValueByHeader_(row, header, "Campaign Name") || "").trim();
     const creatorLabel = getPreferredCreatorLabelForRow_(row, header, null) || String(insight.handle || "").trim();
-    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap);
+    applyCreatorCampaignNames_(row, header, creatorLabel, campaignName, changeMap, importSpec);
 
     return {
       insight: insight,
@@ -1558,12 +1705,15 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!handle && /\/@/i.test(String(resolved.canonicalUrl || ""))) {
       handle = normalizeYouTubeHandle_(resolved.canonicalUrl);
     }
+    const canonicalUrl = handle
+      ? buildCreatorPlatformCanonicalUrl_("youtube", handle)
+      : (resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl));
 
     const insight = {
       channelId: resolved.channelId,
       channelName: String(snippet.title || channelName || "").trim(),
       handle: handle,
-      canonicalUrl: resolved.canonicalUrl || buildCanonicalYouTubeUrl_(resolved.channelId, snippet.customUrl),
+      canonicalUrl: canonicalUrl,
       description: String(snippet.description || branding.description || "").trim(),
       countryCode: String(snippet.country || branding.country || "").trim(),
       subscribers: Number(statistics.subscriberCount || 0),
@@ -1673,6 +1823,13 @@ const INT_HUBSPOT_MENU_ = (function () {
     const out = Object.assign({}, insight);
     out.sampledTitles = uniqueNonEmptyStrings_(out.sampledTitles || []);
     out.sampledVideoDescriptions = uniqueNonEmptyStrings_(out.sampledVideoDescriptions || []);
+    out.handle = normalizeCreatorPlatformHandle_("youtube", out.handle);
+    if (!out.handle && /\/@/i.test(String(out.canonicalUrl || ""))) {
+      out.handle = normalizeCreatorPlatformHandle_("youtube", out.canonicalUrl);
+    }
+    if (out.handle) {
+      out.canonicalUrl = buildCreatorPlatformCanonicalUrl_("youtube", out.handle);
+    }
     out.bioEmails = extractExplicitEmailsFromText_(out.description || "");
     out.videoDescriptionEmails = extractExplicitEmailsFromTextList_(out.sampledVideoDescriptions || []);
 
@@ -1923,7 +2080,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       if (handleChannelId) {
         return {
           channelId: handleChannelId,
-          canonicalUrl: "https://www.youtube.com/" + normalizeYouTubeHandle_(raw)
+          canonicalUrl: buildCreatorPlatformCanonicalUrl_("youtube", raw)
         };
       }
     }
@@ -2016,7 +2173,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
   function buildCanonicalYouTubeUrl_(channelId, customUrl) {
     const handle = normalizeYouTubeHandle_(customUrl);
-    if (handle) return "https://www.youtube.com/" + handle;
+    if (handle) return buildCreatorPlatformCanonicalUrl_("youtube", handle);
     return channelId ? "https://www.youtube.com/channel/" + channelId : "";
   }
 
@@ -3015,10 +3172,10 @@ const INT_HUBSPOT_MENU_ = (function () {
     return getCreatorYouTubeInsight_(channelUrl, channelName, apiKey, options);
   }
 
-  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName) {
+  function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName, importSpec) {
     // Validate every deal row against HubSpot's live pipeline configuration before
-    // building or sending any import payload. The dropdowns intentionally expose
-    // all stages, so correctness is enforced here instead of in the sheet UI.
+    // building or sending any import payload. This prevents HubSpot from silently
+    // rejecting rows whose Pipeline / Deal Stage combination does not exist.
     setScriptActionProgress_(
       `Validating Pipeline / Deal Stage pairs for ${rowItems.length} row(s)…`,
       8,
@@ -3039,7 +3196,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       throw new Error("Validation failed:\n" + validationIssues.join("\n"));
     }
 
-    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName());
+    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName(), importSpec);
     if (payloads.length === 0) {
       throw new Error("No importable HubSpot columns found.");
     }
@@ -3098,11 +3255,12 @@ const INT_HUBSPOT_MENU_ = (function () {
   // are prefixed with the object alias so the shared importer routes every
   // column to that object instead of guessing by generic header hints.
   function buildSimpleHubSpotImportPayload_(ss, header, rowItems, spec, sheetName) {
+    const spreadsheetLocale = ss.getSpreadsheetLocale();
     const activeColIndexes = [];
     header.forEach((h, idx) => {
       if (!h) return;
       const hasValue = rowItems.some(item =>
-        String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
+        String(formatHubSpotImportCellValue_(h, item.values[idx], spreadsheetLocale) || "").trim() !== ""
       );
       if (!hasValue) return;
       activeColIndexes.push(idx);
@@ -3121,14 +3279,14 @@ const INT_HUBSPOT_MENU_ = (function () {
       return alias ? alias + " " + header[i] : header[i];
     });
     const activeRows = rowItems.map(item =>
-      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
+      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i], spreadsheetLocale))
     );
     const safeSpreadsheetName = toAsciiSafeHubSpotImportName_(ss.getName(), "HubSpot Import");
 
     return {
       sheetName: toAsciiSafeHubSpotImportName_(sheetName, spec.label),
       spreadsheetName: safeSpreadsheetName + " - " + spec.label,
-      spreadsheetLocale: ss.getSpreadsheetLocale(),
+      spreadsheetLocale: spreadsheetLocale,
       headers: activeHeaders,
       rows: activeRows,
       sourceRowNumbers: rowItems.map(item => item.row1),
@@ -3359,9 +3517,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     (pipelines || []).forEach(function (pipeline) {
       if (!pipeline || pipeline.archived === true) return;
 
-      const pipelineLabel = String(pipeline.label || pipeline.id || "").trim();
       const entry = {
-        label: pipelineLabel,
         stageKeys: {},
         stageLabels: []
       };
@@ -3413,9 +3569,9 @@ const INT_HUBSPOT_MENU_ = (function () {
     return errors.join("\n\n");
   }
 
-  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName) {
+  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName, importSpec) {
     if (emailCol === -1) {
-      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "", sheetName);
+      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "", sheetName, importSpec);
       return payload ? [payload] : [];
     }
 
@@ -3435,7 +3591,8 @@ const INT_HUBSPOT_MENU_ = (function () {
         rowsWithEmail,
         null,
         shouldLabelPayloads ? "with email" : "",
-        sheetName
+        sheetName,
+        importSpec
       );
       if (payload) payloads.push(payload);
     }
@@ -3447,7 +3604,8 @@ const INT_HUBSPOT_MENU_ = (function () {
         rowsWithoutEmail,
         new Set([emailCol]),
         shouldLabelPayloads ? "without email" : "",
-        sheetName
+        sheetName,
+        importSpec
       );
       if (payload) payloads.push(payload);
     }
@@ -3509,14 +3667,15 @@ const INT_HUBSPOT_MENU_ = (function () {
     return text || String(fallback || "HubSpot Import");
   }
 
-  function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel, sheetName) {
+  function buildHubSpotImportPayload_(ss, header, rowItems, excludedColIndexes, importLabel, sheetName, importSpec) {
+    const spreadsheetLocale = ss.getSpreadsheetLocale();
     const activeColIndexes = [];
     header.forEach((h, idx) => {
       if (!h) return;
       if (excludedColIndexes && excludedColIndexes.has(idx)) return;
-      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h)) return;
+      if (shouldExcludeCreatorListColumnFromHubSpotImport_(h, importSpec)) return;
       const hasValue = rowItems.some(item =>
-        String(formatHubSpotImportCellValue_(h, item.values[idx]) || "").trim() !== ""
+        String(formatHubSpotImportCellValue_(h, item.values[idx], spreadsheetLocale) || "").trim() !== ""
       );
       if (!hasValue) return;
       activeColIndexes.push(idx);
@@ -3524,9 +3683,9 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     if (activeColIndexes.length === 0 || rowItems.length === 0) return null;
 
-    const activeHeaders = activeColIndexes.map(i => header[i]);
+    const activeHeaders = activeColIndexes.map(i => resolveHubSpotImportHeaderName_(header[i], importSpec));
     const activeRows = rowItems.map(item =>
-      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i]))
+      activeColIndexes.map(i => formatHubSpotImportCellValue_(header[i], item.values[i], spreadsheetLocale))
     );
     const safeSpreadsheetName = toAsciiSafeHubSpotImportName_(ss.getName(), "HubSpot Import");
     const label = String(importLabel || "").trim();
@@ -3534,7 +3693,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     return {
       sheetName: toAsciiSafeHubSpotImportName_(sheetName, "Creator List"),
       spreadsheetName: label ? safeSpreadsheetName + " - " + label : safeSpreadsheetName,
-      spreadsheetLocale: ss.getSpreadsheetLocale(),
+      spreadsheetLocale: spreadsheetLocale,
       headers: activeHeaders,
       rows: activeRows,
       sourceRowNumbers: rowItems.map(item => item.row1),
@@ -3733,13 +3892,34 @@ const INT_HUBSPOT_MENU_ = (function () {
     dealRecordIds.forEach(item => out.push(item));
   }
 
-  function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName) {
+  function shouldExcludeCreatorListColumnFromHubSpotImport_(headerName, importSpec) {
     const text = String(headerName || "").trim();
     if (!text) return true;
+    const normalized = normalizeHeaderName_(text);
+    if (
+      isHistoryHubSpotImportSpec_(importSpec) &&
+      HUBSPOT_HISTORY_IMPORT_INCLUDED_EXCLUDED_COL_KEYS_.has(normalized)
+    ) {
+      return false;
+    }
+
     if (HUBSPOT_IMPORT_EXCLUDED_COLS_.has(text)) return true;
+    return normalized === "activationtype" || normalized === "activationname";
+  }
+
+  function resolveHubSpotImportHeaderName_(headerName, importSpec) {
+    const text = String(headerName || "").trim();
+    if (!text || !isHistoryHubSpotImportSpec_(importSpec)) return text;
 
     const normalized = normalizeHeaderName_(text);
-    return normalized === "activationtype" || normalized === "activationname";
+    const columnNames = Object.keys(HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_);
+    for (let i = 0; i < columnNames.length; i++) {
+      if (normalizeHeaderName_(columnNames[i]) === normalized) {
+        return HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_[columnNames[i]] + " " + text;
+      }
+    }
+
+    return text;
   }
 
   function saveImportedCreatorListDealMarkers_(sheet, header, dealRecordIds) {
@@ -3786,15 +3966,112 @@ const INT_HUBSPOT_MENU_ = (function () {
     };
   }
 
-  function formatHubSpotImportCellValue_(headerName, value) {
+  function formatHubSpotImportCellValue_(headerName, value, spreadsheetLocale) {
     const text = String(value == null ? "" : value).trim();
     if (!text) return "";
+
+    if (isHubSpotImportDateColumn_(headerName)) {
+      return formatHubSpotImportDateCellValue_(value, spreadsheetLocale);
+    }
 
     if (!HUBSPOT_IMPORT_MULTISELECT_COLS_.has(normalizeHeaderName_(headerName))) {
       return text;
     }
 
     return normalizeHubSpotMultiselectImportValue_(text);
+  }
+
+  function isHubSpotImportDateColumn_(headerName) {
+    return normalizeHeaderName_(headerName) === "publicationdate";
+  }
+
+  function formatHubSpotImportDateCellValue_(value, spreadsheetLocale) {
+    const text = String(value == null ? "" : value).trim();
+    const date = parseHubSpotImportDateCellValue_(value, spreadsheetLocale);
+    if (!date) return text;
+
+    const importDateFormat = getHubSpotImportDateFormatForLocale_(spreadsheetLocale);
+    const pattern = importDateFormat === "MONTH_DAY_YEAR"
+      ? "MM/dd/yyyy"
+      : (importDateFormat === "YEAR_MONTH_DAY" ? "yyyy/MM/dd" : "dd/MM/yyyy");
+
+    return Utilities.formatDate(date, Session.getScriptTimeZone(), pattern);
+  }
+
+  function getHubSpotImportDateFormatForLocale_(spreadsheetLocale) {
+    const locale = String(spreadsheetLocale || "").replace("-", "_").toLowerCase();
+    if (locale === "en_us") return "MONTH_DAY_YEAR";
+    if (/^(ja|ko|zh)(_|$)/.test(locale)) return "YEAR_MONTH_DAY";
+    return "DAY_MONTH_YEAR";
+  }
+
+  function parseHubSpotImportDateCellValue_(value, spreadsheetLocale) {
+    if (
+      Object.prototype.toString.call(value) === "[object Date]" ||
+      (typeof value === "number" && isFinite(value))
+    ) {
+      return parseSpreadsheetDateValue_(value);
+    }
+
+    const text = String(value == null ? "" : value).trim();
+    if (!text) return null;
+
+    if (/^-?\d+(\.\d+)?$/.test(text)) {
+      return parseSpreadsheetDateValue_(Number(text));
+    }
+
+    const ymdMatch = text.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+    if (ymdMatch) {
+      return buildValidDateOnly_(
+        Number(ymdMatch[1]),
+        Number(ymdMatch[2]),
+        Number(ymdMatch[3])
+      );
+    }
+
+    const dmyOrMdyMatch = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})$/);
+    if (dmyOrMdyMatch) {
+      const first = Number(dmyOrMdyMatch[1]);
+      const second = Number(dmyOrMdyMatch[2]);
+      const year = normalizeTwoDigitYear_(Number(dmyOrMdyMatch[3]));
+      if (getHubSpotImportDateFormatForLocale_(spreadsheetLocale) === "MONTH_DAY_YEAR") {
+        return buildValidDateOnly_(year, first, second) || buildValidDateOnly_(year, second, first);
+      }
+      return buildValidDateOnly_(year, second, first) || buildValidDateOnly_(year, first, second);
+    }
+
+    return parseSpreadsheetDateValue_(text);
+  }
+
+  function normalizeTwoDigitYear_(year) {
+    if (!isFinite(year)) return year;
+    return year < 100 ? 2000 + year : year;
+  }
+
+  function buildValidDateOnly_(year, month, day) {
+    if (
+      !isFinite(year) ||
+      !isFinite(month) ||
+      !isFinite(day) ||
+      year < 1900 ||
+      month < 1 ||
+      month > 12 ||
+      day < 1 ||
+      day > 31
+    ) {
+      return null;
+    }
+
+    const date = new Date(year, month - 1, day);
+    if (
+      date.getFullYear() !== year ||
+      date.getMonth() !== month - 1 ||
+      date.getDate() !== day
+    ) {
+      return null;
+    }
+
+    return date;
   }
 
   function normalizeHubSpotMultiselectImportValue_(value) {
@@ -3978,7 +4255,7 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     const campaignClientRows = fetchHubSpotDropdownCampaignClientRows_(token);
     const valuesByColumnName = {};
-    valuesByColumnName[config.columns.clientName] = getDistinctHubSpotDropdownCampaignClientNames_(campaignClientRows);
+    valuesByColumnName[config.columns.clientName] = fetchHubSpotDropdownClientNames_(token);
     valuesByColumnName[config.columns.client] = campaignClientRows.map(function (row) {
       return row.clientName;
     });
@@ -3995,7 +4272,9 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     writeHubSpotDropdownValues_(sheet, valuesByColumnName);
 
-    reapplyCreatorListPipelineAndDealStageValidation_(spreadsheet, valuesByColumnName);
+    const pipelineStageMap = fetchHubSpotDealPipelineStageMap_(token);
+    persistHubSpotPipelineStageMap_(pipelineStageMap);
+    reapplyCreatorListDealStageValidation_(spreadsheet, pipelineStageMap);
 
     return buildHubSpotDropdownSyncResult_(valuesByColumnName);
   }
@@ -4004,6 +4283,34 @@ const INT_HUBSPOT_MENU_ = (function () {
     return String(
       PropertiesService.getScriptProperties().getProperty(HUBSPOT_API_KEY_PROP_) || ""
     ).trim();
+  }
+
+  function persistHubSpotPipelineStageMap_(map) {
+    const payload = JSON.stringify({ v: 1, map: map || {} });
+    if (payload.length > 9000) {
+      Logger.log(
+        "Pipeline→stage map too large to persist (" + payload.length + " chars); skipping."
+      );
+      return false;
+    }
+    PropertiesService.getDocumentProperties().setProperty(
+      HUBSPOT_PIPELINE_STAGE_MAP_PROP_,
+      payload
+    );
+    return true;
+  }
+
+  function readHubSpotPipelineStageMap_() {
+    try {
+      const raw = PropertiesService.getDocumentProperties().getProperty(
+        HUBSPOT_PIPELINE_STAGE_MAP_PROP_
+      );
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && parsed.map && typeof parsed.map === "object" ? parsed.map : null;
+    } catch (e) {
+      return null;
+    }
   }
 
   function fetchHubSpotDropdownDealOwnerNames_(token) {
@@ -4117,6 +4424,28 @@ const INT_HUBSPOT_MENU_ = (function () {
       });
     });
     return normalizeHubSpotDropdownValues_(names);
+  }
+
+  function fetchHubSpotDropdownClientNames_(token) {
+    const clientConfig = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_.client;
+    const clientObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, clientConfig);
+    const clientPropertyName = resolveHubSpotDropdownPropertyName_(
+      clientObjectTypeId,
+      clientConfig && clientConfig.propertyName,
+      token
+    );
+    const records = fetchHubSpotCrmObjectRecords_(
+      clientObjectTypeId,
+      [clientPropertyName],
+      token
+    );
+
+    return normalizeHubSpotDropdownValues_(
+      records.map(function (record) {
+        const properties = record && record.properties ? record.properties : {};
+        return properties[clientPropertyName];
+      })
+    );
   }
 
   function fetchHubSpotDropdownCurrencyCodes_(token) {
@@ -4246,6 +4575,21 @@ const INT_HUBSPOT_MENU_ = (function () {
     return pipelines.filter(function (pipeline) {
       return !(pipeline && pipeline.archived === true);
     });
+  }
+
+  function fetchHubSpotDealPipelineStageMap_(token) {
+    const map = {};
+    fetchHubSpotDealPipelines_(token).forEach(function (pipeline) {
+      const label = String(pipeline && pipeline.label || "").trim();
+      if (!label) return;
+      const stages = Array.isArray(pipeline && pipeline.stages) ? pipeline.stages : [];
+      map[label] = uniqueHubSpotDropdownValues_(
+        stages
+          .filter(function (stage) { return !(stage && stage.archived === true); })
+          .map(function (stage) { return String(stage && stage.label || "").trim(); })
+      );
+    });
+    return map;
   }
 
   function resolveHubSpotDropdownObjectTypeId_(token, objectConfig) {
@@ -4480,78 +4824,84 @@ const INT_HUBSPOT_MENU_ = (function () {
     });
   }
 
-  function buildFullDropdownValidationRule_(values) {
-    const options = normalizeHubSpotDropdownValues_(values);
-    if (options.length === 0) return null;
+  function buildFullStageList_(map) {
+    const all = [];
+    Object.keys(map || {}).forEach(function (key) {
+      (map[key] || []).forEach(function (stage) { all.push(stage); });
+    });
+    return uniqueHubSpotDropdownValues_(all);
+  }
 
+  function listContainsLabel_(list, value) {
+    const key = normalizeDropdownLookupValue_(value);
+    if (!key) return false;
+    return (list || []).some(function (item) {
+      return normalizeDropdownLookupValue_(item) === key;
+    });
+  }
+
+  function buildDealStageValidationRule_(stages) {
     return SpreadsheetApp.newDataValidation()
-      .requireValueInList(options, true)
+      .requireValueInList(stages, true)
       .setAllowInvalid(false)
       .build();
   }
 
-  function getFullDropdownValuesForColumn_(ss, valuesByColumnName, columnName) {
-    if (valuesByColumnName && Array.isArray(valuesByColumnName[columnName])) {
-      return valuesByColumnName[columnName];
-    }
-
-    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
-    const valuesByHeader = getDropdownValuesByHeader_(ss, config.sheetName);
-    return valuesByHeader[columnName] || [];
-  }
-
-  // Keep visible Pipeline and Deal Stage dropdowns on the full HubSpot option
-  // lists. Deal Stage is intentionally not restricted by the selected Pipeline.
-  function reapplyCreatorListPipelineAndDealStageValidation_(
-    ss,
-    valuesByColumnName,
-    targetSheet,
-    startRow1Arg,
-    endRow1Arg
-  ) {
+  // Retrofit every existing Creator List row: restrict its Deal Stage dropdown to
+  // the stages of its current Pipeline and clear any value that no longer matches.
+  function reapplyCreatorListDealStageValidation_(ss, mapArg, targetSheet) {
     const spreadsheet = ss || SpreadsheetApp.getActiveSpreadsheet();
     const sheet = targetSheet || (spreadsheet && spreadsheet.getSheetByName("Creator List"));
-    if (!spreadsheet || !sheet) return { processed: 0, updatedColumns: 0 };
+    if (!sheet) return { processed: 0, cleared: 0 };
+
+    const map = mapArg || readHubSpotPipelineStageMap_();
+    if (!map) return { processed: 0, cleared: 0 };
 
     const lastRow = sheet.getLastRow();
-    if (lastRow < 2) return { processed: 0, updatedColumns: 0 };
+    if (lastRow < 2) return { processed: 0, cleared: 0 };
 
     const header = sheet
       .getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1))
       .getDisplayValues()[0];
-    const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
-    const columnNames = [config.columns.pipeline, config.columns.dealStage];
-    const startRow1 = Math.max(2, Number(startRow1Arg) || 2);
-    const endRow1 = Math.min(lastRow, Number(endRow1Arg) || lastRow);
-    if (endRow1 < startRow1) return { processed: 0, updatedColumns: 0 };
+    const pipelineCol0 = findHeaderIndex_(header, "Pipeline");
+    const dealStageCol0 = findHeaderIndex_(header, "Deal Stage");
+    if (pipelineCol0 === -1 || dealStageCol0 === -1) return { processed: 0, cleared: 0 };
 
-    const rowCount = endRow1 - startRow1 + 1;
-    let updatedColumns = 0;
+    const rowCount = lastRow - 1;
+    const stageRange = sheet.getRange(2, dealStageCol0 + 1, rowCount, 1);
+    const pipelineValues = sheet.getRange(2, pipelineCol0 + 1, rowCount, 1).getDisplayValues();
+    const stageValues = stageRange.getDisplayValues();
+    const fullStages = buildFullStageList_(map);
 
-    columnNames.forEach(function (columnName) {
-      const col0 = findHeaderIndex_(header, columnName);
-      if (col0 === -1) return;
+    const rules = new Array(rowCount);
+    const nextStageValues = new Array(rowCount);
+    let cleared = 0;
 
-      const rule = buildFullDropdownValidationRule_(
-        getFullDropdownValuesForColumn_(spreadsheet, valuesByColumnName, columnName)
-      );
-      if (!rule) return;
+    for (let i = 0; i < rowCount; i++) {
+      const pipeline = String((pipelineValues[i] && pipelineValues[i][0]) || "").trim();
+      const currentStage = String((stageValues[i] && stageValues[i][0]) || "").trim();
+      nextStageValues[i] = [currentStage];
 
-      sheet.getRange(startRow1, col0 + 1, rowCount, 1).setDataValidation(rule);
-      updatedColumns++;
-    });
+      const hasPipeline = !!pipeline && Object.prototype.hasOwnProperty.call(map, pipeline);
+      const stages = hasPipeline ? map[pipeline] : fullStages;
+      rules[i] = [buildDealStageValidationRule_(stages.length ? stages : fullStages)];
 
-    return { processed: rowCount, updatedColumns: updatedColumns };
+      if (hasPipeline && stages.length && currentStage && !listContainsLabel_(stages, currentStage)) {
+        nextStageValues[i] = [""];
+        cleared++;
+      }
+    }
+
+    stageRange.setDataValidations(rules);
+    if (cleared > 0) {
+      stageRange.setValues(nextStageValues);
+    }
+
+    return { processed: rowCount, cleared: cleared };
   }
 
-  // Legacy name kept for any existing trigger/library references. It now applies
-  // the full Pipeline and Deal Stage lists instead of narrowing Deal Stage.
-  function reapplyCreatorListDealStageValidation_(ss, unusedMapArg, targetSheet) {
-    return reapplyCreatorListPipelineAndDealStageValidation_(ss, null, targetSheet);
-  }
-
-  // Repair stale row-level dropdown validation after edits without changing any
-  // existing cell values. Both columns always keep their full HubSpot option list.
+  // Simple onEdit handler: when a row's Pipeline changes, restrict that row's Deal
+  // Stage dropdown to the pipeline's stages and clear a now-invalid stage value.
   function handleCreatorListEdit_(e) {
     try {
       if (!e || !e.range) return;
@@ -4565,24 +4915,70 @@ const INT_HUBSPOT_MENU_ = (function () {
       const dealStageCol0 = findHeaderIndex_(header, "Deal Stage");
       if (pipelineCol0 === -1 || dealStageCol0 === -1) return;
 
-      // Column gate: ignore edits that don't touch Pipeline or Deal Stage.
+      // Column gate: ignore edits that don't touch the Pipeline column.
       const startCol0 = e.range.getColumn() - 1;
       const endCol0 = startCol0 + e.range.getNumColumns() - 1;
-      const touchesPipeline = pipelineCol0 >= startCol0 && pipelineCol0 <= endCol0;
-      const touchesDealStage = dealStageCol0 >= startCol0 && dealStageCol0 <= endCol0;
-      if (!touchesPipeline && !touchesDealStage) return;
+      if (pipelineCol0 < startCol0 || pipelineCol0 > endCol0) return;
 
       const startRow1 = Math.max(e.range.getRow(), 2); // skip header row
       const endRow1 = e.range.getRow() + e.range.getNumRows() - 1;
       if (endRow1 < startRow1) return;
 
-      reapplyCreatorListPipelineAndDealStageValidation_(
-        sheet.getParent(),
-        null,
-        sheet,
-        startRow1,
-        endRow1
-      );
+      const map = readHubSpotPipelineStageMap_();
+      if (!map) {
+        showSpreadsheetToast_(
+          "Pipeline→stage list not synced yet. Run ⏰ Triggers → Sync Dropdown Values from HubSpot."
+        );
+        return;
+      }
+
+      const fullStages = buildFullStageList_(map);
+      const rowCount = endRow1 - startRow1 + 1;
+      const pipelineValues = sheet
+        .getRange(startRow1, pipelineCol0 + 1, rowCount, 1)
+        .getDisplayValues();
+      const stageRange = sheet.getRange(startRow1, dealStageCol0 + 1, rowCount, 1);
+      const stageValues = stageRange.getDisplayValues();
+
+      const rules = new Array(rowCount);
+      const nextStageValues = new Array(rowCount);
+      let cleared = 0;
+      let sawUnknownPipeline = false;
+
+      for (let i = 0; i < rowCount; i++) {
+        const pipeline = String((pipelineValues[i] && pipelineValues[i][0]) || "").trim();
+        const currentStage = String((stageValues[i] && stageValues[i][0]) || "").trim();
+        nextStageValues[i] = [currentStage];
+
+        if (!pipeline) {
+          rules[i] = [buildDealStageValidationRule_(fullStages)];
+          continue;
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(map, pipeline)) {
+          rules[i] = [buildDealStageValidationRule_(fullStages)];
+          sawUnknownPipeline = true;
+          continue;
+        }
+
+        const stages = map[pipeline];
+        rules[i] = [buildDealStageValidationRule_(stages.length ? stages : fullStages)];
+        if (stages.length && currentStage && !listContainsLabel_(stages, currentStage)) {
+          nextStageValues[i] = [""];
+          cleared++;
+        }
+      }
+
+      stageRange.setDataValidations(rules);
+      if (cleared > 0) {
+        stageRange.setValues(nextStageValues);
+      }
+
+      if (sawUnknownPipeline) {
+        showSpreadsheetToast_(
+          "Some pipelines aren't in the synced list. Re-run Sync Dropdown Values from HubSpot."
+        );
+      }
     } catch (err) {
       Logger.log("handleCreatorListEdit_ failed: " + (err && err.message ? err.message : err));
     }
@@ -5760,7 +6156,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     runWoodpeckerExportForSubsheet: runWoodpeckerExportForSubsheet,
     syncDropdownValuesFromHubSpot: syncDropdownValuesFromHubSpot,
     handleCreatorListEdit_: handleCreatorListEdit_,
-    reapplyCreatorListPipelineAndDealStageValidation_: reapplyCreatorListPipelineAndDealStageValidation_,
     reapplyCreatorListDealStageValidation_: reapplyCreatorListDealStageValidation_
   };
 })();

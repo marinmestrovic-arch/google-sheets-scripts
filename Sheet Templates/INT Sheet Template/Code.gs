@@ -3845,7 +3845,7 @@ function syncHubSpotDropdownValues_(ss) {
 
   const campaignClientRows = fetchHubSpotDropdownCampaignClientRows_(token);
   const valuesByColumnName = {};
-  valuesByColumnName[config.columns.clientName] = getDistinctHubSpotDropdownCampaignClientNames_(campaignClientRows);
+  valuesByColumnName[config.columns.clientName] = fetchHubSpotDropdownClientNames_(token);
   valuesByColumnName[config.columns.client] = campaignClientRows.map(function (row) {
     return row.clientName;
   });
@@ -3980,6 +3980,28 @@ function getDistinctHubSpotDropdownCampaignClientNames_(campaignClientRows) {
     });
   });
   return normalizeHubSpotDropdownValues_(names);
+}
+
+function fetchHubSpotDropdownClientNames_(token) {
+  const clientConfig = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_.client;
+  const clientObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, clientConfig);
+  const clientPropertyName = resolveHubSpotDropdownPropertyName_(
+    clientObjectTypeId,
+    clientConfig && clientConfig.propertyName,
+    token
+  );
+  const records = fetchHubSpotCrmObjectRecords_(
+    clientObjectTypeId,
+    [clientPropertyName],
+    token
+  );
+
+  return normalizeHubSpotDropdownValues_(
+    records.map(function (record) {
+      const properties = record && record.properties ? record.properties : {};
+      return properties[clientPropertyName];
+    })
+  );
 }
 
 function fetchHubSpotDropdownCurrencyCodes_(token) {
