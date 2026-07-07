@@ -115,8 +115,7 @@ const INT_HUBSPOT_MENU_ = (function () {
     campaign: {
       objectTypeId: "",
       aliases: ["Client Campaign", "Client Campaigns"],
-      propertyName: "Campaign Name",
-      createdWithinMonths: 3
+      propertyName: "Campaign Name"
     },
     activation: {
       objectTypeId: "",
@@ -4348,7 +4347,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
     const campaignConfig = config.campaign;
     const clientConfig = config.client;
-    const createdAfter = getHubSpotDropdownCampaignCreatedAfter_(campaignConfig);
     const campaignObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, campaignConfig);
     const clientObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, clientConfig);
     const campaignPropertyName = resolveHubSpotDropdownPropertyName_(
@@ -4365,9 +4363,7 @@ const INT_HUBSPOT_MENU_ = (function () {
       campaignObjectTypeId,
       [campaignPropertyName],
       token
-    ).filter(function (record) {
-      return isHubSpotRecordCreatedAtOrAfter_(record, createdAfter);
-    });
+    );
 
     const campaignIds = campaignRecords.map(function (record) {
       return String(record && record.id || "").trim();
@@ -4990,13 +4986,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (maxRows >= rowCount) return;
 
     sheet.insertRowsAfter(maxRows, rowCount - maxRows);
-  }
-
-  function getHubSpotDropdownCampaignCreatedAfter_(campaignConfig) {
-    const months = Math.max(1, Number(campaignConfig && campaignConfig.createdWithinMonths) || 3);
-    const cutoff = new Date();
-    cutoff.setMonth(cutoff.getMonth() - months);
-    return cutoff;
   }
 
   function isHubSpotRecordCreatedAtOrAfter_(record, cutoff) {

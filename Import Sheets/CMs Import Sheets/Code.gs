@@ -115,7 +115,8 @@ const INT_HUBSPOT_MENU_ = (function () {
       objectTypeId: "",
       aliases: ["Client Campaign", "Client Campaigns"],
       propertyName: "Campaign Name",
-      createdWithinMonths: 3
+      statusPropertyName: ["Status", "Campaign Status"],
+      allowedStatusValues: ["In progress", "Planned"]
     },
     activation: {
       objectTypeId: "",
@@ -4041,7 +4042,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     const config = HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_;
     const campaignConfig = config.campaign;
     const clientConfig = config.client;
-    const createdAfter = getHubSpotDropdownCampaignCreatedAfter_(campaignConfig);
     const campaignObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, campaignConfig);
     const clientObjectTypeId = resolveHubSpotDropdownObjectTypeId_(token, clientConfig);
     const campaignPropertyName = resolveHubSpotDropdownPropertyName_(
@@ -4049,17 +4049,41 @@ const INT_HUBSPOT_MENU_ = (function () {
       campaignConfig && campaignConfig.propertyName,
       token
     );
+    const campaignStatusPropertyName = resolveHubSpotDropdownFirstAvailablePropertyName_(
+      campaignObjectTypeId,
+      campaignConfig && campaignConfig.statusPropertyName,
+      token
+    );
+    const campaignStatusValues = resolveHubSpotDropdownAllowedPropertyValues_(
+      campaignObjectTypeId,
+      campaignStatusPropertyName,
+      campaignConfig && campaignConfig.allowedStatusValues,
+      token
+    );
     const clientPropertyName = resolveHubSpotDropdownPropertyName_(
       clientObjectTypeId,
       clientConfig && clientConfig.propertyName,
       token
     );
-    const campaignRecords = fetchHubSpotCrmObjectRecords_(
+    const campaignRecords = searchHubSpotCrmObjectRecords_(
       campaignObjectTypeId,
-      [campaignPropertyName],
-      token
+      [campaignPropertyName, campaignStatusPropertyName],
+      token,
+      {
+        filterGroups: [
+          {
+            filters: [
+              {
+                propertyName: campaignStatusPropertyName,
+                operator: "IN",
+                values: campaignStatusValues
+              }
+            ]
+          }
+        ]
+      }
     ).filter(function (record) {
-      return isHubSpotRecordCreatedAtOrAfter_(record, createdAfter);
+      return isHubSpotDropdownRecordPropertyInValues_(record, campaignStatusPropertyName, campaignStatusValues);
     });
 
     const campaignIds = campaignRecords.map(function (record) {
@@ -4327,6 +4351,72 @@ const INT_HUBSPOT_MENU_ = (function () {
     );
   }
 
+  function resolveHubSpotDropdownFirstAvailablePropertyName_(objectTypeId, propertyLabelOrNames, token) {
+    const candidates = uniqueNonEmptyStrings_(
+      Array.isArray(propertyLabelOrNames) ? propertyLabelOrNames : [propertyLabelOrNames]
+    );
+    let lastError = null;
+
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        return resolveHubSpotDropdownPropertyName_(objectTypeId, candidates[i], token);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
+    if (lastError) throw lastError;
+    throw new Error("HubSpot dropdown property name is not configured.");
+  }
+
+  function resolveHubSpotDropdownAllowedPropertyValues_(objectType, propertyName, allowedValues, token) {
+    const configuredValues = uniqueNonEmptyStrings_(allowedValues || []);
+    if (configuredValues.length === 0) return configuredValues;
+
+    const property = fetchHubSpotPropertyDefinition_(objectType, propertyName, token);
+    const options = Array.isArray(property && property.options) ? property.options : [];
+    const targets = {};
+    const matchedValues = [];
+
+    configuredValues.forEach(function (value) {
+      targets[normalizeDropdownLookupValue_(value)] = true;
+    });
+
+    options.forEach(function (option) {
+      const label = String(option && option.label || "").trim();
+      const value = String(option && option.value || "").trim();
+      if (!value) return;
+      if (targets[normalizeDropdownLookupValue_(label)] || targets[normalizeDropdownLookupValue_(value)]) {
+        matchedValues.push(value);
+      }
+    });
+
+    return uniqueNonEmptyStrings_(matchedValues.length > 0 ? matchedValues : configuredValues);
+  }
+
+  function isHubSpotDropdownRecordPropertyInValues_(record, propertyName, allowedValues) {
+    const allowed = {};
+    let allowedCount = 0;
+    uniqueNonEmptyStrings_(allowedValues || []).forEach(function (value) {
+      const key = normalizeDropdownLookupValue_(value);
+      if (!key || allowed[key]) return;
+      allowed[key] = true;
+      allowedCount++;
+    });
+    if (allowedCount === 0) return true;
+
+    const properties = record && record.properties ? record.properties : {};
+    const rawValue = properties[propertyName];
+    const values = Array.isArray(rawValue)
+      ? rawValue
+      : String(rawValue || "").split(";");
+
+    for (let i = 0; i < values.length; i++) {
+      if (allowed[normalizeDropdownLookupValue_(values[i])]) return true;
+    }
+    return false;
+  }
+
   function fetchHubSpotCrmObjectRecords_(objectTypeId, propertyNames, token) {
     const records = [];
     const normalizedObjectTypeId = String(objectTypeId || "").trim();
@@ -4345,6 +4435,47 @@ const INT_HUBSPOT_MENU_ = (function () {
       const data = hubspotRequestJson_(
         HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(normalizedObjectTypeId) + "?" + query,
         token
+      );
+      const pageRecords = Array.isArray(data && data.results) ? data.results : [];
+      pageRecords.forEach(function (record) {
+        if (!record || record.archived === true) return;
+        records.push(record);
+      });
+
+      after = String(data && data.paging && data.paging.next && data.paging.next.after || "").trim();
+    } while (after);
+
+    return records;
+  }
+
+  function searchHubSpotCrmObjectRecords_(objectTypeId, propertyNames, token, searchOptions) {
+    const records = [];
+    const normalizedObjectTypeId = String(objectTypeId || "").trim();
+    if (!normalizedObjectTypeId) return records;
+
+    const properties = uniqueNonEmptyStrings_(propertyNames || []);
+    const basePayload = Object.assign(
+      {
+        limit: 200,
+        properties: properties
+      },
+      searchOptions || {}
+    );
+    basePayload.limit = Math.min(200, Math.max(1, Number(basePayload.limit) || 200));
+    basePayload.properties = properties;
+
+    let after = "";
+    do {
+      const payload = Object.assign({}, basePayload);
+      if (after) payload.after = after;
+
+      const data = hubspotRequestJson_(
+        HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(normalizedObjectTypeId) + "/search",
+        token,
+        {
+          method: "post",
+          payload: JSON.stringify(payload)
+        }
       );
       const pageRecords = Array.isArray(data && data.results) ? data.results : [];
       pageRecords.forEach(function (record) {
@@ -4616,13 +4747,6 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (maxRows >= rowCount) return;
 
     sheet.insertRowsAfter(maxRows, rowCount - maxRows);
-  }
-
-  function getHubSpotDropdownCampaignCreatedAfter_(campaignConfig) {
-    const months = Math.max(1, Number(campaignConfig && campaignConfig.createdWithinMonths) || 3);
-    const cutoff = new Date();
-    cutoff.setMonth(cutoff.getMonth() - months);
-    return cutoff;
   }
 
   function isHubSpotRecordCreatedAtOrAfter_(record, cutoff) {
