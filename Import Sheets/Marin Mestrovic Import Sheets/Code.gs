@@ -226,6 +226,7 @@ const INT_HUBSPOT_MENU_ = (function () {
   const HUBSPOT_MULTISELECT_IMPORT_DELIMITER_ = ";";
   const HUBSPOT_HISTORY_IMPORT_KEY_ = "history";
   const HUBSPOT_HISTORY_IMPORT_INCLUDED_EXCLUDED_COL_KEYS_ = new Set([
+    "hubspotrecordid",
     "activationtype",
     "activationname"
   ]);
@@ -553,6 +554,21 @@ const INT_HUBSPOT_MENU_ = (function () {
 
     if (candidateRowItems.length === 0) {
       return finishActionWithInfo_(`No importable rows in "${sheetName}" from row ${startRow1} onward.`);
+    }
+
+    if (isHistoryHubSpotImportSpec_(importSpec)) {
+      const preparedRows = prepareHistoryHubSpotImportRows_(header, candidateRowItems);
+      if (preparedRows.rowItems.length === 0 && preparedRows.deferredRowItems.length === 0) {
+        return finishActionWithInfo_(
+          "No new history rows to import. " +
+          "Rows with a filled Timestamp Imported value were skipped."
+        );
+      }
+      if (preparedRows.rowItems.length === 0) {
+        return finishActionWithInfo_(buildHistoryImportDeferredMessage_(preparedRows));
+      }
+
+      return importHistoryCreatorListToHubSpot_(ss, sheet, header, preparedRows, sheetName, importSpec);
     }
 
     const preparedRows = prepareCreatorListHubSpotImportRows_(header, candidateRowItems);
@@ -3172,6 +3188,122 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function importCreatorListToHubSpot_(ss, sheet, header, rowItems, importSummary, sheetName, importSpec) {
+    const result = runCreatorListHubSpotImportRows_(
+      ss,
+      sheet,
+      header,
+      rowItems,
+      sheetName,
+      importSpec
+    );
+    const message = buildImportSuccessMessage_(
+      result.importResults,
+      result.savedRecordIds,
+      result.savedTimestamps,
+      importSummary
+    );
+    setScriptActionProgress_(message, 100, "done");
+    showSpreadsheetToast_(message);
+    Logger.log(`✅ ${message}`);
+    return message;
+  }
+
+  function importHistoryCreatorListToHubSpot_(ss, sheet, header, preparedRows, sheetName, importSpec) {
+    const combinedResult = {
+      importResults: [],
+      dealRecordIds: [],
+      savedRecordIds: 0,
+      savedTimestamps: 0
+    };
+
+    importRemainingHistoryRowsWithResolvedIds_(
+      ss,
+      sheet,
+      header,
+      preparedRows,
+      sheetName,
+      importSpec,
+      combinedResult
+    );
+
+    const message = buildImportSuccessMessage_(
+      combinedResult.importResults,
+      combinedResult.savedRecordIds,
+      combinedResult.savedTimestamps,
+      preparedRows
+    );
+    setScriptActionProgress_(message, 100, "done");
+    showSpreadsheetToast_(message);
+    Logger.log(`✅ ${message}`);
+    return message;
+  }
+
+  function importRemainingHistoryRowsWithResolvedIds_(
+    ss,
+    sheet,
+    header,
+    preparedRows,
+    sheetName,
+    importSpec,
+    combinedResult
+  ) {
+    const contactIdByKey = {};
+    const seededContactKeys = {};
+    let pendingRows = preparedRows.rowItems;
+    let phaseIndex = 0;
+
+    preparedRows.contactExistingRowCount = 0;
+    preparedRows.contactSeedRowCount = 0;
+    preparedRows.contactDeferredRowCount = 0;
+    preparedRows.contactNoIdentityRowCount = 0;
+
+    while (pendingRows.length > 0 && phaseIndex < 5) {
+      const stage = stageHistoryRowsForContactImport_(
+        header,
+        pendingRows,
+        contactIdByKey,
+        seededContactKeys
+      );
+      preparedRows.contactExistingRowCount += stage.existingContactRowCount;
+      preparedRows.contactSeedRowCount += stage.seedContactRowCount;
+      preparedRows.contactNoIdentityRowCount += stage.noIdentityRowCount;
+
+      if (stage.rowItems.length === 0) {
+        preparedRows.contactDeferredRowCount += stage.deferredRowItems.length;
+        pendingRows = [];
+        break;
+      }
+
+      const phaseLabel = phaseIndex === 0
+        ? (preparedRows.deferredRowItems.length > 0 ? "deal seeds and known activations" : "history activations")
+        : "additional activations";
+      const result = runCreatorListHubSpotImportRows_(
+        ss,
+        sheet,
+        header,
+        stage.rowItems,
+        sheetName,
+        importSpec,
+        phaseLabel
+      );
+      appendHubSpotImportRunResult_(combinedResult, result);
+      updateHistoryDealRecordIdMapFromImportResult_(preparedRows, result.dealRecordIds);
+      resolveHistorySeededContactIds_(stage.seededContactIdentities, contactIdByKey);
+
+      const deferredDeals = prepareHistoryDeferredRowsWithResolvedDealIds_(header, preparedRows);
+      preparedRows.resolvedDeferredRowCount += deferredDeals.rowItems.length;
+      preparedRows.unresolvedDeferredRowCount = deferredDeals.unresolvedCount;
+
+      pendingRows = stage.deferredRowItems.concat(deferredDeals.rowItems);
+      phaseIndex++;
+    }
+
+    if (pendingRows.length > 0) {
+      preparedRows.contactDeferredRowCount += pendingRows.length;
+    }
+  }
+
+  function runCreatorListHubSpotImportRows_(ss, sheet, header, rowItems, sheetName, importSpec, importLabel) {
     // Validate every deal row against HubSpot's live pipeline configuration before
     // building or sending any import payload. This prevents HubSpot from silently
     // rejecting rows whose Pipeline / Deal Stage combination does not exist.
@@ -3195,7 +3327,9 @@ const INT_HUBSPOT_MENU_ = (function () {
       throw new Error("Validation failed:\n" + validationIssues.join("\n"));
     }
 
-    const payloads = buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName(), importSpec);
+    const payloads = isHistoryHubSpotImportSpec_(importSpec)
+      ? buildHistoryHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName(), importSpec, importLabel)
+      : buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheet.getName(), importSpec, importLabel);
     if (payloads.length === 0) {
       throw new Error("No importable HubSpot columns found.");
     }
@@ -3209,17 +3343,23 @@ const INT_HUBSPOT_MENU_ = (function () {
       return saveImportedCreatorListDealMarkers_(sheet, header, dealRecordIds);
     };
 
-    const result = sendHubSpotImportPayloads_(payloads, saveMarkers, sheetName);
-    const message = buildImportSuccessMessage_(
-      result.importResults,
-      result.savedRecordIds,
-      result.savedTimestamps,
-      importSummary
-    );
-    setScriptActionProgress_(message, 100, "done");
-    showSpreadsheetToast_(message);
-    Logger.log(`✅ ${message}`);
-    return message;
+    return sendHubSpotImportPayloads_(payloads, saveMarkers, sheetName);
+  }
+
+  function appendHubSpotImportRunResult_(combinedResult, runResult) {
+    if (!combinedResult || !runResult) return;
+    if (Array.isArray(runResult.importResults)) {
+      runResult.importResults.forEach(function (result) {
+        combinedResult.importResults.push(result);
+      });
+    }
+    if (Array.isArray(runResult.dealRecordIds)) {
+      runResult.dealRecordIds.forEach(function (item) {
+        combinedResult.dealRecordIds.push(item);
+      });
+    }
+    combinedResult.savedRecordIds += Number(runResult.savedRecordIds || 0);
+    combinedResult.savedTimestamps += Number(runResult.savedTimestamps || 0);
   }
 
   // Sends prepared payloads through the shared library when present, otherwise
@@ -3374,6 +3514,377 @@ const INT_HUBSPOT_MENU_ = (function () {
       skippedWithRecordId: skippedWithRecordId,
       skippedDuplicateDealName: skippedDuplicateDealName
     };
+  }
+
+  function prepareHistoryHubSpotImportRows_(header, candidateRowItems) {
+    const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+    const dealNameCol = findHeaderIndex_(header, "Deal Name");
+    const timestampCol = findHeaderIndex_(header, CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_);
+    const recordIdByDealName = {};
+    const dealNameBySourceRow1 = {};
+
+    (candidateRowItems || []).forEach(function (item) {
+      const dealName = getHistoryImportDealName_(item, dealNameCol);
+      const recordId = getHistoryImportRecordId_(item, recordIdCol);
+      const dealKey = normalizeHistoryImportDealNameKey_(dealName);
+      if (dealKey && recordId) recordIdByDealName[dealKey] = recordId;
+    });
+
+    const seededNewDealNames = {};
+    const rowItems = [];
+    const deferredRowItems = [];
+    let skippedAlreadyImported = 0;
+    let copiedRecordIdToRows = 0;
+    let seedNewDealRows = 0;
+
+    (candidateRowItems || []).forEach(function (item) {
+      const timestamp = timestampCol === -1 ? "" : String(item.values[timestampCol] || "").trim();
+      if (timestamp) {
+        skippedAlreadyImported++;
+        return;
+      }
+
+      const cloned = cloneHubSpotImportRowItem_(item);
+      const dealName = getHistoryImportDealName_(cloned, dealNameCol);
+      const dealKey = normalizeHistoryImportDealNameKey_(dealName);
+      if (dealKey) dealNameBySourceRow1[String(cloned.row1)] = dealKey;
+
+      let recordId = getHistoryImportRecordId_(cloned, recordIdCol);
+      if (!recordId && dealKey && recordIdByDealName[dealKey]) {
+        cloned.values[recordIdCol] = recordIdByDealName[dealKey];
+        recordId = recordIdByDealName[dealKey];
+        copiedRecordIdToRows++;
+      }
+
+      if (!recordId && dealKey) {
+        if (seededNewDealNames[dealKey]) {
+          deferredRowItems.push(cloned);
+          return;
+        }
+        seededNewDealNames[dealKey] = true;
+        seedNewDealRows++;
+      }
+
+      rowItems.push(cloned);
+    });
+
+    return {
+      importKind: HUBSPOT_HISTORY_IMPORT_KEY_,
+      rowItems: rowItems,
+      deferredRowItems: deferredRowItems,
+      recordIdByDealName: recordIdByDealName,
+      dealNameBySourceRow1: dealNameBySourceRow1,
+      skippedAlreadyImported: skippedAlreadyImported,
+      copiedRecordIdToRows: copiedRecordIdToRows,
+      seedNewDealRows: seedNewDealRows,
+      resolvedDeferredRowCount: 0,
+      unresolvedDeferredRowCount: deferredRowItems.length,
+      skippedWithRecordId: 0,
+      skippedDuplicateDealName: 0
+    };
+  }
+
+  function cloneHubSpotImportRowItem_(item) {
+    const cloned = {
+      row1: item.row1,
+      values: Array.isArray(item.values) ? item.values.slice() : []
+    };
+    if (item.contactIdentity) cloned.contactIdentity = item.contactIdentity;
+    if (item.contactRecordId) cloned.contactRecordId = item.contactRecordId;
+    return cloned;
+  }
+
+  function getHistoryImportDealName_(item, dealNameCol) {
+    if (!item || dealNameCol === -1) return "";
+    return String(item.values[dealNameCol] || "").trim();
+  }
+
+  function getHistoryImportRecordId_(item, recordIdCol) {
+    if (!item || recordIdCol === -1) return "";
+    return String(item.values[recordIdCol] || "").trim();
+  }
+
+  function normalizeHistoryImportDealNameKey_(dealName) {
+    return String(dealName || "").trim().toLowerCase();
+  }
+
+  function updateHistoryDealRecordIdMapFromImportResult_(preparedRows, dealRecordIds) {
+    if (!preparedRows || !Array.isArray(dealRecordIds)) return;
+    const recordIdByDealName = preparedRows.recordIdByDealName || {};
+    const dealNameBySourceRow1 = preparedRows.dealNameBySourceRow1 || {};
+
+    dealRecordIds.forEach(function (item) {
+      const row1 = String(Number(item && item.sourceRowNumber) || "");
+      const recordId = String(item && item.recordId || "").trim();
+      const dealKey = dealNameBySourceRow1[row1];
+      if (dealKey && recordId) recordIdByDealName[dealKey] = recordId;
+    });
+  }
+
+  function prepareHistoryDeferredRowsWithResolvedDealIds_(header, preparedRows) {
+    const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+    const dealNameCol = findHeaderIndex_(header, "Deal Name");
+    const recordIdByDealName = preparedRows && preparedRows.recordIdByDealName
+      ? preparedRows.recordIdByDealName
+      : {};
+    const consumed = preparedRows.consumedDealDeferredRow1 || {};
+    preparedRows.consumedDealDeferredRow1 = consumed;
+    const rowItems = [];
+    let unresolvedCount = 0;
+
+    (preparedRows && preparedRows.deferredRowItems || []).forEach(function (item) {
+      if (consumed[item.row1]) return;
+
+      const cloned = cloneHubSpotImportRowItem_(item);
+      const dealKey = normalizeHistoryImportDealNameKey_(getHistoryImportDealName_(cloned, dealNameCol));
+      const recordId = dealKey ? String(recordIdByDealName[dealKey] || "").trim() : "";
+      if (!recordId) {
+        unresolvedCount++;
+        return;
+      }
+
+      cloned.values[recordIdCol] = recordId;
+      consumed[item.row1] = true;
+      rowItems.push(cloned);
+    });
+
+    return {
+      rowItems: rowItems,
+      unresolvedCount: unresolvedCount
+    };
+  }
+
+  function buildHistoryImportDeferredMessage_(preparedRows) {
+    return (
+      "No history rows can be safely imported yet. " +
+      "Additional activation rows need a saved HubSpot Deal ID first. " +
+      "Rows already imported: " + Number(preparedRows && preparedRows.skippedAlreadyImported || 0) + ". " +
+      "Rows waiting for Deal ID: " + Number(preparedRows && preparedRows.deferredRowItems && preparedRows.deferredRowItems.length || 0) + "."
+    );
+  }
+
+  function stageHistoryRowsForContactImport_(header, rowItems, contactIdByKey, seededContactKeys) {
+    resolveExistingHistoryContactIds_(header, rowItems, contactIdByKey);
+
+    const seededKeys = seededContactKeys || {};
+    const stagedRows = [];
+    const deferredRows = [];
+    const seededContactIdentities = [];
+    let existingContactRowCount = 0;
+    let seedContactRowCount = 0;
+    let noIdentityRowCount = 0;
+
+    (rowItems || []).forEach(function (item) {
+      const cloned = cloneHubSpotImportRowItem_(item);
+      const identity = cloned.contactIdentity || buildHistoryContactIdentity_(cloned.values, header);
+      cloned.contactIdentity = identity;
+
+      if (!identity || !identity.key) {
+        noIdentityRowCount++;
+        stagedRows.push(cloned);
+        return;
+      }
+
+      const contactRecordId = String(contactIdByKey[identity.key] || "").trim();
+      if (contactRecordId) {
+        cloned.contactRecordId = contactRecordId;
+        existingContactRowCount++;
+        stagedRows.push(cloned);
+        return;
+      }
+
+      if (!seededKeys[identity.key]) {
+        seededKeys[identity.key] = true;
+        seedContactRowCount++;
+        seededContactIdentities.push(identity);
+        stagedRows.push(cloned);
+        return;
+      }
+
+      deferredRows.push(cloned);
+    });
+
+    return {
+      rowItems: stagedRows,
+      deferredRowItems: deferredRows,
+      seededContactIdentities: seededContactIdentities,
+      existingContactRowCount: existingContactRowCount,
+      seedContactRowCount: seedContactRowCount,
+      noIdentityRowCount: noIdentityRowCount
+    };
+  }
+
+  function resolveExistingHistoryContactIds_(header, rowItems, contactIdByKey) {
+    const token = getHubSpotApiToken_();
+    if (!token) return;
+
+    (rowItems || []).forEach(function (item) {
+      const identity = item && item.contactIdentity
+        ? item.contactIdentity
+        : buildHistoryContactIdentity_(item && item.values, header);
+      if (!identity || !identity.key || contactIdByKey[identity.key]) return;
+
+      const recordId = findHistoryContactRecordId_(token, identity);
+      if (recordId) contactIdByKey[identity.key] = recordId;
+    });
+  }
+
+  function resolveHistorySeededContactIds_(identities, contactIdByKey) {
+    const token = getHubSpotApiToken_();
+    if (!token) return;
+
+    (identities || []).forEach(function (identity) {
+      if (!identity || !identity.key || contactIdByKey[identity.key]) return;
+      const recordId = findHistoryContactRecordIdWithRetry_(token, identity);
+      if (recordId) contactIdByKey[identity.key] = recordId;
+    });
+  }
+
+  function findHistoryContactRecordIdWithRetry_(token, identity) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const recordId = findHistoryContactRecordId_(token, identity);
+      if (recordId) return recordId;
+      if (attempt < 2) Utilities.sleep(1500);
+    }
+    return "";
+  }
+
+  function findHistoryContactRecordId_(token, identity) {
+    const candidates = Array.isArray(identity && identity.candidates) ? identity.candidates : [];
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i] || {};
+      const propertyName = resolveHistoryContactLookupPropertyName_(candidate.header, token);
+      const value = String(candidate.value || "").trim();
+      if (!propertyName || !value) continue;
+
+      const recordId = searchHubSpotContactRecordId_(token, propertyName, value);
+      if (recordId) return recordId;
+    }
+    return "";
+  }
+
+  function searchHubSpotContactRecordId_(token, propertyName, value) {
+    const payload = {
+      filterGroups: [
+        {
+          filters: [
+            {
+              propertyName: propertyName,
+              operator: "EQ",
+              value: String(value)
+            }
+          ]
+        }
+      ],
+      properties: ["hs_object_id"],
+      limit: 1,
+      sorts: [
+        {
+          propertyName: "createdate",
+          direction: "ASCENDING"
+        }
+      ]
+    };
+    const data = hubspotRequestJson_(
+      HUBSPOT_API_BASE_ + "/crm/v3/objects/" + encodeURIComponent(HUBSPOT_CONTACTS_OBJECT_API_NAME_) + "/search",
+      token,
+      {
+        method: "post",
+        payload: JSON.stringify(payload)
+      }
+    );
+    const match = data && data.results && data.results[0];
+    if (!match) return "";
+    return String(
+      match.id ||
+      (match.properties && match.properties.hs_object_id) ||
+      ""
+    ).trim();
+  }
+
+  function resolveHistoryContactLookupPropertyName_(headerName, token) {
+    const normalized = normalizeHeaderName_(headerName);
+    if (!normalized) return "";
+    if (normalized === "email") return "email";
+
+    try {
+      return resolveHubSpotDropdownPropertyName_(
+        HUBSPOT_CONTACTS_OBJECT_API_NAME_,
+        headerName,
+        token
+      );
+    } catch (e) {
+      Logger.log(
+        "⚠️ Could not resolve contact lookup property for " +
+        String(headerName || "") +
+        ": " +
+        (e && e.message ? e.message : e)
+      );
+      return "";
+    }
+  }
+
+  function buildHistoryContactIdentity_(row, header) {
+    if (!Array.isArray(row)) return null;
+
+    const identities = collectCreatorPlatformIdentitiesFromRow_(row, header)
+      .filter(function (identity) {
+        return !!(identity && identity.key && identity.handle);
+      });
+    if (identities.length > 0) {
+      const identity = identities[0];
+      const handleKey = normalizeHistoryContactIdentityValue_(identity.handle);
+      const spec = getCreatorPlatformSpec_(identity.key);
+      const candidates = [];
+
+      if (spec) {
+        appendHistoryContactLookupCandidate_(candidates, spec.handleHeader, identity.handle);
+        appendHistoryContactLookupCandidate_(candidates, spec.handleHeader, String(identity.handle || "").replace(/^@/, ""));
+        appendHistoryContactLookupCandidate_(candidates, spec.urlHeader, identity.canonicalUrl);
+        appendHistoryContactLookupCandidate_(candidates, spec.urlHeader, getValueByHeader_(row, header, spec.urlHeader));
+      }
+      appendHistoryContactLookupCandidate_(candidates, "Email", getValueByHeader_(row, header, "Email"));
+
+      return {
+        key: identity.key + ":" + handleKey,
+        candidates: candidates
+      };
+    }
+
+    const email = String(getValueByHeader_(row, header, "Email") || "").trim();
+    if (email) {
+      return {
+        key: "email:" + normalizeHistoryContactIdentityValue_(email),
+        candidates: [{ header: "Email", value: email }]
+      };
+    }
+
+    return null;
+  }
+
+  function appendHistoryContactLookupCandidate_(out, headerName, value) {
+    const headerText = String(headerName || "").trim();
+    const valueText = String(value || "").trim();
+    if (!headerText || !valueText) return;
+
+    const key = normalizeHeaderName_(headerText) + "::" + normalizeHistoryContactIdentityValue_(valueText);
+    for (let i = 0; i < out.length; i++) {
+      const existingKey =
+        normalizeHeaderName_(out[i].header) + "::" + normalizeHistoryContactIdentityValue_(out[i].value);
+      if (existingKey === key) return;
+    }
+
+    out.push({
+      header: headerText,
+      value: valueText
+    });
+  }
+
+  function normalizeHistoryContactIdentityValue_(value) {
+    return String(value || "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .toLowerCase();
   }
 
   function collectCreatorListHubSpotImportValidationIssues_(header, rowItems, emailCol) {
@@ -3568,9 +4079,17 @@ const INT_HUBSPOT_MENU_ = (function () {
     return errors.join("\n\n");
   }
 
-  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName, importSpec) {
+  function buildHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName, importSpec, baseImportLabel) {
     if (emailCol === -1) {
-      const payload = buildHubSpotImportPayload_(ss, header, rowItems, null, "", sheetName, importSpec);
+      const payload = buildHubSpotImportPayload_(
+        ss,
+        header,
+        rowItems,
+        null,
+        baseImportLabel || "",
+        sheetName,
+        importSpec
+      );
       return payload ? [payload] : [];
     }
 
@@ -3589,7 +4108,7 @@ const INT_HUBSPOT_MENU_ = (function () {
         header,
         rowsWithEmail,
         null,
-        shouldLabelPayloads ? "with email" : "",
+        buildHubSpotImportPayloadLabel_(baseImportLabel, shouldLabelPayloads ? "with email" : ""),
         sheetName,
         importSpec
       );
@@ -3602,7 +4121,7 @@ const INT_HUBSPOT_MENU_ = (function () {
         header,
         rowsWithoutEmail,
         new Set([emailCol]),
-        shouldLabelPayloads ? "without email" : "",
+        buildHubSpotImportPayloadLabel_(baseImportLabel, shouldLabelPayloads ? "without email" : ""),
         sheetName,
         importSpec
       );
@@ -3610,6 +4129,102 @@ const INT_HUBSPOT_MENU_ = (function () {
     }
 
     return splitHubSpotImportPayloadsByRows_(payloads);
+  }
+
+  function buildHistoryHubSpotImportPayloads_(ss, header, rowItems, emailCol, sheetName, importSpec, baseImportLabel) {
+    const rowsWithContactRecordId = [];
+    const rowsWithoutContactRecordId = [];
+
+    (rowItems || []).forEach(function (item) {
+      const contactRecordId = String(item && item.contactRecordId || "").trim();
+      if (contactRecordId) {
+        rowsWithContactRecordId.push(item);
+      } else {
+        rowsWithoutContactRecordId.push(item);
+      }
+    });
+
+    const payloads = [];
+    const shouldLabelPayloads = rowsWithContactRecordId.length > 0 && rowsWithoutContactRecordId.length > 0;
+    if (rowsWithContactRecordId.length > 0) {
+      const payload = buildHubSpotImportPayloadWithExtraColumns_(
+        ss,
+        header,
+        rowsWithContactRecordId,
+        [
+          {
+            header: "Contacts Record ID",
+            getValue: function (item) {
+              return String(item && item.contactRecordId || "").trim();
+            }
+          }
+        ],
+        buildHubSpotImportPayloadLabel_(baseImportLabel, shouldLabelPayloads ? "resolved contacts" : ""),
+        sheetName,
+        importSpec
+      );
+      splitHubSpotImportPayloadByRows_(payload).forEach(function (chunk) {
+        payloads.push(chunk);
+      });
+    }
+
+    if (rowsWithoutContactRecordId.length > 0) {
+      buildHubSpotImportPayloads_(
+        ss,
+        header,
+        rowsWithoutContactRecordId,
+        emailCol,
+        sheetName,
+        importSpec,
+        buildHubSpotImportPayloadLabel_(baseImportLabel, shouldLabelPayloads ? "contact seeds" : "")
+      ).forEach(function (payload) {
+        payloads.push(payload);
+      });
+    }
+
+    return payloads;
+  }
+
+  function buildHubSpotImportPayloadWithExtraColumns_(
+    ss,
+    header,
+    rowItems,
+    extraColumns,
+    importLabel,
+    sheetName,
+    importSpec
+  ) {
+    const extras = Array.isArray(extraColumns) ? extraColumns : [];
+    const syntheticHeader = (header || []).slice();
+    extras.forEach(function (extra) {
+      syntheticHeader.push(String(extra && extra.header || "").trim());
+    });
+
+    const syntheticRows = (rowItems || []).map(function (item) {
+      const cloned = cloneHubSpotImportRowItem_(item);
+      extras.forEach(function (extra) {
+        const getValue = extra && extra.getValue;
+        cloned.values.push(typeof getValue === "function" ? getValue(item) : "");
+      });
+      return cloned;
+    });
+
+    return buildHubSpotImportPayload_(
+      ss,
+      syntheticHeader,
+      syntheticRows,
+      null,
+      importLabel,
+      sheetName,
+      importSpec
+    );
+  }
+
+  function buildHubSpotImportPayloadLabel_(baseLabel, suffixLabel) {
+    const base = String(baseLabel || "").trim();
+    const suffix = String(suffixLabel || "").trim();
+    if (base && suffix) return base + " - " + suffix;
+    return base || suffix;
   }
 
   function buildCreatorListWoodpeckerExportRows_(data, header, headerRow1) {
@@ -3911,6 +4526,8 @@ const INT_HUBSPOT_MENU_ = (function () {
     if (!text || !isHistoryHubSpotImportSpec_(importSpec)) return text;
 
     const normalized = normalizeHeaderName_(text);
+    if (normalized === "hubspotrecordid") return "Deals Record ID";
+
     const columnNames = Object.keys(HUBSPOT_HISTORY_IMPORT_OBJECT_PREFIX_BY_COLUMN_);
     for (let i = 0; i < columnNames.length; i++) {
       if (normalizeHeaderName_(columnNames[i]) === normalized) {
@@ -4088,6 +4705,15 @@ const INT_HUBSPOT_MENU_ = (function () {
   }
 
   function buildImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps, importSummary) {
+    if (importSummary && importSummary.importKind === HUBSPOT_HISTORY_IMPORT_KEY_) {
+      return buildHistoryImportSuccessMessage_(
+        importResults,
+        savedRecordIds,
+        savedTimestamps,
+        importSummary
+      );
+    }
+
     const results = Array.isArray(importResults) ? importResults : [];
     const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
     const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
@@ -4116,6 +4742,53 @@ const INT_HUBSPOT_MENU_ = (function () {
       CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
       "Skipped rows with HubSpot Record ID: " + skippedWithRecordId + "\n" +
       "Skipped duplicate Deal Name rows: " + skippedDuplicateDealName + "\n\n" +
+      suffix
+    );
+  }
+
+  function buildHistoryImportSuccessMessage_(importResults, savedRecordIds, savedTimestamps, importSummary) {
+    const results = Array.isArray(importResults) ? importResults : [];
+    const rowCount = results.reduce((sum, result) => sum + Number(result.rowCount || 0), 0);
+    const allDone = results.length > 0 && results.every(result => String(result.state || "").trim() === "DONE");
+    const suffix = allDone
+      ? "HubSpot finished the import and the returned deal IDs were saved."
+      : "HubSpot continues processing the import in the background.";
+    const importLines = results.map(result => {
+      const label = String(result.label || "").trim();
+      const prefix = label ? label + ": " : "";
+      const importState = String(result.state || "STARTED").trim() || "STARTED";
+      return (
+        "- " + prefix +
+        "Rows " + Number(result.rowCount || 0) +
+        ", Import ID " + (result.importId || "N/A") +
+        ", State " + importState
+      );
+    });
+    const unresolvedDeferred = Number(importSummary && importSummary.unresolvedDeferredRowCount || 0);
+    const unresolvedLine = unresolvedDeferred > 0
+      ? "Rows still waiting for a saved Deal ID: " + unresolvedDeferred + "\n"
+      : "";
+
+    return (
+      "✅ HubSpot history import submitted.\n\n" +
+      "History rows imported: " + rowCount + "\n" +
+      "Imports:\n" + importLines.join("\n") + "\n" +
+      "HubSpot Record IDs saved: " + Number(savedRecordIds || 0) + "\n" +
+      CREATOR_LIST_TIMESTAMP_IMPORTED_HEADER_ + " saved: " + Number(savedTimestamps || 0) + "\n\n" +
+      "Skipped already imported rows: " + Number(importSummary && importSummary.skippedAlreadyImported || 0) + "\n" +
+      "Rows associated using existing Deal ID: " + Number(importSummary && importSummary.copiedRecordIdToRows || 0) + "\n" +
+      "New deal seed rows: " + Number(importSummary && importSummary.seedNewDealRows || 0) + "\n" +
+      "Additional activation rows imported after Deal ID resolution: " +
+        Number(importSummary && importSummary.resolvedDeferredRowCount || 0) + "\n" +
+      "Rows imported with existing/resolved Contact ID: " +
+        Number(importSummary && importSummary.contactExistingRowCount || 0) + "\n" +
+      "Contact seed rows allowed to create contacts: " +
+        Number(importSummary && importSummary.contactSeedRowCount || 0) + "\n" +
+      "Rows without a reusable contact identity: " +
+        Number(importSummary && importSummary.contactNoIdentityRowCount || 0) + "\n" +
+      "Rows still waiting for Contact ID: " +
+        Number(importSummary && importSummary.contactDeferredRowCount || 0) + "\n" +
+      unresolvedLine + "\n" +
       suffix
     );
   }
