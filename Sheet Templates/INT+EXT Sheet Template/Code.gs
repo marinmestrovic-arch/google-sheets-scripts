@@ -70,7 +70,10 @@ const HUBSPOT_DROPDOWN_VALUES_SYNC_CONFIG_ = {
     aliases: ["Client Campaign", "Client Campaigns"],
     propertyName: "Campaign Name",
     statusPropertyName: ["Status", "Campaign Status"],
-    allowedStatusValues: ["In progress", "Planned"]
+    allowedStatusValues: [
+      ["Active", "In progress"],
+      ["Planned"]
+    ]
   },
   activation: {
     objectTypeId: "",
@@ -4100,28 +4103,48 @@ function resolveHubSpotDropdownFirstAvailablePropertyName_(objectTypeId, propert
 }
 
 function resolveHubSpotDropdownAllowedPropertyValues_(objectType, propertyName, allowedValues, token) {
-  const configuredValues = uniqueNonEmptyStrings_(allowedValues || []);
-  if (configuredValues.length === 0) return configuredValues;
+  const configuredValueGroups = (allowedValues || []).map(function (valueOrAliases) {
+    return uniqueNonEmptyStrings_(
+      Array.isArray(valueOrAliases) ? valueOrAliases : [valueOrAliases]
+    );
+  }).filter(function (values) {
+    return values.length > 0;
+  });
+  if (configuredValueGroups.length === 0) return [];
 
   const property = fetchHubSpotPropertyDefinition_(objectType, propertyName, token);
   const options = Array.isArray(property && property.options) ? property.options : [];
-  const targets = {};
-  const matchedValues = [];
+  if (options.length === 0) {
+    return uniqueNonEmptyStrings_(configuredValueGroups.map(function (values) {
+      return values[0];
+    }));
+  }
 
-  configuredValues.forEach(function (value) {
-    targets[normalizeDropdownLookupValue_(value)] = true;
-  });
-
-  options.forEach(function (option) {
-    const label = String(option && option.label || "").trim();
-    const value = String(option && option.value || "").trim();
-    if (!value) return;
-    if (targets[normalizeDropdownLookupValue_(label)] || targets[normalizeDropdownLookupValue_(value)]) {
-      matchedValues.push(value);
+  const matchedValues = configuredValueGroups.map(function (aliases) {
+    for (let a = 0; a < aliases.length; a++) {
+      const target = normalizeDropdownLookupValue_(aliases[a]);
+      for (let o = 0; o < options.length; o++) {
+        const option = options[o];
+        const label = String(option && option.label || "").trim();
+        const value = String(option && option.value || "").trim();
+        if (
+          value &&
+          (
+            normalizeDropdownLookupValue_(label) === target ||
+            normalizeDropdownLookupValue_(value) === target
+          )
+        ) {
+          return value;
+        }
+      }
     }
+    throw new Error(
+      "HubSpot property '" + propertyName + "' does not contain the configured status " +
+      "option '" + aliases[0] + "' (accepted labels: " + aliases.join(", ") + ")."
+    );
   });
 
-  return uniqueNonEmptyStrings_(matchedValues.length > 0 ? matchedValues : configuredValues);
+  return uniqueNonEmptyStrings_(matchedValues);
 }
 
 function isHubSpotDropdownRecordPropertyInValues_(record, propertyName, allowedValues) {
@@ -4681,18 +4704,26 @@ function fetchHubSpotPropertiesForObject_(objectType, token) {
 }
 
 function compactHubSpotPropertyInfo_(property) {
+  const modificationMetadata = property && property.modificationMetadata
+    ? property.modificationMetadata
+    : {};
   return {
     name: String(property && property.name || "").trim(),
     label: String(property && property.label || property && property.name || "").trim(),
     type: String(property && property.type || "").trim(),
-    fieldType: String(property && property.fieldType || "").trim()
+    fieldType: String(property && property.fieldType || "").trim(),
+    options: normalizeHubSpotPropertyOptions_(property && property.options),
+    readOnlyValue:
+      property && property.readOnlyValue === true ||
+      modificationMetadata.readOnlyValue === true,
+    calculated: property && property.calculated === true
   };
 }
 
 function getHubSpotPropertiesCacheKey_(token, objectType) {
   const type = String(objectType || "").trim();
   if (!type) return "";
-  return "HS_PROPERTIES::" + getHubSpotTokenFingerprint_(token) + "::" + type;
+  return "HS_PROPERTIES_V2::" + getHubSpotTokenFingerprint_(token) + "::" + type;
 }
 
 function getHubSpotTokenFingerprint_(token) {
@@ -4743,7 +4774,7 @@ function updateHubSpotDealPropertySingle_(token, propertyName, item) {
   );
 }
 
-function syncCampaignRowsToHubSpot_(sheet) {
+function syncCampaignRowsToHubSpot_(sheet, dealTypeByDealId) {
   if (!sheet) {
     Logger.log("ℹ️ HubSpot Campaign sync skipped. Campaigns sheet not available.");
     return {
@@ -4794,12 +4825,16 @@ function syncCampaignRowsToHubSpot_(sheet) {
     };
   }
 
-  const dealPropertyLabels = uniqueNonEmptyStrings_(
+  const dealStagePropertyLabels = uniqueNonEmptyStrings_(
     flatten2d_(
       HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_.map(function (stage) {
         return (stage.fields || []).map(function (field) { return field.propertyLabel; });
       })
     )
+  );
+  const dealCommercialPropertyLabels = ["Deal Type", "Amount", "EXT Amount"];
+  const dealPropertyLabels = uniqueNonEmptyStrings_(
+    dealStagePropertyLabels.concat(dealCommercialPropertyLabels)
   );
   const dealPropertyInfoByLabel = dealPropertyLabels.length > 0
     ? resolveHubSpotPropertyInfosByLabel_(HUBSPOT_DEALS_OBJECT_API_NAME_, dealPropertyLabels, token)
@@ -4813,10 +4848,13 @@ function syncCampaignRowsToHubSpot_(sheet) {
       unresolvedDealProperties.join(", ")
     );
   }
-  if (dealIdCol === -1 || activationIdCol === -1) {
+  if (dealIdCol === -1) {
+    Logger.log("ℹ️ HubSpot Campaign deal sync skipped. Missing 'HubSpot Record ID' column.");
+  }
+  if (activationIdCol === -1) {
     Logger.log(
-      "ℹ️ HubSpot Campaign deal sync requires both 'HubSpot Record ID' and " +
-      "'HubSpot Activation ID' columns."
+      "ℹ️ HubSpot Campaign activation sync and deal amount totals require " +
+      "the 'HubSpot Activation ID' column."
     );
   }
 
@@ -4826,6 +4864,13 @@ function syncCampaignRowsToHubSpot_(sheet) {
     HUBSPOT_INT_CAMPAIGN_DEAL_SYNC_STAGES_,
     dealPropertyInfoByLabel,
     spreadsheetTimeZone
+  );
+  const dealCommercialStagePlan = buildHubSpotDealCommercialStagePlan_(
+    data,
+    header,
+    dealPropertyInfoByLabel,
+    spreadsheetTimeZone,
+    dealTypeByDealId
   );
 
   let activationStagePlan = {
@@ -4899,6 +4944,20 @@ function syncCampaignRowsToHubSpot_(sheet) {
     totalFailed += stageResult.failed;
   });
 
+  dealCommercialStagePlan.stages.forEach(function (stage) {
+    const stageResult = stage && Array.isArray(stage.updates) && stage.updates.length > 0
+      ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
+      : { updated: 0, failed: 0 };
+
+    stageResults.push({
+      stageLabel: stage.stageLabel,
+      updated: stageResult.updated,
+      failed: stageResult.failed
+    });
+    totalUpdated += stageResult.updated;
+    totalFailed += stageResult.failed;
+  });
+
   groupedDealStagePlan.stages.forEach(function (stage, index) {
     const stageResult = stage && Array.isArray(stage.updates) && stage.updates.length > 0
       ? updateHubSpotObjectPropertiesBatch_(stage.objectTypeId, stage.updates, token)
@@ -4934,6 +4993,10 @@ function syncCampaignRowsToHubSpot_(sheet) {
     `Activation rows considered: ${activationStagePlan.rowsConsidered}. ` +
     `Missing activation ID: ${activationStagePlan.missingIdCount}. ` +
     `Activation rows with no values: ${activationStagePlan.rowsWithNoStageValues}. ` +
+    `Commercial rows considered: ${dealCommercialStagePlan.rowsConsidered}. ` +
+    `Commercial rows missing deal ID: ${dealCommercialStagePlan.missingDealIdCount}. ` +
+    `Commercial rows missing activation ID: ${dealCommercialStagePlan.missingActivationIdCount}. ` +
+    `Commercial rows with no rate values: ${dealCommercialStagePlan.rowsWithNoRateValues}. ` +
     `Stages: ${stageResults.map(function (stage) {
       return stage.stageLabel + "=" + stage.updated + "/" + stage.failed;
     }).join(", ")}.`
@@ -5232,6 +5295,222 @@ function buildHubSpotGroupedDealStageProperties_(
   return properties;
 }
 
+function buildHubSpotDealCommercialStagePlan_(
+  data,
+  header,
+  propertyInfoByLabel,
+  spreadsheetTimeZone,
+  dealTypeByDealId
+) {
+  const dealIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  const activationIdCol = findHeaderIndex_(header, "HubSpot Activation ID");
+  const dealTypeCol = findHeaderIndex_(header, "Deal Type");
+  const intRateCol = findHeaderIndex_(header, "INT Rate");
+  const extRateCol = findHeaderIndex_(header, "EXT Rate");
+  const dealTypePropertyInfo = propertyInfoByLabel["Deal Type"];
+  const amountPropertyInfo = propertyInfoByLabel["Amount"];
+  const extAmountPropertyInfo = propertyInfoByLabel["EXT Amount"];
+  const deals = {};
+  const updates = [];
+  let rowsConsidered = 0;
+  let missingDealIdCount = 0;
+  let missingActivationIdCount = 0;
+  let rowsWithNoRateValues = 0;
+
+  if (
+    dealIdCol === -1 ||
+    (
+      !isWritableHubSpotPropertyInfo_(dealTypePropertyInfo) &&
+      !isWritableHubSpotPropertyInfo_(amountPropertyInfo) &&
+      !isWritableHubSpotPropertyInfo_(extAmountPropertyInfo)
+    )
+  ) {
+    return {
+      stages: [
+        {
+          stageLabel: "Deal Commercial Fields",
+          objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
+          updates: []
+        }
+      ],
+      rowsConsidered: 0,
+      missingDealIdCount: 0,
+      missingActivationIdCount: 0,
+      rowsWithNoRateValues: 0
+    };
+  }
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+    rowsConsidered++;
+
+    const dealId = String(row[dealIdCol] || "").trim();
+    if (!dealId) {
+      missingDealIdCount++;
+      continue;
+    }
+
+    if (!deals[dealId]) {
+      deals[dealId] = {
+        row1: r + 1,
+        dealType: "",
+        activations: {}
+      };
+    }
+    const deal = deals[dealId];
+    deal.row1 = r + 1;
+
+    const pitchingDealType = getCampaignDealTypeFromLookup_(dealTypeByDealId, dealId);
+    const campaignDealType = dealTypeCol === -1 ? "" : String(row[dealTypeCol] || "").trim();
+    if (pitchingDealType) {
+      deal.dealType = pitchingDealType;
+    } else if (!deal.dealType && campaignDealType) {
+      deal.dealType = campaignDealType;
+    }
+
+    const intAmount = intRateCol === -1 ? null : parseHubSpotAmountNumber_(row[intRateCol]);
+    const extAmount = extRateCol === -1 ? null : parseHubSpotAmountNumber_(row[extRateCol]);
+    if (intAmount == null && extAmount == null) {
+      rowsWithNoRateValues++;
+      continue;
+    }
+
+    const activationId = activationIdCol === -1
+      ? ""
+      : String(row[activationIdCol] || "").trim();
+    if (!activationId) {
+      missingActivationIdCount++;
+      continue;
+    }
+
+    if (!deal.activations[activationId]) {
+      deal.activations[activationId] = {
+        intAmount: null,
+        extAmount: null
+      };
+    }
+    if (intAmount != null) deal.activations[activationId].intAmount = intAmount;
+    if (extAmount != null) deal.activations[activationId].extAmount = extAmount;
+  }
+
+  Object.keys(deals).forEach(function (dealId) {
+    const deal = deals[dealId] || {};
+    const properties = {};
+
+    if (deal.dealType && isWritableHubSpotPropertyInfo_(dealTypePropertyInfo)) {
+      const value = serializeHubSpotPropertyValue_(
+        deal.dealType,
+        dealTypePropertyInfo,
+        spreadsheetTimeZone
+      );
+      if (value !== "") properties[dealTypePropertyInfo.name] = value;
+    }
+
+    let intTotal = 0;
+    let extTotal = 0;
+    let hasIntAmount = false;
+    let hasExtAmount = false;
+    const activations = deal.activations || {};
+    Object.keys(activations).forEach(function (activationId) {
+      const activation = activations[activationId] || {};
+      if (activation.intAmount != null) {
+        intTotal += activation.intAmount;
+        hasIntAmount = true;
+      }
+      if (activation.extAmount != null) {
+        extTotal += activation.extAmount;
+        hasExtAmount = true;
+      }
+    });
+
+    if (hasIntAmount && isWritableHubSpotPropertyInfo_(amountPropertyInfo)) {
+      const value = serializeHubSpotPropertyValue_(
+        roundHubSpotAmountNumber_(intTotal),
+        amountPropertyInfo,
+        spreadsheetTimeZone
+      );
+      if (value !== "") properties[amountPropertyInfo.name] = value;
+    }
+    if (hasExtAmount && isWritableHubSpotPropertyInfo_(extAmountPropertyInfo)) {
+      const value = serializeHubSpotPropertyValue_(
+        roundHubSpotAmountNumber_(extTotal),
+        extAmountPropertyInfo,
+        spreadsheetTimeZone
+      );
+      if (value !== "") properties[extAmountPropertyInfo.name] = value;
+    }
+
+    if (Object.keys(properties).length === 0) return;
+    updates.push({
+      id: dealId,
+      properties: properties,
+      row1: deal.row1
+    });
+  });
+
+  return {
+    stages: [
+      {
+        stageLabel: "Deal Commercial Fields",
+        objectTypeId: HUBSPOT_DEALS_OBJECT_API_NAME_,
+        updates: updates
+      }
+    ],
+    rowsConsidered: rowsConsidered,
+    missingDealIdCount: missingDealIdCount,
+    missingActivationIdCount: missingActivationIdCount,
+    rowsWithNoRateValues: rowsWithNoRateValues
+  };
+}
+
+function getCampaignDealTypeFromLookup_(lookup, dealId) {
+  const normalizedDealId = String(dealId || "").trim();
+  if (!normalizedDealId || !lookup) return "";
+
+  if (typeof lookup.get === "function") {
+    return String(lookup.get(normalizedDealId) || "").trim();
+  }
+  return String(lookup[normalizedDealId] || "").trim();
+}
+
+function parseHubSpotAmountNumber_(value) {
+  if (value == null) return null;
+  if (typeof value === "number") return isFinite(value) ? value : null;
+
+  const text = String(value || "").trim();
+  if (!text) return null;
+
+  const negative = /^\(.*\)$/.test(text);
+  let cleaned = text.replace(/[^\d.,-]/g, "");
+  if (!cleaned || cleaned === "-" || cleaned === "." || cleaned === "-.") return null;
+
+  const lastComma = cleaned.lastIndexOf(",");
+  const lastDot = cleaned.lastIndexOf(".");
+  if (lastComma !== -1 && lastDot !== -1) {
+    if (lastComma > lastDot) {
+      cleaned = cleaned.replace(/\./g, "").replace(",", ".");
+    } else {
+      cleaned = cleaned.replace(/,/g, "");
+    }
+  } else if (lastComma !== -1) {
+    const commaDecimals = cleaned.length - lastComma - 1;
+    cleaned = commaDecimals > 0 && commaDecimals <= 2
+      ? cleaned.replace(",", ".")
+      : cleaned.replace(/,/g, "");
+  }
+
+  const parsed = Number(cleaned);
+  if (!isFinite(parsed)) return null;
+  return negative && parsed > 0 ? -parsed : parsed;
+}
+
+function roundHubSpotAmountNumber_(value) {
+  const amount = Number(value);
+  if (!isFinite(amount)) return 0;
+  return Math.round(amount * 100) / 100;
+}
+
 function loadHubSpotCustomObjectInfo_(spec, token) {
   const schemasResponse = hubspotRequestJson_(
     HUBSPOT_API_BASE_ + "/crm-object-schemas/v3/schemas",
@@ -5288,7 +5567,10 @@ function resolveHubSpotPropertyInfosByLabel_(objectType, propertyLabels, token) 
         name: String(property.name || "").trim(),
         label: String(property.label || property.name || "").trim(),
         type: String(property.type || "").trim(),
-        fieldType: String(property.fieldType || "").trim()
+        fieldType: String(property.fieldType || "").trim(),
+        options: normalizeHubSpotPropertyOptions_(property.options),
+        readOnlyValue: property.readOnlyValue === true,
+        calculated: property.calculated === true
       };
     });
   });
@@ -5491,6 +5773,13 @@ function buildHubSpotPropertiesFromRowForFields_(
   return properties;
 }
 
+function isWritableHubSpotPropertyInfo_(propertyInfo) {
+  if (!propertyInfo || !propertyInfo.name) return false;
+  if (propertyInfo.readOnlyValue === true) return false;
+  if (propertyInfo.calculated === true) return false;
+  return true;
+}
+
 function isEmptyHubSpotSyncValue_(value) {
   if (value == null) return true;
   if (Object.prototype.toString.call(value) === "[object Date]") {
@@ -5547,7 +5836,86 @@ function serializeHubSpotPropertyValue_(value, propertyInfo, spreadsheetTimeZone
     if (normalized === "false" || normalized === "no" || normalized === "0") return "false";
   }
 
+  if (isHubSpotEnumerationProperty_(propertyInfo)) {
+    return serializeHubSpotEnumerationValue_(text, propertyInfo);
+  }
+
   return text;
+}
+
+function isHubSpotEnumerationProperty_(propertyInfo) {
+  const type = String(propertyInfo && propertyInfo.type || "").trim().toLowerCase();
+  const options = propertyInfo && Array.isArray(propertyInfo.options)
+    ? propertyInfo.options
+    : [];
+  return type === "enumeration" || options.length > 0;
+}
+
+function serializeHubSpotEnumerationValue_(text, propertyInfo) {
+  const options = propertyInfo && Array.isArray(propertyInfo.options)
+    ? propertyInfo.options
+    : [];
+  if (options.length === 0) return text;
+
+  const fieldType = String(propertyInfo && propertyInfo.fieldType || "").trim().toLowerCase();
+  const isMulti =
+    fieldType === "checkbox" ||
+    fieldType === "checkboxes" ||
+    fieldType === "multiplecheckbox" ||
+    fieldType === "multiplecheckboxes";
+
+  if (!isMulti) {
+    return resolveHubSpotOptionValue_(text, options) || "";
+  }
+
+  const delimiter = text.indexOf(";") !== -1 ? ";" : ",";
+  const parts = text
+    .split(delimiter)
+    .map(function (part) { return String(part || "").trim(); })
+    .filter(Boolean);
+  if (parts.length === 0) return "";
+
+  const values = [];
+  for (let i = 0; i < parts.length; i++) {
+    const optionValue = resolveHubSpotOptionValue_(parts[i], options);
+    if (!optionValue) return "";
+    values.push(optionValue);
+  }
+
+  return uniqueNonEmptyStrings_(values).join(";");
+}
+
+function resolveHubSpotOptionValue_(value, options) {
+  const target = normalizeHeaderName_(value);
+  if (!target) return "";
+
+  for (let i = 0; i < options.length; i++) {
+    const option = options[i] || {};
+    const optionValue = String(option.value || "").trim();
+    const optionLabel = String(option.label || "").trim();
+    if (
+      normalizeHeaderName_(optionValue) === target ||
+      normalizeHeaderName_(optionLabel) === target
+    ) {
+      return optionValue;
+    }
+  }
+
+  return "";
+}
+
+function normalizeHubSpotPropertyOptions_(options) {
+  if (!Array.isArray(options)) return [];
+  return options
+    .map(function (option) {
+      return {
+        label: String(option && option.label || option && option.value || "").trim(),
+        value: String(option && option.value || "").trim()
+      };
+    })
+    .filter(function (option) {
+      return option.value;
+    });
 }
 
 function hubspotRequestJson_(url, token, options) {
@@ -5695,6 +6063,11 @@ function pushRespondedToNegotiation() {
 
   const statusCol = creatorHeader.indexOf("Status");
   if (statusCol === -1) return Logger.log("❌ Creator List missing 'Status' column.");
+  const recordIdCol = findHeaderIndex_(creatorHeader, "HubSpot Record ID");
+  if (recordIdCol === -1) return Logger.log("❌ Creator List missing 'HubSpot Record ID' column.");
+  if (findHeaderIndex_(pitchingHeader, "HubSpot Record ID") === -1) {
+    return Logger.log("❌ Pitching missing 'HubSpot Record ID' column.");
+  }
 
   const contactingStart0 = findSectionRowByLabel_(creatorData, "Contacting");
   if (contactingStart0 === -1) return Logger.log("❌ 'Contacting' section not found in Creator List.");
@@ -5706,14 +6079,26 @@ function pushRespondedToNegotiation() {
 
   // Find responded rows
   const respondedRows = [];
+  let skippedMissingRecordId = 0;
   for (let r = contactingStart0 + 1; r < creatorEnd0; r++) {
     const row = creatorData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     if (String(row[statusCol] || "").trim() !== "Responded") continue;
-    respondedRows.push({ row1: r + 1, values: row.slice() });
+    const recordId = String(row[recordIdCol] || "").trim();
+    if (!recordId) {
+      skippedMissingRecordId++;
+      continue;
+    }
+    respondedRows.push({ row1: r + 1, values: row.slice(), recordId: recordId });
   }
 
   if (respondedRows.length === 0) {
+    if (skippedMissingRecordId > 0) {
+      return Logger.log(
+        `ℹ️ No rows copied to Pitching Negotiation. ${skippedMissingRecordId} Responded row(s) ` +
+        `skipped because HubSpot Record ID is empty.`
+      );
+    }
     return Logger.log("ℹ️ No rows with Status 'Responded' in Contacting section.");
   }
 
@@ -5726,6 +6111,7 @@ function pushRespondedToNegotiation() {
     CREATOR_TO_PITCHING_NEGOTIATION_SKIP_COLS_
   );
   const pitchingNumCols = pitchingHeader.length;
+  const existingPitchingRecordIds = buildHubSpotRecordIdSet_(pitchingData, pitchingHeader);
   const existingPitchingCompositeKeys = buildCompositeKeySet_(pitchingData, pitchingHeader);
   const existingPitchingSignatures = buildMappedRowSignatureSetFromTarget_(pitchingData, colMap);
 
@@ -5733,13 +6119,17 @@ function pushRespondedToNegotiation() {
   const pitchingRows = [];
   let skippedDup = 0;
   respondedRows.forEach(item => {
+    const recordId = item.recordId;
     const compositeKey = buildCompositeKey_(item.values, creatorHeader);
     const signature = buildMappedRowSignatureFromSource_(item.values, colMap);
     if (
+      existingPitchingRecordIds.has(recordId) ||
       (compositeKey && existingPitchingCompositeKeys.has(compositeKey)) ||
       (signature && existingPitchingSignatures.has(signature))
     ) {
+      existingPitchingRecordIds.add(recordId);
       if (compositeKey) existingPitchingCompositeKeys.add(compositeKey);
+      if (signature) existingPitchingSignatures.add(signature);
       skippedDup++;
       return;
     }
@@ -5748,12 +6138,16 @@ function pushRespondedToNegotiation() {
     for (const m of colMap) out[m.targetIdx] = item.values[m.sourceIdx];
     pitchingRows.push(out);
 
+    existingPitchingRecordIds.add(recordId);
     if (compositeKey) existingPitchingCompositeKeys.add(compositeKey);
     if (signature) existingPitchingSignatures.add(signature);
   });
 
   if (pitchingRows.length === 0) {
-    return Logger.log(`ℹ️ No new rows copied to Pitching Negotiation. ${skippedDup} duplicate(s) skipped.`);
+    return Logger.log(
+      `ℹ️ No new rows copied to Pitching Negotiation. ${skippedDup} duplicate HubSpot Record ID(s) ` +
+      `or matching row(s) skipped, ${skippedMissingRecordId} missing HubSpot Record ID skipped.`
+    );
   }
 
   // Insert into Negotiation section
@@ -5772,7 +6166,11 @@ function pushRespondedToNegotiation() {
   templateRange.copyTo(writeRange, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
   writeRange.setValues(pitchingRows);
 
-  Logger.log(`✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ${skippedDup} duplicate(s) skipped.`);
+  Logger.log(
+    `✅ Copied ${pitchingRows.length} row(s) into Pitching Negotiation section. ` +
+    `${skippedDup} duplicate HubSpot Record ID(s) or matching row(s) skipped, ` +
+    `${skippedMissingRecordId} missing HubSpot Record ID skipped.`
+  );
 }
 
 
@@ -6036,6 +6434,7 @@ function updateCampaignsFromExt() {
   const intHeader = intData[0].map(v => String(v || "").trim());
   const extHeader = extData[0].map(v => String(v || "").trim());
   const pitchingIntRateLookup = buildCampaignIntRateLookupFromPitching_(intPitching);
+  const pitchingDealTypeLookup = buildCampaignDealTypeLookupFromPitching_(intPitching);
 
   // Build INT row lookup by composite key
   const intRowMap = new Map();
@@ -6076,6 +6475,9 @@ function updateCampaignsFromExt() {
       if (applyCampaignIntRateFromPitchingLookup_(intRow, intHeader, pitchingIntRateLookup)) {
         changed = true;
       }
+      if (applyCampaignDealTypeFromPitchingLookup_(intRow, intHeader, pitchingDealTypeLookup)) {
+        changed = true;
+      }
 
       if (changed) {
         intCampaigns.getRange(intRowIdx + 1, 1, 1, intHeader.length).setValues([intRow]);
@@ -6097,6 +6499,7 @@ function updateCampaignsFromExt() {
       const out = new Array(intNumCols).fill("");
       for (const m of colMap) out[m.targetIdx] = extRow[m.sourceIdx];
       applyCampaignIntRateFromPitchingLookup_(out, intHeader, pitchingIntRateLookup);
+      applyCampaignDealTypeFromPitchingLookup_(out, intHeader, pitchingDealTypeLookup);
 
       intCampaigns.insertRowBefore(insertAt1);
       const targetRange = intCampaigns.getRange(insertAt1, 1, 1, intNumCols);
@@ -6110,7 +6513,8 @@ function updateCampaignsFromExt() {
 
   Logger.log(`✅ INT Campaigns: ${updated} updated, ${inserted} inserted from EXT.`);
   try {
-    syncCampaignRowsToHubSpot_(intCampaigns);
+    SpreadsheetApp.flush();
+    syncCampaignRowsToHubSpot_(intCampaigns, pitchingDealTypeLookup);
   } catch (e) {
     Logger.log("⚠️ INT Campaigns HubSpot sync failed: " + (e && e.stack ? e.stack : e));
   }
@@ -6310,6 +6714,33 @@ function buildCampaignIntRateLookupFromPitching_(sheet) {
   return lookup;
 }
 
+function buildCampaignDealTypeLookupFromPitching_(sheet) {
+  const lookup = new Map();
+  if (!sheet) return lookup;
+
+  const data = sheet.getDataRange().getValues();
+  if (!data || data.length < 2) return lookup;
+
+  const header = (data[0] || []).map(function (value) {
+    return String(value || "").trim();
+  });
+  const dealIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  const dealTypeCol = findHeaderIndex_(header, "Deal Type");
+  if (dealIdCol === -1 || dealTypeCol === -1) return lookup;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const dealId = String(row[dealIdCol] || "").trim();
+    const dealType = String(row[dealTypeCol] || "").trim();
+    if (!dealId || !dealType || lookup.has(dealId)) continue;
+    lookup.set(dealId, dealType);
+  }
+
+  return lookup;
+}
+
 function applyCampaignIntRateFromPitchingLookup_(campaignRow, campaignHeader, lookup) {
   if (!campaignRow || !Array.isArray(campaignHeader) || !lookup || lookup.size === 0) return false;
 
@@ -6324,6 +6755,22 @@ function applyCampaignIntRateFromPitchingLookup_(campaignRow, campaignHeader, lo
   if (currentValue === nextValue) return false;
 
   campaignRow[intRateIdx] = intRate;
+  return true;
+}
+
+function applyCampaignDealTypeFromPitchingLookup_(campaignRow, campaignHeader, lookup) {
+  if (!campaignRow || !Array.isArray(campaignHeader) || !lookup || lookup.size === 0) return false;
+
+  const dealId = String(getValueByHeader_(campaignRow, campaignHeader, "HubSpot Record ID") || "").trim();
+  const dealTypeIdx = findHeaderIndex_(campaignHeader, "Deal Type");
+  if (!dealId || dealTypeIdx === -1 || !lookup.has(dealId)) return false;
+
+  const dealType = lookup.get(dealId);
+  const currentValue = String(campaignRow[dealTypeIdx] == null ? "" : campaignRow[dealTypeIdx]).trim();
+  const nextValue = String(dealType == null ? "" : dealType).trim();
+  if (!nextValue || currentValue === nextValue) return false;
+
+  campaignRow[dealTypeIdx] = dealType;
   return true;
 }
 
@@ -6413,6 +6860,22 @@ function buildCompositeKeySet_(data, header) {
     const key = buildCompositeKey_(row, header);
     if (key) set.add(key);
   }
+  return set;
+}
+
+function buildHubSpotRecordIdSet_(data, header) {
+  const set = new Set();
+  const recordIdCol = findHeaderIndex_(header, "HubSpot Record ID");
+  if (recordIdCol === -1) return set;
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
+
+    const recordId = String(row[recordIdCol] || "").trim();
+    if (recordId) set.add(recordId);
+  }
+
   return set;
 }
 
