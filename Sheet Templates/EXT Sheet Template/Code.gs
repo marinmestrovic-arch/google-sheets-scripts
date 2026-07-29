@@ -39,7 +39,7 @@ function pushConfirmedCreatorsToCampaigns() {
   const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
   const token = getHubSpotToken_();
   if (!token) {
-    return Logger.log("❌ Missing HubSpot token. Set HUBSPOT_PRIVATE_APP_TOKEN_");
+    return Logger.log("❌ Missing HubSpot token. Set the HUBSPOT_API_KEY script property.");
   }
 
   let activationsInfo;
@@ -946,7 +946,6 @@ function iso8601DurationToSeconds_(duration) {
  * HUBSPOT -> PITCHING IMPORT
  ***************************************/
 
-const HUBSPOT_PRIVATE_APP_TOKEN_ = "api key here";
 const HUBSPOT_API_BASE_ = "https://api.hubapi.com";
 
 // Internal name of the Activations custom object type in HubSpot.
@@ -1285,7 +1284,9 @@ function fetchHubSpotActivationsByIds_(activationIds, activationsObjectTypeId, t
 
 
 function getHubSpotToken_() {
-  return String(HUBSPOT_PRIVATE_APP_TOKEN_ || "").trim();
+  return String(
+    PropertiesService.getScriptProperties().getProperty("HUBSPOT_API_KEY") || ""
+  ).trim();
 }
 
 function hubspotHeaders_(token) {
