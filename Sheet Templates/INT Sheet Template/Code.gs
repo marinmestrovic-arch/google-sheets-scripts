@@ -372,7 +372,7 @@ function isKnownSectionLabel_(value) {
   if (!text) return false;
 
   const knownLabels = new Set(
-    ["Contacting", "Archived", "Negotiation", "Active Pitches"].concat(MONTH_NAMES_)
+    ["Contacting", "Archived", "Approved", "Confirmed", "Negotiation", "Active Pitches"].concat(MONTH_NAMES_)
   );
   return knownLabels.has(text);
 }
@@ -7110,11 +7110,17 @@ function pushConfirmedCreatorsToCampaigns() {
   if (cRecordIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Record ID.");
   if (cActivationIdCol === -1) return Logger.log("❌ Campaigns missing required column: HubSpot Activation ID.");
 
+  const approvedSection = findPitchApprovedSection_(pitchData);
+  const approvedStart0 = approvedSection.start0;
   const archivedStart0 = findSectionRowByLabel_(pitchData, "Archived");
+  if (approvedStart0 === -1) return Logger.log("❌ Pitching section 'Approved' or 'Confirmed' not found.");
   if (archivedStart0 === -1) return Logger.log("❌ Pitching section 'Archived' not found.");
+  if (approvedStart0 >= archivedStart0) {
+    return Logger.log(`❌ Pitching sections must place '${approvedSection.label}' before 'Archived'.`);
+  }
 
   const approvedPitchingStatusItems = [];
-  for (let r = 1; r < archivedStart0; r++) {
+  for (let r = 1; r < approvedStart0; r++) {
     const row = pitchData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     if (String(row[pStatusCol] || "").trim() !== "Approved") continue;
@@ -7131,7 +7137,7 @@ function pushConfirmedCreatorsToCampaigns() {
 
   const commonCols = getCommonColumnsByHeader_(pitchHeader, campHeader);
   if (commonCols.length === 0) return Logger.log("ℹ️ No matching columns between Pitching and Campaigns.");
-  const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, archivedStart0);
+  const pitchRowsByKey = getPitchRowsByKey_(pitchData, pitchHeader, approvedStart0);
   const token = getHubSpotApiToken_();
   if (!token) {
     return Logger.log("❌ Missing HubSpot token. Set the HUBSPOT_API_KEY script property.");
@@ -7152,7 +7158,7 @@ function pushConfirmedCreatorsToCampaigns() {
 
   const existingBySection = getExistingSignaturesBySection_(campData, commonCols);
   const candidates = [];
-  for (let r = 1; r < archivedStart0; r++) {
+  for (let r = 1; r < approvedStart0; r++) {
     const row = pitchData[r];
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
     if (String(row[pStatusCol] || "").trim() !== "Approved") continue;
@@ -7174,7 +7180,7 @@ function pushConfirmedCreatorsToCampaigns() {
   }
 
   if (candidates.length === 0) {
-    Logger.log("ℹ️ No approved creators eligible to push above Archived.");
+    Logger.log(`ℹ️ No approved creators eligible to push above ${approvedSection.label}.`);
     archivePitches({ includeApproved: true });
     return;
   }
@@ -7281,12 +7287,21 @@ function archivePitches(options) {
   const pipelineCol = findHeaderIndex_(header, "Pipeline");
 
   const activeStart0 = findSectionRowByLabel_(data, "Active Pitches");
+  const approvedSection = findPitchApprovedSection_(data);
+  const approvedStart0 = approvedSection.start0;
   const archivedStart0 = findSectionRowByLabel_(data, "Archived");
   if (activeStart0 === -1) return Logger.log("❌ Could not find 'Active Pitches' section in Pitching.");
+  if (approvedStart0 === -1) return Logger.log("❌ Could not find 'Approved' or 'Confirmed' section in Pitching.");
   if (archivedStart0 === -1) return Logger.log("❌ Could not find 'Archived' section in Pitching.");
+  if (activeStart0 >= approvedStart0 || approvedStart0 >= archivedStart0) {
+    return Logger.log(
+      `❌ Pitching sections must be ordered with 'Active Pitches' before ` +
+      `'${approvedSection.label}' before 'Archived'.`
+    );
+  }
 
   const rowsToArchive = [];
-  for (let r = activeStart0 + 1; r < archivedStart0; r++) {
+  for (let r = activeStart0 + 1; r < approvedStart0; r++) {
     const row = data[r];
     const displayRow = displayData[r] || row;
     if (isBlankRow_(row) || isSectionLabelRow_(row)) continue;
@@ -7309,9 +7324,16 @@ function archivePitches(options) {
     Logger.log("⚠️ Rejected Pitching Deal Stage sync failed: " + (e && e.stack ? e.stack : e));
   }
 
-  movePitchRowsToArchivedSection_(sheet, rowsToArchive);
+  movePitchRowsToArchiveSections_(sheet, rowsToArchive);
 
-  Logger.log(`✅ Archived ${rowsToArchive.length} row(s). Local Deal Stage set to Lost: ${localLostUpdates}.`);
+  const approvedCount = rowsToArchive.filter(function (entry) {
+    return normalizeHeaderName_(entry && entry.status) === "approved";
+  }).length;
+  const rejectedCount = rowsToArchive.length - approvedCount;
+  Logger.log(
+    `✅ Moved ${approvedCount} row(s) to ${approvedSection.label} and ${rejectedCount} row(s) to Archived. ` +
+    `Local Deal Stage set to Lost: ${localLostUpdates}.`
+  );
 }
 
 function markRejectedPitchDealStagesLost_(sheet, header, rowsToArchive) {
@@ -7363,7 +7385,7 @@ function syncRejectedPitchDealStagesToLost_(rowsToArchive) {
   if (dealIds.length === 0) {
     Logger.log(
       `ℹ️ Rejected Pitching Deal Stage sync skipped. Missing deal ID: ${missingRecordIdCount}. ` +
-      `Non-rejected archived rows: ${skippedNonRejectedCount}.`
+      `Non-rejected archive candidates: ${skippedNonRejectedCount}.`
     );
     return {
       attempted: 0,
@@ -7448,7 +7470,7 @@ function syncRejectedPitchDealStagesToLost_(rowsToArchive) {
   Logger.log(
     `✅ Rejected Pitching Deal Stage sync done. Updated: ${result.updated}. Failed: ${result.failed}. ` +
     `Attempted: ${updates.length}. Candidate deals: ${dealIds.length}. Missing deal ID: ${missingRecordIdCount}. ` +
-    `Non-rejected archived rows: ${skippedNonRejectedCount}. Missing pipeline: ${missingPipelineCount}. ` +
+    `Non-rejected archive candidates: ${skippedNonRejectedCount}. Missing pipeline: ${missingPipelineCount}. ` +
     `Missing Lost stage value: ${missingStageValueCount}. Used sheet pipeline fallback: ${fallbackPipelineCount}.`
   );
 
@@ -7460,7 +7482,7 @@ function syncRejectedPitchDealStagesToLost_(rowsToArchive) {
   };
 }
 
-function movePitchRowsToArchivedSection_(sheet, rowsToArchive) {
+function movePitchRowsToArchiveSections_(sheet, rowsToArchive) {
   const rows = (rowsToArchive || []).slice().sort(function (a, b) {
     return a.sourceRow1 - b.sourceRow1;
   });
@@ -7469,12 +7491,24 @@ function movePitchRowsToArchivedSection_(sheet, rowsToArchive) {
   rows.forEach(function (entry) {
     const sourceRow1 = entry.sourceRow1 - movedCount;
     const liveData = sheet.getDataRange().getValues();
-    const archivedStart0 = findSectionRowByLabel_(liveData, "Archived");
-    if (archivedStart0 === -1) throw new Error("Archived section disappeared while moving rows.");
+    const status = normalizeHeaderName_(entry && entry.status);
+    const destinationLabel = status === "approved"
+      ? findPitchApprovedSection_(liveData).label
+      : status === "rejected"
+        ? "Archived"
+        : "";
+    if (!destinationLabel) {
+      throw new Error(`Unsupported Pitching archive status: ${entry && entry.status}`);
+    }
 
-    let insertAt1 = findFirstEmptyRowInSection1_(liveData, archivedStart0);
+    const destinationStart0 = findSectionRowByLabel_(liveData, destinationLabel);
+    if (destinationStart0 === -1) {
+      throw new Error(`${destinationLabel} section disappeared while moving rows.`);
+    }
+
+    let insertAt1 = findFirstEmptyRowInSection1_(liveData, destinationStart0);
     if (insertAt1 === -1) {
-      const nextSection0 = findNextSectionStart0_(liveData, archivedStart0);
+      const nextSection0 = findNextSectionStart0_(liveData, destinationStart0);
       insertAt1 = nextSection0 === -1 ? liveData.length + 1 : nextSection0 + 1;
     }
     if (insertAt1 > sheet.getMaxRows()) sheet.insertRowAfter(sheet.getMaxRows());
@@ -7482,6 +7516,20 @@ function movePitchRowsToArchivedSection_(sheet, rowsToArchive) {
     sheet.moveRows(sheet.getRange(sourceRow1, 1, 1, sheet.getMaxColumns()), insertAt1);
     movedCount++;
   });
+}
+
+function findPitchApprovedSection_(data) {
+  const approvedStart0 = findSectionRowByLabel_(data, "Approved");
+  if (approvedStart0 !== -1) {
+    return { label: "Approved", start0: approvedStart0 };
+  }
+
+  const confirmedStart0 = findSectionRowByLabel_(data, "Confirmed");
+  if (confirmedStart0 !== -1) {
+    return { label: "Confirmed", start0: confirmedStart0 };
+  }
+
+  return { label: "", start0: -1 };
 }
 
 function pushPublishedCampaignsToPerformance() {
